@@ -13,7 +13,7 @@ Kaggle 5-Day AI Agents Capstone submission — track: **Agents for Business**.
 Static analyzers find patterns but can't explain why they matter. LLMs can explain things but hallucinate when given no real grounding. This agent fetches your actual repo, runs real Semgrep static analysis on it, and hands both the code and the findings to Gemini 2.5 Flash — so every issue in the final report is backed by either a deterministic rule or a model that's actually looking at your code, never a guess.
 
 ```
-                    ┌─────────────────┐
+                    ┌──────────────────┐
    repo URL ───────►│  github_fetcher  │── GitHub API
                     └────────┬─────────┘
                              │ Python files
