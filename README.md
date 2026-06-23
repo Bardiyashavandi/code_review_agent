@@ -1,4 +1,8 @@
+<div align="center">
+
 # AI Code Review Agent
+
+**Give it a GitHub URL. Get back a prioritized, fix-it-now code review.**
 
 ![Python](https://img.shields.io/badge/python-3.10%2B-blue)
 ![License](https://img.shields.io/badge/license-MIT-green)
@@ -6,38 +10,64 @@
 ![ADK](https://img.shields.io/badge/Google%20ADK-2.0-orange)
 ![Cost](https://img.shields.io/badge/cost-%240-success)
 
-**Give it a GitHub URL. Get back a prioritized, fix-it-now code review.**
+Kaggle 5-Day AI Agents Capstone — track: **Agents for Business**
 
-Kaggle 5-Day AI Agents Capstone submission — track: **Agents for Business**.
+</div>
 
-Static analyzers find patterns but can't explain why they matter. LLMs can explain things but hallucinate when given no real grounding. This agent fetches your actual repo, runs real Semgrep static analysis on it, and hands both the code and the findings to Gemini 2.5 Flash — so every issue in the final report is backed by either a deterministic rule or a model that's actually looking at your code, never a guess.
+---
+
+## Contents
+
+- [The idea](#the-idea)
+- [Architecture](#architecture)
+- [What a run actually looks like](#what-a-run-actually-looks-like)
+- [Quick start](#quick-start)
+- [How it works](#how-it-works)
+- [Security, by design](#security-by-design)
+- [Testing](#testing)
+- [Real-world verification](#real-world-verification-not-just-mocks)
+- [Project structure](#project-structure)
+- [Known limitations](#known-limitations)
+- [License](#license)
+
+## The idea
+
+Static analyzers find patterns but can't explain why they matter. LLMs can explain things but hallucinate when given no real grounding. This agent closes that gap: it fetches your actual repository, runs real Semgrep static analysis on it, and hands both the code and the findings to Gemini 2.5 Flash — so every issue in the final report is backed by either a deterministic rule or a model that's actually looking at your code, never a guess.
+
+Only a fetch failure is treated as fatal — there's nothing to review without files. A Semgrep or Gemini hiccup is captured as a non-fatal `StageError` instead, so the pipeline always returns a usable result, degraded but never empty-handed. This isn't theoretical: during real testing, Gemini intermittently threw transient `503` errors under load, and the retry logic kept the run going without dropping it.
+
+## Architecture
 
 ```
-                    ┌──────────────────┐
-   repo URL ───────►│  github_fetcher  │── GitHub API
-                    └────────┬─────────┘
-                             │ Python files
-                             ▼
-                    ┌──────────────────
-                    │  semgrep_runner  │── sandboxed subprocess
-                    └────────┬─────────┘
-                             │ files + findings
-                             ▼
-                    ┌──────────────────
-                    │  gemini_reviewer │── Gemini 2.5 Flash
-                    └────────┬─────────┘
-                             │ structured issues
-                             ▼
-                    ┌─────────────────┐
-                    │ report_generator│── review_report.md
-                    └─────────────────┘
+                       ┌────────────────────┐
+   repo URL ──────────►│   github_fetcher   │── GitHub API
+                       └──────────┬─────────┘
+                                  │ Python files
+                                  ▼
+                       ┌────────────────────┐
+                       │   semgrep_runner   │── sandboxed subprocess
+                       └──────────┬─────────┘
+                                  │ files + findings
+                                  ▼
+                       ┌────────────────────┐
+                       │   gemini_reviewer  │── Gemini 2.5 Flash
+                       └──────────┬─────────┘
+                                  │ structured issues
+                                  ▼
+                       ┌────────────────────┐
+                       │  report_generator  │── review_report.md
+                       └────────────────────┘
 
    agent.py orchestrates the above AND exposes it as a
    Google ADK 2.0 Agent + FunctionTool, so an LLM-driven
    agent runtime can decide on its own when to call it.
 ```
 
-Only a fetch failure is treated as fatal — there's nothing to review without files. A Semgrep or Gemini hiccup is captured as a non-fatal `StageError` instead, so the pipeline always returns a usable result, degraded but never empty-handed. This isn't theoretical: during real testing, Gemini intermittently threw transient `503` errors under load, and the retry logic kept the run going without dropping it.
+| Stage | Module | Job |
+|---|---|---|
+| 1. Fetch | `github_fetcher.py` | Walks the repo tree via the GitHub API, pulls every Python file, skips venvs/build noise |
+| 2. Scan | `semgrep_runner.py` | Writes files into an isolated sandbox, runs Semgrep, parses JSON into typed findings |
+| 3. Review | `gemini_reviewer.py` | Batches code + findings into prompts, asks Gemini 2.5 Flash for a structured, severity-ranked review |
 
 ## What a run actually looks like
 
@@ -58,7 +88,7 @@ Hardcoded Mock API Key (agent.py:95)
   Suggested fix: load all keys from environment variables, never literals.
 ```
 
-That's a real run against a real (unmodified) repository, not a cherry-picked fixture — see "Real-world verification" below.
+That's a real run against a real, unmodified repository, not a cherry-picked fixture — see [Real-world verification](#real-world-verification-not-just-mocks) below.
 
 ## Quick start
 
@@ -82,21 +112,13 @@ Run it:
 python3 main.py https://github.com/owner/repo --branch main --out review_report.md -v
 ```
 
-`--max-files` caps how many Python files get reviewed for very large repos.
+`--max-files` (default `10`) caps how many Python files get reviewed per run — kept conservative by default since Gemini's free tier caps requests per day; raise it if you have a higher quota.
 
 ## How it works
 
-The pipeline runs in three stages, each implemented as an independent, individually-tested module:
+`agent.py` orchestrates all three stages behind a single `CodeReviewAgent.review_repo()` call, and also exposes the same pipeline as a Google ADK 2.0 `Agent` + `FunctionTool` — so a Gemini-powered ADK agent can decide for itself, from a plain-language request, to call `review_repo_tool`. `report_generator.py` renders the result to Markdown, and `main.py` is the CLI entry point.
 
-| Stage | Module | Job |
-|---|---|---|
-| 1. Fetch | `github_fetcher.py` | Walks the repo tree via the GitHub API, pulls every Python file, skips venvs/build noise |
-| 2. Scan | `semgrep_runner.py` | Writes files into an isolated sandbox, runs Semgrep, parses JSON into typed findings |
-| 3. Review | `gemini_reviewer.py` | Batches code + findings into prompts, asks Gemini 2.5 Flash for a structured, severity-ranked review |
-
-`agent.py` orchestrates all three behind a single `CodeReviewAgent.review_repo()` call, and also exposes the same pipeline as a Google ADK 2.0 `Agent` + `FunctionTool` — so a Gemini-powered ADK agent can decide for itself, from a plain-language request, to call `review_repo_tool`. `report_generator.py` renders the result to Markdown, and `main.py` is the CLI entry point.
-
-### Use it programmatically
+**Use it programmatically:**
 
 ```python
 import os
@@ -111,7 +133,7 @@ for issue in result.review_report.issues:
     print(issue.severity, issue.path, issue.title)
 ```
 
-### Use it as an ADK agent
+**Use it as an ADK agent** — the model decides on its own when to call the review tool:
 
 ```python
 from agent import build_adk_agent
@@ -122,7 +144,7 @@ adk_agent = build_adk_agent(
 )
 ```
 
-Run `adk_agent` through any ADK `Runner` (e.g. `google.adk.runners.InMemoryRunner`). Given a prompt like *"review https://github.com/owner/repo and summarize the top issues,"* the model itself calls `review_repo_tool` — no manual function dispatch — receives the structured result, and writes a severity-prioritized summary. Verified directly against this project's own repository.
+Run `adk_agent` through any ADK `Runner` (e.g. `google.adk.runners.InMemoryRunner`) — or just run `python3 adk_demo.py` for a ready-made example. Given a prompt like *"review https://github.com/owner/repo and summarize the top issues,"* the model itself calls `review_repo_tool` — no manual function dispatch — receives the structured result, and writes a severity-prioritized summary. Verified directly against this project's own repository.
 
 ## Security, by design
 
@@ -141,7 +163,7 @@ pytest -v
 
 83 tests across all five modules. Every external dependency — GitHub's API, the Semgrep subprocess, the Gemini SDK — is mocked, so the suite runs in about a second with no network access or credentials.
 
-### Real-world verification, not just mocks
+## Real-world verification, not just mocks
 
 A real end-to-end run (not a test fixture) fetched 25 files, ran a live Semgrep scan, called Gemini 2.5 Flash, and produced a 23-issue report in 96 seconds with genuine findings — a Flask app left in debug mode, a hardcoded mock API key, an endpoint trusting a client-supplied ID. That run also surfaced three real integration bugs no mock could have caught, all now fixed and covered by regression tests:
 
@@ -163,15 +185,16 @@ code-review-agent/
 ├── gemini_reviewer.py        # stage 3: review
 ├── report_generator.py       # Markdown rendering
 ├── main.py                   # CLI entry point
-├── *_spec.md                 # spec written before each module's code
-├── tests/                    # 83 tests, one file per module
-├── KAGGLE_WRITEUP.md         # full capstone writeup
-└── VIDEO_SCRIPT.md           # demo video script
+├── adk_demo.py                # standalone ADK tool-calling demo
+├── *_spec.md                  # spec written before each module's code
+├── tests/                     # 83 tests, one file per module
+├── KAGGLE_WRITEUP.md           # full capstone writeup
+└── VIDEO_SCRIPT.md             # demo video script
 ```
 
 ## Known limitations
 
-`--config auto` requires reaching `semgrep.dev`'s rule registry over the network; locked-down CI runners or sandboxes with restrictive egress will need a local or registry-pinned ruleset instead. Gemini occasionally returns a transient `503` under high demand — `gemini_reviewer.py` retries automatically with exponential backoff, but a sustained outage still surfaces as a non-fatal `StageError` rather than blocking the run.
+`--config auto` requires reaching `semgrep.dev`'s rule registry over the network; locked-down CI runners or sandboxes with restrictive egress will need a local or registry-pinned ruleset instead. Gemini occasionally returns a transient `503` under high demand — `gemini_reviewer.py` retries automatically with exponential backoff, but a sustained outage still surfaces as a non-fatal `StageError` rather than blocking the run. Free-tier Gemini keys also cap total requests per day (not just per minute) — `--max-files` defaults to `10` and batches include a short inter-batch delay specifically to stretch a free-tier quota further.
 
 ## What this demonstrates
 
