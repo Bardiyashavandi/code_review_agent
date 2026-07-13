@@ -273,7 +273,19 @@ Response (200):
 }
 ```
 
-Error responses follow standard HTTP semantics: `404` for a missing repo, `401` for a bad token, `429` for a rate-limited GitHub key, `504` if the pipeline exceeds the timeout. Set `AGENT_TIMEOUT_S` in your environment to override the default 180-second limit.
+Error responses follow standard HTTP semantics:
+
+| Status | Cause |
+|---|---|
+| `400` | Bad orchestrator/config state (`AgentError`, `ValueError`) |
+| `401` | GitHub token is invalid or expired |
+| `404` | Repository not found (or private, without access) |
+| `429` | GitHub API rate limit hit |
+| `500` | Unexpected internal error (logged server-side with full traceback) |
+| `502` | GitHub API error unrelated to auth/rate-limit/not-found |
+| `504` | Pipeline exceeded the timeout — try a smaller `max_files` or raise `AGENT_TIMEOUT_S` |
+
+Request validation errors (bad `repo_url`, `max_files` outside 1–500) return FastAPI's standard `422` before the pipeline ever runs. Set `AGENT_TIMEOUT_S` in your environment to override the default 180-second limit.
 
 **`GET /health`** — liveness check, returns `{"status": "ok"}`.
 
