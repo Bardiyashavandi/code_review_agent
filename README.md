@@ -7,8 +7,9 @@
 ![Python](https://img.shields.io/badge/python-3.11%2B-blue)
 ![License](https://img.shields.io/badge/license-MIT-green)
 ![Tests](https://img.shields.io/badge/tests-107%20passing-brightgreen)
-![ADK](https://img.shields.io/badge/Google%20ADK-2.0-orange)
+![ADK](https://img.shields.io/badge/Google%20ADK-2.3-orange)
 ![ADK Tools](https://img.shields.io/badge/ADK%20tools-8-blueviolet)
+![FastAPI](https://img.shields.io/badge/FastAPI-0.115-009688)
 ![Cost](https://img.shields.io/badge/cost-%240-success)
 
 Kaggle 5-Day AI Agents Capstone — track: **Agents for Business**
@@ -24,6 +25,7 @@ Kaggle 5-Day AI Agents Capstone — track: **Agents for Business**
 - [What a run actually looks like](#what-a-run-actually-looks-like)
 - [Quick start](#quick-start)
 - [How it works](#how-it-works)
+- [HTTP API](#http-api)
 - [Security, by design](#security-by-design)
 - [Testing](#testing)
 - [Real-world verification](#real-world-verification-not-just-mocks)
@@ -33,7 +35,7 @@ Kaggle 5-Day AI Agents Capstone — track: **Agents for Business**
 
 ## The idea
 
-Static analyzers find patterns but can't explain why they matter. LLMs can explain things but hallucinate when given no real grounding. This agent closes that gap: it fetches your actual repository, runs real Semgrep static analysis on it, and hands both the code and the findings to Gemini 3.1 Flash Lite — so every issue in the final report is backed by either a deterministic rule or a model that's actually looking at your code, never a guess.
+Static analyzers find patterns but can't explain why they matter. LLMs can explain things but hallucinate when given no real grounding. This agent closes that gap: it fetches your actual repository, runs real Semgrep static analysis on it, and hands both the code and the findings to Gemini — so every issue in the final report is backed by either a deterministic rule or a model that's actually looking at your code, never a guess.
 
 Only a fetch failure is treated as fatal — there's nothing to review without files. A Semgrep or Gemini hiccup is captured as a non-fatal `StageError` instead, so the pipeline always returns a usable result, degraded but never empty-handed. This isn't theoretical: during real testing, Gemini intermittently threw transient `503` errors under load, and the retry logic kept the run going without dropping it.
 
@@ -51,7 +53,7 @@ Only a fetch failure is treated as fatal — there's nothing to review without f
                                   │ files + findings
                                   ▼
                        ┌────────────────────┐
-                       │   gemini_reviewer  │── Gemini 3.1 Flash Lite
+                       │   gemini_reviewer  │── Gemini Flash
                        └──────────┬─────────┘
                                   │ structured issues
                                   ▼
@@ -60,15 +62,19 @@ Only a fetch failure is treated as fatal — there's nothing to review without f
                        └────────────────────┘
 
    agent.py orchestrates the above AND exposes it as a
-   Google ADK 2.0 Agent + FunctionTool, so an LLM-driven
+   Google ADK 2.3 Agent + FunctionTool, so an LLM-driven
    agent runtime can decide on its own when to call it.
+
+   server.py wraps the same pipeline behind a FastAPI HTTP
+   endpoint, so any service can trigger a review over the
+   network with a single POST request.
 ```
 
 | Stage | Module | Job |
 |---|---|---|
 | 1. Fetch | `github_fetcher.py` | Walks the repo tree via the GitHub API, pulls every Python file, skips venvs/build noise |
 | 2. Scan | `semgrep_runner.py` | Writes files into an isolated sandbox, runs Semgrep, parses JSON into typed findings |
-| 3. Review | `gemini_reviewer.py` | Batches code + findings into prompts, asks Gemini 3.1 Flash Lite for a structured, severity-ranked review |
+| 3. Review | `gemini_reviewer.py` | Batches code + findings into prompts, asks Gemini for a structured, severity-ranked review |
 
 ### The agent's tool graph
 
@@ -113,13 +119,13 @@ Hardcoded Mock API Key (agent.py:95)
   Suggested fix: load all keys from environment variables, never literals.
 ```
 
-That's a real run against a real, unmodified repository, not a cherry-picked fixture — see [Real-world verification](#real-world-verification-not-just-mocks) below.
+That's a real run against a real, unmodified repository — see [Real-world verification](#real-world-verification-not-just-mocks) below.
 
 ## Quick start
 
 ```bash
-git clone https://github.com/Bardiyashavandi/code-review-agent
-cd code-review-agent
+git clone https://github.com/Bardiyashavandi/code_review_agent
+cd code_review_agent
 python3 -m pip install -r requirements.txt
 pipx install semgrep   # isolated — see "Why pipx" below
 ```
@@ -131,7 +137,7 @@ GITHUB_TOKEN=ghp_your_token_here
 GEMINI_API_KEY=your_gemini_key_here
 ```
 
-Run it:
+**Option 1 — CLI:**
 
 ```bash
 python3 main.py https://github.com/owner/repo --branch main --out review_report.md -v
@@ -139,9 +145,32 @@ python3 main.py https://github.com/owner/repo --branch main --out review_report.
 
 `--max-files` (default `10`) caps how many Python files get reviewed per run — kept conservative by default since Gemini's free tier caps requests per day; raise it if you have a higher quota.
 
+**Option 2 — HTTP API:**
+
+```bash
+uvicorn server:app --reload
+```
+
+Then POST a repo URL to get back a structured JSON review:
+
+```bash
+curl -s -X POST http://127.0.0.1:8000/analyze \
+     -H "Content-Type: application/json" \
+     -d '{"repo_url": "https://github.com/owner/repo", "max_files": 10}' \
+     | python3 -m json.tool
+```
+
+**Option 3 — ADK playground:**
+
+```bash
+adk web
+```
+
+Opens Google's ADK Dev UI at `http://127.0.0.1:8000` — chat with the agent directly in a browser, with a visual graph of all eight tool nodes.
+
 ## How it works
 
-`agent.py` orchestrates all three stages behind a single `CodeReviewAgent.review_repo()` call, and also exposes the same pipeline as a Google ADK 2.0 `Agent` + `FunctionTool` (via a module-level `root_agent`) — so a Gemini-powered ADK agent can decide for itself, from a plain-language request, to call `review_repo_tool`. `report_generator.py` renders the result to Markdown, and `main.py` is the CLI entry point.
+`agent.py` orchestrates all three stages behind a single `CodeReviewAgent.review_repo()` call, and also exposes the same pipeline as a Google ADK 2.3 `Agent` + `FunctionTool` (via a module-level `root_agent`) — so a Gemini-powered ADK agent can decide for itself, from a plain-language request, to call `review_repo_tool`.
 
 **Use it programmatically:**
 
@@ -169,7 +198,7 @@ adk_agent = build_adk_agent(
 )
 ```
 
-Run `adk_agent` through any ADK `Runner` (e.g. `google.adk.runners.InMemoryRunner`) — or just run `python3 adk_demo.py` for a ready-made example. The agent exposes eight tools, not one:
+Run `adk_agent` through any ADK `Runner` (e.g. `google.adk.runners.InMemoryRunner`) — or just run `python3 adk_demo.py` for a ready-made example.
 
 | Tool | Does |
 |---|---|
@@ -182,9 +211,73 @@ Run `adk_agent` through any ADK `Runner` (e.g. `google.adk.runners.InMemoryRunne
 | `explain_finding_tool` | Ask Gemini for a focused, deeper explanation of one already-known issue |
 | `generate_report_file_tool` | Render an already-produced review as Markdown and save it to disk |
 
-For a typical request like *"review https://github.com/owner/repo and summarize the top issues,"* the model calls `review_repo_tool` directly. For a narrower request — *"just show me the files in this repo,"* *"just run static analysis,"* *"find every place using eval,"* *"explain issue #3 in more detail,"* or *"save that as a file"* — the model instead reaches for the appropriate single tool, or plans a multi-step call sequence using the granular pipeline tools, passing each tool's output into the next itself. The agent's instructions also keep it in scope: asked something unrelated to code review, it declines and redirects rather than forcing an unrelated tool call. All of this was exercised and verified live in the ADK Dev UI playground, where the tool graph now shows eight distinct nodes branching from the agent.
+The agent's instructions also keep it in scope: asked something unrelated to code review, it declines and redirects rather than forcing an unrelated tool call. All of this was verified live in the ADK Dev UI playground, where the tool graph shows eight distinct nodes branching from the agent.
 
-This was verified two independent ways: once via the standalone `adk_demo.py` script, and again interactively in Google's own ADK Dev UI playground (`adk web`), which loads `agent.py`'s module-level `root_agent` and lets you chat with the agent directly in a browser, complete with a visual graph of all eight tool nodes. Both surfaced the same correct behavior — the model picking the right tool (or chaining several) for the request and returning accurate, well-formed output — which is stronger evidence than either check alone, since the Dev UI is Google's own tooling, not code this project wrote.
+## HTTP API
+
+`server.py` wraps the exact same `CodeReviewAgent.review_repo()` pipeline behind a FastAPI endpoint — no changes to internal logic, just a new way to trigger it.
+
+**Start the server:**
+
+```bash
+uvicorn server:app --reload                        # dev, auto-reloads on save
+uvicorn server:app --host 0.0.0.0 --port 8080     # prod-like
+```
+
+**Interactive docs:** `http://127.0.0.1:8000/docs` (Swagger UI, auto-generated from the Pydantic models)
+
+**`POST /analyze`**
+
+Request:
+
+```json
+{
+  "repo_url":  "https://github.com/owner/repo",
+  "branch":    "main",
+  "max_files": 10
+}
+```
+
+Response (200):
+
+```json
+{
+  "repo_url":     "https://github.com/owner/repo",
+  "duration_s":   11.1,
+  "files_fetched": 5,
+  "truncated":    false,
+  "review": {
+    "summary":        "2 issues found...",
+    "model":          "gemini-3.1-flash-lite",
+    "files_reviewed": 5,
+    "duration_s":     1.8,
+    "issues": [
+      {
+        "path":          "auth.py",
+        "line":          42,
+        "severity":      "HIGH",
+        "title":         "Hardcoded secret",
+        "description":   "...",
+        "suggested_fix": "...",
+        "rule_id":       null
+      }
+    ]
+  },
+  "scan": {
+    "scanned":    5,
+    "skipped":    [],
+    "duration_s": 4.3,
+    "findings":   []
+  },
+  "stage_errors": []
+}
+```
+
+Error responses follow standard HTTP semantics: `404` for a missing repo, `401` for a bad token, `429` for a rate-limited GitHub key, `504` if the pipeline exceeds the timeout. Set `AGENT_TIMEOUT_S` in your environment to override the default 180-second limit.
+
+**`GET /health`** — liveness check, returns `{"status": "ok"}`.
+
+Credentials stay server-side and are never passed by the caller.
 
 ## Security, by design
 
@@ -205,13 +298,13 @@ pytest -v
 
 ## Real-world verification, not just mocks
 
-A real end-to-end run (not a test fixture) fetched 25 files, ran a live Semgrep scan, called Gemini 3.1 Flash Lite, and produced a 23-issue report in 96 seconds with genuine findings — a Flask app left in debug mode, a hardcoded mock API key, an endpoint trusting a client-supplied ID. That run also surfaced three real integration bugs no mock could have caught, all now fixed and covered by regression tests:
+A real end-to-end run (not a test fixture) fetched 25 files, ran a live Semgrep scan, called Gemini, and produced a 23-issue report in 96 seconds with genuine findings — a Flask app left in debug mode, a hardcoded mock API key, an endpoint trusting a client-supplied ID. That run also surfaced three real integration bugs no mock could have caught, all now fixed and covered by regression tests:
 
 1. **Dependency conflict** — `google-adk` and `semgrep` pin incompatible `opentelemetry` ranges. Fixed by isolating Semgrep into its own `pipx` environment.
 2. **Stale shell env var** — `python-dotenv` never overrides an already-exported variable, so an old `GEMINI_API_KEY` from a previous test silently beat the correct `.env` value. Fixed by loading `.env` with `override=True`.
 3. **macOS symlink bug** — macOS resolves its temp dir through a `/private/...` symlink; a path comparison that worked fine on Linux raised `ValueError` on a real Mac.
 
-The ADK agent itself was also verified two ways — once via the `adk_demo.py` terminal script, and again live in Google's ADK Dev UI playground (`adk web`) — both producing the same correct tool-calling behavior and accurate review output.
+The ADK agent was verified two ways: once via the `adk_demo.py` terminal script, and again live in Google's ADK Dev UI playground (`adk web`) — both producing the same correct tool-calling behavior. The HTTP API was verified against a real repo with a live `curl` call returning a full JSON review.
 
 ### Why `pipx` for Semgrep
 
@@ -220,32 +313,30 @@ The ADK agent itself was also verified two ways — once via the `adk_demo.py` t
 ## Project structure
 
 ```
-code-review-agent/
+code_review_agent/
 ├── agent.py                  # orchestrator + ADK Agent/FunctionTool (exposes root_agent)
 ├── github_fetcher.py         # stage 1: fetch
 ├── semgrep_runner.py         # stage 2: scan
 ├── gemini_reviewer.py        # stage 3: review
 ├── report_generator.py       # Markdown rendering
 ├── main.py                   # CLI entry point
-├── adk_demo.py                # standalone ADK tool-calling demo
-├── *_spec.md                  # spec written before each module's code
-├── tests/                     # 107 tests, one file per module
-├── deploy/                    # optional cloud-deployment scaffold (not used for this
-│                               # submission — see "Known limitations"), generated by
-│                               # `agents-cli`: Dockerfile, FastAPI wrapper, uv-based build
-├── KAGGLE_WRITEUP.md           # full capstone writeup
-└── VIDEO_SCRIPT.md             # demo video script
+├── server.py                 # FastAPI HTTP wrapper (POST /analyze)
+├── adk_demo.py               # standalone ADK tool-calling demo
+├── *_spec.md                 # spec written before each module's code
+├── tests/                    # 107 tests, one file per module
+├── KAGGLE_WRITEUP.md         # full capstone writeup
+└── VIDEO_SCRIPT.md           # demo video script
 ```
 
 ## Known limitations
 
 `--config auto` requires reaching `semgrep.dev`'s rule registry over the network; locked-down CI runners or sandboxes with restrictive egress will need a local or registry-pinned ruleset instead. Gemini occasionally returns a transient `503` under high demand — `gemini_reviewer.py` retries automatically with exponential backoff, but a sustained outage still surfaces as a non-fatal `StageError` rather than blocking the run. Free-tier Gemini keys also cap total requests per day (not just per minute) — `--max-files` defaults to `10` and batches include a short inter-batch delay specifically to stretch a free-tier quota further.
 
-The `deploy/` folder contains a scaffolded Cloud Run/FastAPI deployment target generated while exploring Google's `agents-cli` tooling. It is not built, run, or required for this submission — real cloud deployment would typically need a billing-enabled Google Cloud project, which conflicts with this project's no-paid-services constraint, so it's kept here only as a documented next step.
+The HTTP server (`server.py`) runs locally and is not deployed to any cloud service — real cloud deployment would typically need a billing-enabled project, which conflicts with this project's no-paid-services constraint.
 
 ## What this demonstrates
 
-Every module started as a written spec (interface, behavior, error hierarchy, test table) before any implementation code — the `*_spec.md` files in this repo are the visible record of that. The orchestrator is a genuine Google ADK 2.0 tool, with the agent runtime itself deciding when to invoke the pipeline. No paid services are used anywhere — Semgrep's `--config auto`, Gemini, and the GitHub API are all free-tier, by hard constraint from day one.
+Every module started as a written spec (interface, behavior, error hierarchy, test table) before any implementation code — the `*_spec.md` files in this repo are the visible record of that. The orchestrator is a genuine Google ADK 2.3 tool, with the agent runtime itself deciding when to invoke the pipeline and which of the eight tools to chain. The same pipeline is also reachable over HTTP via a FastAPI server, making it callable from any language or service. No paid services are used anywhere — Semgrep's `--config auto`, Gemini, and the GitHub API are all free-tier, by hard constraint from day one.
 
 Full writeup: [`KAGGLE_WRITEUP.md`](./KAGGLE_WRITEUP.md). Demo video script: [`VIDEO_SCRIPT.md`](./VIDEO_SCRIPT.md).
 
