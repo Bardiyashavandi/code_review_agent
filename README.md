@@ -10,6 +10,7 @@
 ![ADK](https://img.shields.io/badge/Google%20ADK-2.3-orange)
 ![ADK Tools](https://img.shields.io/badge/ADK%20tools-8-blueviolet)
 ![FastAPI](https://img.shields.io/badge/FastAPI-0.115-009688)
+![Streamlit](https://img.shields.io/badge/Streamlit-1.45-FF4B4B)
 ![Cost](https://img.shields.io/badge/cost-%240-success)
 
 Kaggle 5-Day AI Agents Capstone — track: **Agents for Business**
@@ -26,6 +27,7 @@ Kaggle 5-Day AI Agents Capstone — track: **Agents for Business**
 - [Quick start](#quick-start)
 - [How it works](#how-it-works)
 - [HTTP API](#http-api)
+- [Streamlit UI](#streamlit-ui)
 - [Security, by design](#security-by-design)
 - [Testing](#testing)
 - [Real-world verification](#real-world-verification-not-just-mocks)
@@ -305,6 +307,32 @@ Request validation errors (bad `repo_url`, `max_files` outside 1–500) return F
 
 Credentials stay server-side and are never passed by the caller.
 
+## Streamlit UI
+
+`streamlit_app.py` is a browser UI that calls `server.py` over HTTP — it contains no agent logic itself. Both processes must run at the same time:
+
+```bash
+# Terminal 1 — keep running
+uvicorn server:app --reload
+
+# Terminal 2
+streamlit run streamlit_app.py
+```
+
+Opens at `http://localhost:8501`.
+
+**What you get:**
+
+- Repo URL input with client-side validation (must be `https://github.com/...`)
+- Branch and max-files controls
+- Color-coded severity badges (CRITICAL → HIGH → MEDIUM → LOW) on every issue
+- Each issue in an expandable card showing file, line, description, and suggested fix
+- Semgrep findings expandable per-finding with the actual code snippet (`st.code`)
+- Metrics row: files fetched, issues found, duration, model used
+- Specific readable error messages for every failure mode — connection refused, timeout, 404, 401, 429, 504 — never a raw traceback or JSON dump
+
+Point the UI at a remote server by setting `REVIEW_API_URL` in your environment (defaults to `http://127.0.0.1:8000`).
+
 ## Security, by design
 
 - Every subprocess call (Semgrep) uses explicit argument lists — never `shell=True`.
@@ -363,7 +391,7 @@ The HTTP server (`server.py`) runs locally and is not deployed to any cloud serv
 
 ## What this demonstrates
 
-Every module started as a written spec (interface, behavior, error hierarchy, test table) before any implementation code — the `*_spec.md` files in this repo are the visible record of that. The orchestrator is a genuine Google ADK 2.3 tool, with the agent runtime itself deciding when to invoke the pipeline and which of the eight tools to chain. The same pipeline is also reachable over HTTP via a FastAPI server, making it callable from any language or service. No paid services are used anywhere — Semgrep's `--config auto`, Gemini, and the GitHub API are all free-tier, by hard constraint from day one.
+Every module started as a written spec (interface, behavior, error hierarchy, test table) before any implementation code — the `*_spec.md` files in this repo are the visible record of that. The orchestrator is a genuine Google ADK 2.3 tool, with the agent runtime itself deciding when to invoke the pipeline and which of the eight tools to chain. The same pipeline is reachable four ways: CLI (`main.py`), HTTP API (`server.py`/FastAPI), browser chat (`adk web`/ADK Dev UI), and a visual web UI (`streamlit_app.py`/Streamlit) — all calling the same underlying `CodeReviewAgent` without duplicating any logic. No paid services are used anywhere — Semgrep's `--config auto`, Gemini, and the GitHub API are all free-tier, by hard constraint from day one.
 
 Full writeup: [`KAGGLE_WRITEUP.md`](./KAGGLE_WRITEUP.md). Demo video script: [`VIDEO_SCRIPT.md`](./VIDEO_SCRIPT.md).
 
