@@ -168,6 +168,20 @@ adk web
 
 Opens Google's ADK Dev UI at `http://127.0.0.1:8000` — chat with the agent directly in a browser, with a visual graph of all eight tool nodes.
 
+**Option 4 — Streamlit UI:**
+
+Both processes must be running at the same time — the UI calls the API server:
+
+```bash
+# Terminal 1 — API server (keep this running)
+uvicorn server:app --reload
+
+# Terminal 2 — Streamlit UI
+streamlit run streamlit_app.py
+```
+
+Opens at `http://localhost:8501` — paste a GitHub URL, set branch and file limit, click **Run Review**. Results show a severity-ranked issue list, Gemini summary, and Semgrep findings. Point the UI at a different server by setting `REVIEW_API_URL` in your environment.
+
 ## How it works
 
 `agent.py` orchestrates all three stages behind a single `CodeReviewAgent.review_repo()` call, and also exposes the same pipeline as a Google ADK 2.3 `Agent` + `FunctionTool` (via a module-level `root_agent`) — so a Gemini-powered ADK agent can decide for itself, from a plain-language request, to call `review_repo_tool`.
@@ -333,6 +347,7 @@ code_review_agent/
 ├── report_generator.py       # Markdown rendering
 ├── main.py                   # CLI entry point
 ├── server.py                 # FastAPI HTTP wrapper (POST /analyze)
+├── streamlit_app.py          # Streamlit UI (calls server.py)
 ├── adk_demo.py               # standalone ADK tool-calling demo
 ├── *_spec.md                 # spec written before each module's code
 ├── tests/                    # 107 tests, one file per module
