@@ -45,6 +45,7 @@ from google.adk.tools import FunctionTool
 
 import report_generator
 import tracing
+from dependency_scanner import scan_dependencies
 from gemini_reviewer import GeminiReviewer, GeminiReviewerError, ReviewIssue, ReviewReport
 from github_fetcher import FetchResult, FileResult, GitHubFetcher
 from semgrep_runner import Finding, ScanReport, SemgrepRunner, SemgrepRunnerError
@@ -254,6 +255,14 @@ class CodeReviewAgent:
     def generate_threat_model(self, files: list[FileResult]) -> dict:
         """Produce a STRIDE threat model from a list of source files."""
         return self._reviewer.generate_threat_model(files)
+
+    def generate_crypto_audit(self, files: list[FileResult]) -> dict:
+        """Audit source files for weak or misused cryptography."""
+        return self._reviewer.generate_crypto_audit(files)
+
+    def scan_dependency_cves(self, requirements_content: str) -> dict:
+        """Check requirements.txt content against the OSV vulnerability database."""
+        return scan_dependencies(requirements_content)
 
     # --- Additional, "interesting" tools -----------------------------------
     # Each of these is a distinct capability beyond the core fetch/scan/review
@@ -775,6 +784,82 @@ def make_validate_findings_tool(agent: CodeReviewAgent) -> Callable[..., dict]:
     return validate_findings_tool
 
 
+def make_fetch_requirements_tool(agent: CodeReviewAgent) -> Callable[..., dict]:
+    """Build a tool that fetches requirements.txt from a GitHub repo."""
+
+    def fetch_requirements_tool(repo_url: str, branch: str = DEFAULT_BRANCH) -> dict:
+        """Fetch the requirements.txt file from a GitHub repository.
+
+        repo_url: https://github.com/owner/repo
+        Returns {content, found} where content is the raw requirements.txt text.
+        If no requirements.txt is found, returns {found: false, content: ''}.
+        Use this before dependency_scan_tool."""
+        owner, repo = agent._fetcher.parse_repo_url(repo_url)
+        base = agent._fetcher._base_url
+        for filename in ("requirements.txt", "requirements/base.txt",
+                         "requirements/prod.txt", "requirements-prod.txt"):
+            url = f"{base}/repos/{owner}/{repo}/contents/{filename}?ref={branch}"
+            try:
+                import base64 as _b64
+                data = agent._fetcher._get(url)
+                content = _b64.b64decode(data.get("content", "")).decode("utf-8")
+                return {"found": True, "filename": filename, "content": content}
+            except Exception:
+                continue
+        return {"found": False, "filename": None, "content": ""}
+
+    return fetch_requirements_tool
+
+
+def make_dependency_scan_tool(agent: CodeReviewAgent) -> Callable[..., dict]:
+    """Build a CVE dependency scanner tool."""
+
+    def dependency_scan_tool(requirements_content: str) -> dict:
+        """Check Python dependencies for known CVEs via the OSV database.
+
+        requirements_content: raw text of a requirements.txt file (from
+        fetch_requirements_tool).
+
+        Returns {packages_checked, vulnerable, clean, no_version}.
+        vulnerable is a list of {package, version, cve_count, cves: [
+            {id, summary, severity, fixed_in}
+        ]}.
+        Always call fetch_requirements_tool first to get the content."""
+        if not isinstance(requirements_content, str) or not requirements_content.strip():
+            raise ValueError("requirements_content must be a non-empty string")
+        return agent.scan_dependency_cves(requirements_content)
+
+    return dependency_scan_tool
+
+
+def make_crypto_audit_tool(agent: CodeReviewAgent) -> Callable[..., dict]:
+    """Build a cryptography audit tool."""
+
+    def crypto_audit_tool(files: list[dict]) -> dict:
+        """Audit source files for weak, broken, or misused cryptography.
+
+        files: list of {path, content} dicts from fetch_repo_files_tool.
+
+        Detects: MD5/SHA1 password hashing, Python random for secrets,
+        ECB cipher mode, hardcoded/weak IVs, disabled TLS verification,
+        obsolete algorithms (DES, RC4), base64 as encryption, weak key
+        derivation.
+
+        Returns {findings: [{path, line, severity, pattern, current_code,
+        why_dangerous, correct_alternative, attacker_effort}], summary}.
+        Call fetch_repo_files_tool first, then pass the files here."""
+        if not isinstance(files, list) or not files:
+            raise ValueError("files must be a non-empty list")
+        file_objs = [
+            FileResult(path=f["path"], content=f.get("content", ""),
+                       sha="", size=len(f.get("content", "")), url="")
+            for f in files
+        ]
+        return agent.generate_crypto_audit(file_objs)
+
+    return crypto_audit_tool
+
+
 def make_threat_model_tool(agent: CodeReviewAgent) -> Callable[..., dict]:
     """Build a STRIDE threat model tool bound to a CodeReviewAgent instance."""
 
@@ -1092,7 +1177,70 @@ def build_multi_agent_system(
         ],
     )
 
-    # ── Layer 1d: Threat Model Agent ─────────────────────────────────────────
+    # ── Layer 1d: Dependency CVE Scanner ────────────────────────────────────
+    dependency_agent = Agent(
+        name="dependency_agent",
+        model=DEFAULT_MODEL,
+        description=(
+            "Dependency CVE Scanner: checks a repo's requirements.txt against "
+            "the OSV vulnerability database and reports known CVEs with severity "
+            "and fix versions."
+        ),
+        instruction=(
+            "You are the Dependency Security Scanner. You check third-party "
+            "libraries for known vulnerabilities — not the project's own code, "
+            "but the code it depends on.\n\n"
+            "WORKFLOW:\n"
+            "1. fetch_requirements_tool — fetch requirements.txt from the repo URL.\n"
+            "   If not found, tell the user and stop.\n"
+            "2. dependency_scan_tool — pass the requirements content to check each "
+            "   package against the OSV vulnerability database.\n\n"
+            "PRESENTING RESULTS:\n"
+            "For each vulnerable package: state the CVE ID, severity, what the "
+            "vulnerability allows an attacker to do, and the exact version to "
+            "upgrade to. Group by severity (CRITICAL first). For clean packages "
+            "just give a count. Mention any packages with no pinned version as "
+            "a risk (can't be checked and may pull in vulnerable versions).\n\n"
+            "Trigger phrases: 'dependency scan', 'check dependencies', 'CVE scan', "
+            "'are my dependencies safe', 'check requirements'."
+        ),
+        tools=[
+            _ft(make_fetch_requirements_tool),
+            _ft(make_dependency_scan_tool),
+        ],
+    )
+
+    # ── Layer 1e: Crypto Auditor ─────────────────────────────────────────────
+    crypto_agent = Agent(
+        name="crypto_agent",
+        model=DEFAULT_MODEL,
+        description=(
+            "Cryptography Auditor: detects weak, broken, or misused cryptography "
+            "in source code — MD5/SHA1 password hashing, predictable randomness, "
+            "ECB cipher mode, disabled TLS, obsolete algorithms."
+        ),
+        instruction=(
+            "You are the Cryptography Auditor. You find cryptographic mistakes "
+            "that look correct to most developers but are actually exploitable.\n\n"
+            "WORKFLOW:\n"
+            "1. fetch_repo_files_tool — fetch the source files.\n"
+            "2. crypto_audit_tool — pass the files for cryptographic analysis.\n\n"
+            "PRESENTING RESULTS:\n"
+            "For each finding, explain: what the weak pattern is, WHY it is "
+            "dangerous (not just that it is — give the concrete attack), how much "
+            "effort an attacker needs, and the exact correct replacement. Be "
+            "educational — assume the developer doesn't know why MD5 is broken "
+            "or why `random` is predictable.\n\n"
+            "Trigger phrases: 'crypto audit', 'cryptography review', 'weak crypto', "
+            "'check encryption', 'hash audit', 'is my crypto secure'."
+        ),
+        tools=[
+            _ft(make_fetch_repo_files_tool),
+            _ft(make_crypto_audit_tool),
+        ],
+    )
+
+    # ── Layer 1f: Threat Model Agent ─────────────────────────────────────────
     threat_model_agent = Agent(
         name="threat_model_agent",
         model=DEFAULT_MODEL,
@@ -1136,11 +1284,11 @@ def build_multi_agent_system(
         ),
         instruction=(
             "You are the master orchestrator of a 3-layer multi-agent code review "
-            "system with 9 specialized agents.\n\n"
+            "system with 11 specialized agents.\n\n"
             "ARCHITECTURE:\n"
             "  Layer 0: you (orchestrator)\n"
             "  Layer 1: scout_agent | analysis_coordinator | report_agent | "
-            "pr_agent | threat_model_agent\n"
+            "pr_agent | threat_model_agent | dependency_agent | crypto_agent\n"
             "  Layer 2: security_agent | quality_agent | validator_agent "
             "(inside analysis_coordinator)\n\n"
             "YOUR DIRECT TOOL (fastest path):\n"
@@ -1161,7 +1309,13 @@ def build_multi_agent_system(
             "- threat_model_agent: STRIDE threat model — assets, entry points, trust "
             "  boundaries, attack scenarios, missing defenses. Use for 'threat model', "
             "  'threat analysis', 'attack surface', 'how would an attacker', "
-            "  'what can go wrong'.\n\n"
+            "  'what can go wrong'.\n"
+            "- dependency_agent: CVE scanner for requirements.txt — checks each "
+            "  dependency against the OSV database. Use for 'dependency scan', "
+            "  'check dependencies', 'CVE scan', 'are my deps safe'.\n"
+            "- crypto_agent: cryptography auditor — finds weak hashing, predictable "
+            "  randomness, ECB mode, disabled TLS, obsolete algorithms. Use for "
+            "  'crypto audit', 'check encryption', 'weak crypto', 'hash audit'.\n\n"
             "ROUTING RULES:\n"
             "1. Repo URL + 'quick review' / no specific focus → review_repo_tool.\n"
             "2. 'What is this repo?' / 'scout' / 'list files' → scout_agent.\n"
@@ -1171,14 +1325,17 @@ def build_multi_agent_system(
             "5. 'Explain issue' / 'save report' → report_agent.\n"
             "6. 'Threat model' / 'attack surface' / 'how would an attacker' → "
             "   threat_model_agent.\n"
-            "7. Off-topic requests → politely decline.\n\n"
+            "7. 'Dependency scan' / 'CVE scan' / 'check requirements' → "
+            "   dependency_agent.\n"
+            "8. 'Crypto audit' / 'check encryption' / 'weak crypto' → crypto_agent.\n"
+            "9. Off-topic requests → politely decline.\n\n"
             "Always tell the user which agent you are delegating to and why."
         ),
         tools=[
             FunctionTool(make_review_repo_tool(pipeline)),
         ],
         sub_agents=[scout_agent, analysis_coordinator, report_agent, pr_agent,
-                    threat_model_agent],
+                    threat_model_agent, dependency_agent, crypto_agent],
     )
 
     return root
