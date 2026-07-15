@@ -618,7 +618,7 @@ That run also surfaced three integration bugs no mock could have caught:
 | Stale env var | `python-dotenv` won't override an already-exported variable | Load `.env` with `override=True` |
 | macOS symlink bug | macOS resolves its temp dir through `/private/...`; path comparison that works on Linux raised `ValueError` on a real Mac | Normalize paths before comparison |
 
-The multi-agent system was verified live in Google's ADK Dev UI playground — agent transfers visible in the Traces panel, the 3-layer graph rendered correctly with all 6 nodes.
+The multi-agent system was verified live in Google's ADK Dev UI playground — agent transfers visible in the Traces panel, the 5-layer graph rendered correctly with all 29 agents.
 
 ---
 
