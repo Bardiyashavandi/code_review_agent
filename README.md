@@ -68,7 +68,7 @@ flowchart TD
         Scout["🔍 scout_agent\nmetadata · file list · search"]
         Coord["🎯 analysis_coordinator\nroutes to Layer 2 specialists"]
         Report["📄 report_agent\nexplain findings · save file"]
-        PR["🔀 pr_agent\nPR diff · review"]
+        PR["🔀 pr_agent\nPR diff · review · post inline comments"]
     end
 
     subgraph L2["LAYER 2 — Analysis Specialists"]
@@ -130,7 +130,7 @@ LAYER 2 - Analysis Specialists
 | `scout_agent` | 1 | Lightweight repo inspection — metadata, file listing, pattern search. No LLM review. | `get_repo_metadata_tool`, `fetch_repo_files_tool`, `search_code_in_files_tool` |
 | `analysis_coordinator` | 1 | Decides security vs quality vs validation. Delegates to Layer 2 and aggregates results. | *(sub-agents only)* |
 | `report_agent` | 1 | Deep-dive explanations of individual findings + saves Markdown reports to disk. | `explain_finding_tool`, `generate_report_file_tool` |
-| `pr_agent` | 1 | Pull Request reviewer — fetches only changed files from a PR URL, not the whole repo. | `fetch_pr_files_tool`, `scan_code_tool`, `generate_review_tool`, `validate_findings_tool` |
+| `pr_agent` | 1 | Pull Request reviewer — fetches only changed files from a PR URL, runs Semgrep + LLM review, and can post findings as **inline GitHub PR comments** on the exact lines. | `fetch_pr_files_tool`, `scan_code_tool`, `generate_review_tool`, `validate_findings_tool`, `post_pr_review_tool` |
 | `security_agent` | 2 | Semgrep static analysis + LLM security-focused review. | `fetch_repo_files_tool`, `scan_code_tool`, `generate_review_tool`, `explain_finding_tool` |
 | `quality_agent` | 2 | LLM quality/readability review — no Semgrep, no security angle. | `fetch_repo_files_tool`, `generate_review_tool`, `search_code_in_files_tool` |
 | `validator_agent` | 2 | Cross-checks security findings against source code to flag false positives. | `validate_findings_tool` |
@@ -148,6 +148,7 @@ The root agent reads the user's intent and picks a path:
                                                                    → validator_agent
                                                                    → quality_agent
 "review this PR: github.com/.../pull/42"   →  pr_agent
+"review PR #42 and post to GitHub"         →  pr_agent → post_pr_review_tool
 "explain issue #3"                         →  report_agent
 "save the report"                          →  report_agent
 ```
@@ -572,7 +573,7 @@ code_review_agent/
 
 **Spec-driven development.** Every module started as a written spec (interface, behavior, error hierarchy, test table) before any implementation code. The `*_spec.md` files are the visible record of that.
 
-**Genuine multi-agent architecture.** Eight agents across three layers — root orchestrator, four domain specialists (scout, coordinator, PR reviewer, reporter), and three analysis agents (security, quality, validator). Each has a narrow role, focused instructions, and only the tools it actually needs. The `validator_agent` acts as a peer reviewer, cross-checking the `security_agent`'s findings against actual source code to filter false positives before results reach the user. Agent-to-agent transfers are explicit and visible in the ADK playground. A dedicated `pr_agent` reviews only the changed files in a Pull Request — not the whole repo.
+**Genuine multi-agent architecture.** Eight agents across three layers — root orchestrator, four domain specialists (scout, coordinator, PR reviewer, reporter), and three analysis agents (security, quality, validator). Each has a narrow role, focused instructions, and only the tools it actually needs. The `validator_agent` acts as a peer reviewer, cross-checking the `security_agent`'s findings against actual source code to filter false positives before results reach the user. Agent-to-agent transfers are explicit and visible in the ADK playground. A dedicated `pr_agent` reviews only the changed files in a Pull Request and can post its findings as **inline comments directly on the GitHub PR** — the agent writes back to GitHub, not just to a local report.
 
 **Four access surfaces, one pipeline.** The same `CodeReviewAgent` is reachable via CLI (`main.py`), HTTP API (`server.py`/FastAPI), browser chat (`adk web`/ADK Dev UI), and a visual web UI (`streamlit_app.py`/Streamlit) — without duplicating any logic.
 
