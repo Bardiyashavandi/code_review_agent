@@ -55,21 +55,30 @@ The pipeline is orchestrated by a **3-layer multi-agent system** built on Google
 The system is a directed graph of **8 agents** across three layers. The root orchestrator routes every user request to the right specialist; the analysis coordinator decides whether to delegate to security, quality, validation, or all three.
 
 ```mermaid
-graph TD
-    Root(["⭐ code_review_agent<br/><b>Orchestrator · Layer 0</b>"])
+flowchart TD
+    subgraph L0["LAYER 0 — Orchestrator"]
+        Root(["⭐ code_review_agent\n―――――――――――――――――――――\ntool: review_repo_tool\none-shot fast path"])
+    end
 
-    Root --> Scout["🔍 scout_agent<br/>Layer 1"]
-    Root --> Coord["🎯 analysis_coordinator<br/>Layer 1"]
-    Root --> Report["📄 report_agent<br/>Layer 1"]
-    Root --> PR["🔀 pr_agent<br/>Layer 1"]
+    subgraph L1["LAYER 1 — Domain Specialists"]
+        Scout["🔍 scout_agent\nmetadata · file list · search"]
+        Coord["🎯 analysis_coordinator\nroutes to Layer 2 specialists"]
+        Report["📄 report_agent\nexplain findings · save file"]
+        PR["🔀 pr_agent\nPR diff · review"]
+    end
 
-    Coord --> Sec["🔒 security_agent<br/>Layer 2"]
-    Coord --> Qual["✨ quality_agent<br/>Layer 2"]
-    Coord --> Val["✅ validator_agent<br/>Layer 2"]
+    subgraph L2["LAYER 2 — Analysis Specialists"]
+        Sec["🔒 security_agent\nSemgrep + LLM security review\nexplain findings"]
+        Qual["✨ quality_agent\nLLM quality review\npattern search"]
+        Val["✅ validator_agent\ncross-check findings\nflag false positives"]
+    end
 
-    classDef root fill:#1a7340,color:#fff,stroke:none,rx:8
-    classDef l1   fill:#1d3557,color:#fff,stroke:none,rx:6
-    classDef l2   fill:#5c2a2a,color:#fff,stroke:none,rx:6
+    Root --> Scout & Coord & Report & PR
+    Coord --> Sec & Qual & Val
+
+    classDef root fill:#1a7340,color:#fff,stroke:#0d5c2e
+    classDef l1   fill:#1d3557,color:#fff,stroke:#14253d
+    classDef l2   fill:#5c2a2a,color:#fff,stroke:#3d1a1a
 
     class Root root
     class Scout,Coord,Report,PR l1
@@ -98,9 +107,9 @@ graph TD
 │  │ · file list │  │ quality / validator  │  │   findings  │  │   diff   │ │
 │  │ · search    │  │                      │  │ · save file │  │ · review │ │
 │  └─────────────┘  └──────────┬───────────┘  └─────────────┘  └──────────┘ │
-└─────────────────────────────── │ ───────────────────────────────────────────┘
-                                 │  sub_agents
-              ┌──────────────────┼──────────────────┐
+└─────────────────────────────────────────────────────────────────────────────┘
+                               │  sub_agents (analysis_coordinator → Layer 2 only)
+              ┌────────────────┼───────────────┐
               │                  │                  │
 ┌─────────────▼──────────────────▼──────────────────▼──────────────────────┐
 │  LAYER 2 — Analysis Specialists                                           │
