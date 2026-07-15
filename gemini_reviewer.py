@@ -18,12 +18,22 @@ from __future__ import annotations
 
 import json
 import logging
+import os
+import sys
 import time
 from dataclasses import dataclass, field
 
 from google import genai
 from google.genai import errors as genai_errors
 from google.genai import types as genai_types
+
+# Ensure sibling modules (tracing, etc.) are importable regardless of how
+# this file is loaded (directly, via pytest, or via ADK's package import).
+_THIS_DIR = os.path.dirname(os.path.abspath(__file__))
+if _THIS_DIR not in sys.path:
+    sys.path.insert(0, _THIS_DIR)
+
+import tracing
 
 logger = logging.getLogger(__name__)
 
@@ -204,7 +214,7 @@ class GeminiReviewer:
                 if fnd.path in batch_paths
             ]
             prompt = self._build_prompt(batch, batch_findings)
-            raw_text = self._call_model(prompt)
+            raw_text = self._call_model(prompt, batch_index=i)
             issues, summary = self._parse_response(raw_text)
             all_issues.extend(issues)
             if summary:
@@ -254,6 +264,7 @@ class GeminiReviewer:
             prompt,
             system_instruction=EXPLAIN_SYSTEM_INSTRUCTION,
             json_mode=False,
+            span_name="gemini_explain",
         )
 
     # ------------------------------------------------------------------
@@ -305,66 +316,102 @@ class GeminiReviewer:
         prompt: str,
         system_instruction: str = SYSTEM_INSTRUCTION,
         json_mode: bool = True,
+        batch_index: int = 0,
+        span_name: str = "gemini_call",
     ) -> str:
         """Call Gemini with retry/backoff on rate limiting and transient
-        server overload. Returns raw response text."""
+        server overload. Returns raw response text.
+
+        Emits one llm_call tracing span per invocation, capturing prompt
+        size, token usage (if the SDK returns usage_metadata), and retry
+        count. The span records status=error on any un-retried exception.
+        """
         config_kwargs = {"system_instruction": system_instruction}
         if json_mode:
             config_kwargs["response_mime_type"] = "application/json"
 
-        for attempt in range(MAX_RETRIES + 1):
-            try:
-                response = self._client.models.generate_content(
-                    model=self._model,
-                    contents=prompt,
-                    config=genai_types.GenerateContentConfig(**config_kwargs),
-                )
-                return response.text
-            except genai_errors.APIError as exc:
-                code = getattr(exc, "code", None)
+        with tracing.span(
+            "llm_call", span_name,
+            model=self._model,
+            batch_index=batch_index,
+            prompt_chars=len(prompt),
+        ) as llm_span:
+            retry_count = 0
 
-                if code in (401, 403):
-                    raise GeminiAuthenticationError(
-                        "Invalid or expired Gemini API key.", http_status=code
+            for attempt in range(MAX_RETRIES + 1):
+                try:
+                    response = self._client.models.generate_content(
+                        model=self._model,
+                        contents=prompt,
+                        config=genai_types.GenerateContentConfig(**config_kwargs),
                     )
 
-                if code == 429:
-                    if attempt < MAX_RETRIES:
-                        sleep_time = 2 ** attempt
-                        logger.warning(
-                            "Gemini rate limited (HTTP %s). Sleeping %ss before retry %d/%d.",
-                            code, sleep_time, attempt + 1, MAX_RETRIES,
+                    # Capture token usage if the SDK exposes it — never crash
+                    # if the field is absent or None.
+                    usage = getattr(response, "usage_metadata", None)
+                    if usage is not None:
+                        llm_span.set(
+                            prompt_tokens=getattr(usage, "prompt_token_count", None),
+                            candidates_tokens=getattr(usage, "candidates_token_count", None),
+                            total_tokens=getattr(usage, "total_token_count", None),
+                            tokens_available=True,
                         )
-                        time.sleep(sleep_time)
-                        continue
-                    raise GeminiRateLimitError(
-                        f"Rate limit retries exhausted after {MAX_RETRIES} attempts.",
-                        http_status=code,
-                    )
+                    else:
+                        llm_span.set(tokens_available=False)
 
-                if code in (500, 503):
-                    # Transient server-side overload/error ("high demand"),
-                    # not a client problem -- worth a few retries.
-                    if attempt < MAX_RETRIES:
-                        sleep_time = 2 ** attempt
-                        logger.warning(
-                            "Gemini server error (HTTP %s). Sleeping %ss before retry %d/%d.",
-                            code, sleep_time, attempt + 1, MAX_RETRIES,
+                    llm_span.set(retry_count=retry_count)
+                    return response.text
+
+                except genai_errors.APIError as exc:
+                    code = getattr(exc, "code", None)
+
+                    if code in (401, 403):
+                        llm_span.set(retry_count=retry_count)
+                        raise GeminiAuthenticationError(
+                            "Invalid or expired Gemini API key.", http_status=code
                         )
-                        time.sleep(sleep_time)
-                        continue
+
+                    if code == 429:
+                        if attempt < MAX_RETRIES:
+                            sleep_time = 2 ** attempt
+                            logger.warning(
+                                "Gemini rate limited (HTTP %s). Sleeping %ss before retry %d/%d.",
+                                code, sleep_time, attempt + 1, MAX_RETRIES,
+                            )
+                            time.sleep(sleep_time)
+                            retry_count += 1
+                            continue
+                        llm_span.set(retry_count=retry_count)
+                        raise GeminiRateLimitError(
+                            f"Rate limit retries exhausted after {MAX_RETRIES} attempts.",
+                            http_status=code,
+                        )
+
+                    if code in (500, 503):
+                        if attempt < MAX_RETRIES:
+                            sleep_time = 2 ** attempt
+                            logger.warning(
+                                "Gemini server error (HTTP %s). Sleeping %ss before retry %d/%d.",
+                                code, sleep_time, attempt + 1, MAX_RETRIES,
+                            )
+                            time.sleep(sleep_time)
+                            retry_count += 1
+                            continue
+                        llm_span.set(retry_count=retry_count)
+                        raise GeminiAPIError(
+                            f"Gemini API error {code} persisted after {MAX_RETRIES} retries: "
+                            f"{getattr(exc, 'message', str(exc))}",
+                            http_status=code,
+                        )
+
+                    llm_span.set(retry_count=retry_count)
                     raise GeminiAPIError(
-                        f"Gemini API error {code} persisted after {MAX_RETRIES} retries: "
-                        f"{getattr(exc, 'message', str(exc))}",
+                        f"Gemini API error {code}: {getattr(exc, 'message', str(exc))}",
                         http_status=code,
                     )
 
-                raise GeminiAPIError(
-                    f"Gemini API error {code}: {getattr(exc, 'message', str(exc))}",
-                    http_status=code,
-                )
-
-        raise GeminiAPIError("Exceeded maximum retries.")  # should be unreachable
+            llm_span.set(retry_count=retry_count)
+            raise GeminiAPIError("Exceeded maximum retries.")  # should be unreachable
 
     def _parse_response(self, raw_text: str) -> tuple[list[ReviewIssue], str]:
         """Parse a batch's JSON response into ReviewIssue objects + summary text."""

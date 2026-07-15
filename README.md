@@ -307,6 +307,46 @@ Request validation errors (bad `repo_url`, `max_files` outside 1–500) return F
 
 Credentials stay server-side and are never passed by the caller.
 
+## Observability
+
+Every pipeline run writes structured JSON spans to `traces/trace.jsonl` (appended, never overwritten). Three levels are captured: a run-level span wrapping the entire `review_repo()` call, stage-level spans for fetch / scan / review, and an LLM-call span for each Gemini request — including token counts, prompt size, retry count, and latency.
+
+After any run, inspect it with:
+
+```bash
+python3 view_trace.py              # last full run as an indented tree
+python3 view_trace.py --tail 20    # last 20 spans flat, across run boundaries
+python3 view_trace.py --list       # list all run_ids with timestamps
+python3 view_trace.py --run a3f1   # specific run by id prefix
+```
+
+Example tree output:
+
+```
+▶ RUN  review_repo  ✓  11.47s  run_id=a3f1c2d4
+  2026-07-15 10:23:01 UTC
+  repo_url:  https://github.com/owner/repo
+  branch=main · max_files=10
+  23 files fetched · 2 semgrep findings · 5 issues
+
+  ├─ STAGE  fetch  ✓  1.23s
+  │    files_fetched=23 · truncated=False
+
+  ├─ STAGE  scan  ✓  4.28s
+  │    scanned=23 · findings=2 · skipped=0
+
+  ├─ STAGE  review  ✓  5.87s
+  │    files_reviewed=23 · issues=5 · model=gemini-3.1-flash-lite
+  │    └─ LLM  gemini_call  batch=0  ✓  1.92s
+  │         prompt_chars=18234 · tokens=1205→312 (1517 total) · retries=0
+  │    └─ LLM  gemini_call  batch=1  ✓  1.85s
+  │         prompt_chars=15612 · tokens=1156→298 (1454 total) · retries=0
+
+  Gemini calls today: 2 / 500  [█░░░░░░░░░░░░░░░░░░░]  1%
+```
+
+`traces/` is gitignored — it's runtime data, not source.
+
 ## Streamlit UI
 
 `streamlit_app.py` is a browser UI that calls `server.py` over HTTP — it contains no agent logic itself. Both processes must run at the same time:

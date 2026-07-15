@@ -207,6 +207,9 @@ tools/a2a-inspector/
 review_report.md
 test_report.md
 
+# Observability: runtime trace logs (generated data, not source)
+traces/
+
 # Local-only debug scaffolding from ADK Dev UI troubleshooting - not part of the
 # published project, kept locally for reference only
 code_review_agent/

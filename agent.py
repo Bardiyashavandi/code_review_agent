@@ -44,6 +44,7 @@ from google.adk.agents import Agent
 from google.adk.tools import FunctionTool
 
 import report_generator
+import tracing
 from gemini_reviewer import GeminiReviewer, GeminiReviewerError, ReviewIssue, ReviewReport
 from github_fetcher import FetchResult, FileResult, GitHubFetcher
 from semgrep_runner import Finding, ScanReport, SemgrepRunner, SemgrepRunnerError
@@ -134,53 +135,86 @@ class CodeReviewAgent:
         start = time.monotonic()
         stage_errors: list[StageError] = []
 
-        # --- Fetch: fatal on failure -----------------------------------
-        fetch_result = self._fetcher.fetch_python_files(url, branch=branch, max_files=max_files)
-        logger.info("Fetched %d files from %s", len(fetch_result.files), url)
+        with tracing.span(
+            "run", "review_repo",
+            repo_url=url, branch=branch, max_files=max_files,
+        ) as run_span:
 
-        # --- Scan: non-fatal on failure ---------------------------------
-        try:
-            scan_report = self._semgrep.scan(fetch_result.files)
-        except (SemgrepRunnerError, ValueError) as exc:
-            message = getattr(exc, "message", str(exc))
-            logger.warning("Scan stage failed: %s", message)
-            stage_errors.append(StageError(stage="scan", message=message))
-            scan_report = ScanReport(
-                findings=[],
-                scanned=0,
-                skipped=[f.path for f in fetch_result.files],
-                duration_s=0.0,
+            # --- Fetch: fatal on failure -----------------------------------
+            with tracing.span("stage", "fetch", repo_url=url, branch=branch) as fetch_span:
+                fetch_result = self._fetcher.fetch_python_files(url, branch=branch, max_files=max_files)
+                fetch_span.set(
+                    files_fetched=len(fetch_result.files),
+                    truncated=fetch_result.truncated,
+                )
+            logger.info("Fetched %d files from %s", len(fetch_result.files), url)
+
+            # --- Scan: non-fatal on failure ---------------------------------
+            try:
+                with tracing.span("stage", "scan", files_in=len(fetch_result.files)) as scan_span:
+                    scan_report = self._semgrep.scan(fetch_result.files)
+                    scan_span.set(
+                        scanned=scan_report.scanned,
+                        findings=len(scan_report.findings),
+                        skipped=len(scan_report.skipped),
+                    )
+            except (SemgrepRunnerError, ValueError) as exc:
+                message = getattr(exc, "message", str(exc))
+                logger.warning("Scan stage failed: %s", message)
+                stage_errors.append(StageError(stage="scan", message=message))
+                scan_report = ScanReport(
+                    findings=[],
+                    scanned=0,
+                    skipped=[f.path for f in fetch_result.files],
+                    duration_s=0.0,
+                )
+
+            # --- Review: non-fatal on failure --------------------------------
+            try:
+                with tracing.span("stage", "review", files_in=len(fetch_result.files)) as review_span:
+                    review_report = self._reviewer.review(fetch_result.files, scan_report)
+                    review_span.set(
+                        files_reviewed=review_report.files_reviewed,
+                        issues=len(review_report.issues),
+                        model=review_report.model,
+                    )
+            except (GeminiReviewerError, ValueError) as exc:
+                message = getattr(exc, "message", str(exc))
+                logger.warning("Review stage failed: %s", message)
+                stage_errors.append(StageError(stage="review", message=message))
+                review_report = ReviewReport(
+                    issues=[],
+                    summary=f"Review unavailable: {message}",
+                    model=DEFAULT_MODEL,
+                    files_reviewed=0,
+                    duration_s=0.0,
+                )
+
+            duration = time.monotonic() - start
+            logger.info(
+                "Pipeline complete for %s in %.2fs (%d stage errors)",
+                url, duration, len(stage_errors),
             )
 
-        # --- Review: non-fatal on failure --------------------------------
-        try:
-            review_report = self._reviewer.review(fetch_result.files, scan_report)
-        except (GeminiReviewerError, ValueError) as exc:
-            message = getattr(exc, "message", str(exc))
-            logger.warning("Review stage failed: %s", message)
-            stage_errors.append(StageError(stage="review", message=message))
-            review_report = ReviewReport(
-                issues=[],
-                summary=f"Review unavailable: {message}",
-                model=DEFAULT_MODEL,
-                files_reviewed=0,
-                duration_s=0.0,
+            run_span.set(
+                files_fetched=len(fetch_result.files),
+                truncated=fetch_result.truncated,
+                semgrep_findings=len(scan_report.findings),
+                review_issues=len(review_report.issues),
+                stage_errors=[e.stage for e in stage_errors],
+                duration_s=round(duration, 3),
             )
 
-        duration = time.monotonic() - start
-        logger.info(
-            "Pipeline complete for %s in %.2fs (%d stage errors)",
-            url, duration, len(stage_errors),
-        )
+            result = PipelineResult(
+                repo_url=url,
+                fetch_result=fetch_result,
+                scan_report=scan_report,
+                review_report=review_report,
+                stage_errors=stage_errors,
+                duration_s=duration,
+            )
 
-        return PipelineResult(
-            repo_url=url,
-            fetch_result=fetch_result,
-            scan_report=scan_report,
-            review_report=review_report,
-            stage_errors=stage_errors,
-            duration_s=duration,
-        )
+        return result
 
     # --- Granular, single-stage entry points -----------------------------
     # These exist so the ADK agent can be given separate fetch/scan/review
