@@ -89,24 +89,24 @@ flowchart TD
 ┌─────────────────────────────────────────────────────────────────────────────┐
 │  LAYER 0 — Orchestrator                                                     │
 │                                                                             │
-│                    ┌──────────────────────────┐                            │
-│                    │    code_review_agent      │  tool: review_repo_tool   │
-│                    │    (root orchestrator)    │  ← one-shot fast path     │
-│                    └──────────┬───────────────┘                            │
+│                    ┌──────────────────────────┐                             │
+│                    │    code_review_agent      │  tool: review_repo_tool    │
+│                    │    (root orchestrator)    │  ← one-shot fast path      │
+│                    └──────────┬───────────────┘                             │
 └───────────────────────────────┼─────────────────────────────────────────────┘
                                 │  sub_agents
           ┌─────────────────────┼──────────────┬──────────────┐
           │                     │              │              │
-┌─────────▼─────────────────────▼──────────────▼──────────────▼──────────────┐
+┌─────────▼─────────────────────▼──────────────▼──────────────▼────────────── ┐
 │  LAYER 1 — Domain Specialists                                               │
 │                                                                             │
-│  ┌─────────────┐  ┌──────────────────────┐  ┌─────────────┐  ┌──────────┐ │
-│  │ scout_agent │  │ analysis_coordinator │  │report_agent │  │ pr_agent │ │
-│  │             │  │                      │  │             │  │          │ │
-│  │ · metadata  │  │ routes to security / │  │ · explain   │  │ · PR     │ │
-│  │ · file list │  │ quality / validator  │  │   findings  │  │   diff   │ │
-│  │ · search    │  │                      │  │ · save file │  │ · review │ │
-│  └─────────────┘  └──────────┬───────────┘  └─────────────┘  └──────────┘ │
+│  ┌─────────────┐  ┌──────────────────────┐  ┌─────────────┐  ┌──────────┐   │
+│  │ scout_agent │  │ analysis_coordinator │  │report_agent │  │ pr_agent │   │
+│  │             │  │                      │  │             │  │          │   │
+│  │ · metadata  │  │ routes to security / │  │ · explain   │  │ · PR     │   │
+│  │ · file list │  │ quality / validator  │  │   findings  │  │   diff   │   │
+│  │ · search    │  │                      │  │ · save file │  │ · review │   │
+│  └─────────────┘  └──────────┬───────────┘  └─────────────┘  └──────────┘   │
 └─────────────────────────────────────────────────────────────────────────────┘
                                │  sub_agents (analysis_coordinator → Layer 2 only)
               ┌────────────────┼───────────────┐
