@@ -17,7 +17,10 @@ A root orchestrator agent (`code_review_agent`) delegates to a three-layer multi
 
 1. **Fetch.** `scout_agent` walks the repository's file tree through the GitHub API and pulls down every Python source file, skipping virtual environments, build artifacts, and other noise that would waste review budget.
 2. **Analyze.** `analysis_coordinator` routes to three Layer 2 specialist agents in parallel: `security_agent` (Semgrep + LLM security review), `quality_agent` (LLM quality review + pattern search), and `validator_agent` (cross-checks findings against source, flags false positives).
-3. **Report.** `report_agent` takes the consolidated findings and renders a severity-sorted Markdown report with concrete fix suggestions. `pr_agent` handles PR diff review as a separate mode.
+3. **Report.** `report_agent` takes the consolidated findings and renders a severity-sorted Markdown report with concrete fix suggestions. `pr_agent` handles PR diff review as a separate mode and can post findings as **inline GitHub PR comments** on the exact changed lines.
+4. **Threat model.** `threat_model_agent` applies STRIDE methodology (Spoofing, Tampering, Repudiation, Information Disclosure, DoS, Elevation of Privilege) to the full codebase — identifying assets, entry points, trust boundaries, and concrete attacker scenarios with step-by-step attack paths.
+5. **Dependency CVEs.** `dependency_agent` fetches `requirements.txt` and queries the free [OSV](https://osv.dev) batch API for known vulnerabilities, returning CVE IDs, severity scores, and recommended fix versions. No API key required.
+6. **Cryptography audit.** `crypto_agent` inspects source files for insecure cryptographic patterns: MD5/SHA1 for passwords, Python `random` for secrets, AES-ECB mode, hardcoded IVs and keys, disabled TLS, and base64-as-encryption. Each finding includes attacker effort (seconds/minutes/hours) and a safe alternative.
 
 The pipeline is also exposed as a FastAPI REST service (`server.py`) with a Streamlit web UI (`streamlit_app.py`) and a `/traces` endpoint for full observability of every agent run. A `review_repo_tool` wraps the pipeline so it can be invoked by an LLM-driven ADK agent runtime from a plain-language request.
 
@@ -30,39 +33,35 @@ LAYER 0 - Orchestrator
 +-----------------------------------------------------------------------+
 |  code_review_agent (root)          tool: review_repo_tool (one-shot)  |
 +-----------------------------------------------------------------------+
-       |                    |                   |                |
-       v                    v                   v                v
+    |          |           |           |          |           |
+    v          v           v           v          v           v
 LAYER 1 - Domain Specialists
-+-------------+  +---------------------+  +-------------+  +----------+
-| scout_agent |  | analysis_coordinator|  | report_agent|  | pr_agent |
-|             |  |                     |  |             |  |          |
-| - metadata  |  | routes to Layer 2:  |  | - explain   |  | - PR     |
-| - file list |  |   security_agent    |  |   findings  |  |   diff   |
-| - search    |  |   quality_agent     |  | - save file |  | - review |
-|             |  |   validator_agent   |  |             |  |          |
-+-------------+  +----------+----------+  +-------------+  +----------+
-                            |
-                            | sub_agents (analysis_coordinator only)
-                   +--------+--------+
-                   |        |        |
-                   v        v        v
-LAYER 2 - Analysis Specialists
-+------------------+  +------------------+  +-----------------+
-| security_agent   |  | quality_agent    |  | validator_agent |
-|                  |  |                  |  |                 |
-| - fetch files    |  | - fetch files    |  | - cross-check   |
-| - Semgrep scan   |  | - LLM quality    |  |   findings vs   |
-| - LLM sec review |  |   review         |  |   source code   |
-| - explain finding|  | - pattern search |  | - flag false    |
-|                  |  |                  |  |   positives     |
-+------------------+  +------------------+  +-----------------+
++---------+ +-----------+ +----------+ +--------+ +-----------+ +----------+
+|scout    | |analysis   | |report    | |pr_agent| |threat_    | |dependency|
+|_agent   | |_coordinator| |_agent   | |        | |model_agent| |_agent    |
+|         | |           | |          | |- PR    | |           | |          |
+|-metadata| |→ Layer 2  | |- explain | |  diff  | |- STRIDE   | |- OSV CVE |
+|-file    | |  security | |  findings| |- post  | |- attack   | |  query   |
+|  list   | |  quality  | |- save    | |  inline| |  scenarios| |- fix     |
+|-search  | |  validator| |  file    | |comments| |- entry pts| |  versions|
++---------+ +-----+-----+ +----------+ +--------+ +-----------+ +----------+
+                  |
+         +--------+--------+     +-----------+
+         |        |        |     |crypto_    |
+         v        v        v     |_agent     | ← also Layer 1
+  security   quality  validator  |           |
+  _agent     _agent   _agent     |-MD5/SHA1  |
+                                 |-ECB mode  |
+                                 |-hardcoded |
+                                 |  keys     |
+                                 +-----------+
 ```
 
-The same pipeline is reachable three ways: as a CLI (`main.py`), as a REST API (`uvicorn server:app`), and through the Streamlit web UI. All three routes share the same agent pipeline and produce the same structured output.
+The same pipeline is reachable four ways: as a CLI (`main.py`), as a REST API (`uvicorn server:app`), through the Streamlit web UI, and interactively through the ADK Dev UI playground. All four routes share the same agent pipeline and produce the same structured output.
 
 ## Key concepts demonstrated
 
-**Multi-agent system (ADK).** Eight agents across three layers, built with Google ADK 2.3. `analysis_coordinator` uses ADK's `sub_agents` mechanism to delegate to `security_agent`, `quality_agent`, and `validator_agent` in parallel — the coordinator decides which specialists to invoke and merges their findings, rather than the code dispatching directly. The root agent uses a `FunctionTool` (`review_repo_tool`) that the LLM runtime invokes based on a plain-language request, with no manual intent parsing.
+**Multi-agent system (ADK).** Eleven agents across three layers, built with Google ADK 2.3. `analysis_coordinator` uses ADK's `sub_agents` mechanism to delegate to `security_agent`, `quality_agent`, and `validator_agent` — the coordinator decides which specialists to invoke and merges their findings, rather than the code dispatching directly. The root agent uses a `FunctionTool` (`review_repo_tool`) that the LLM runtime invokes based on a plain-language request, with no manual intent parsing. Three additional Layer 1 specialists handle orthogonal security concerns: `threat_model_agent` (STRIDE), `dependency_agent` (OSV CVE scan), and `crypto_agent` (cryptographic hygiene).
 
 **Security features.** Security was treated as a first-class requirement throughout, not bolted on afterward:
 - All subprocess invocations (Semgrep) use explicit argument lists — never `shell=True` — eliminating shell injection.
@@ -78,7 +77,7 @@ The same pipeline is reachable three ways: as a CLI (`main.py`), as a REST API (
 
 ## Real-world verification, not synthetic testing
 
-A capstone project that only ever sees mocked inputs proves the code parses correctly, not that it works. So beyond the 108-test mocked suite (covering batching logic, severity sorting, error handling, and the security cases above — all running in about a second with no network access or credentials), this project was run end-to-end against a real, unmodified GitHub repository with real credentials, real network calls, and real LLM output.
+A capstone project that only ever sees mocked inputs proves the code parses correctly, not that it works. So beyond the 110-test mocked suite (covering batching logic, severity sorting, error handling, and the security cases above — all running in about a second with no network access or credentials), this project was run end-to-end against a real, unmodified GitHub repository with real credentials, real network calls, and real LLM output.
 
 A real run (visible in the demo GIF) fetched 22 Python files, ran a live Semgrep scan, sent the results through the full multi-agent pipeline, and produced a 12-issue report in 37 seconds — including genuine HIGH-severity findings like subprocess environment variable leakage and hardcoded environment dependencies. These aren't synthetic test fixtures; they're real code smells found by the actual pipeline doing its actual job.
 
@@ -124,4 +123,4 @@ Full setup, usage, and ADK-agent examples are in the repository's `README.md`.
 
 ## What this demonstrates
 
-The project grew from a single-agent pipeline into an eight-agent, three-layer system — not to check rubric boxes, but because the multi-agent design naturally maps to how a real engineering team would divide the work: one agent to scout the repo, specialist agents for security and quality analysis, a validator to cross-check for false positives, and a report agent to explain findings to a human. The 108 tests, the CI pipeline, the tracing endpoint, and the three real bugs found during end-to-end testing are the evidence that this is a working system, not a demo assembled for a deadline.
+The project grew from a single-agent pipeline into an eleven-agent, three-layer system — not to check rubric boxes, but because the multi-agent design naturally maps to how a real security team would divide the work: one agent to scout the repo, specialist agents for security and quality analysis, a validator to cross-check for false positives, a threat modeler to reason about attack surfaces, a dependency scanner to check CVEs, a crypto auditor to flag insecure algorithms, and a report agent to explain findings to a human. The 110 tests, the CI pipeline, the tracing endpoint, and the three real bugs found during end-to-end testing are the evidence that this is a working system, not a demo assembled for a deadline.

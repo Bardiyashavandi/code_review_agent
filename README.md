@@ -9,9 +9,9 @@
 [![Gemini](https://img.shields.io/badge/Gemini-Flash%20Lite-8E24AA?logo=google&logoColor=white)](https://ai.google.dev)
 [![FastAPI](https://img.shields.io/badge/FastAPI-0.115-009688?logo=fastapi&logoColor=white)](https://fastapi.tiangolo.com)
 [![Streamlit](https://img.shields.io/badge/Streamlit-1.45-FF4B4B?logo=streamlit&logoColor=white)](https://streamlit.io)
-[![Tests](https://img.shields.io/badge/tests-107%20passing-22c55e?logo=pytest&logoColor=white)](./tests)
+[![Tests](https://img.shields.io/badge/tests-110%20passing-22c55e?logo=pytest&logoColor=white)](./tests)
 [![CI](https://github.com/Bardiyashavandi/code_review_agent/actions/workflows/ci.yml/badge.svg)](https://github.com/Bardiyashavandi/code_review_agent/actions/workflows/ci.yml)
-[![Agents](https://img.shields.io/badge/agents-9-blueviolet)](#multi-agent-architecture)
+[![Agents](https://img.shields.io/badge/agents-11-blueviolet)](#multi-agent-architecture)
 [![Layers](https://img.shields.io/badge/layers-3-orange)](#multi-agent-architecture)
 [![Cost](https://img.shields.io/badge/cost-%240-success)](https://ai.google.dev/pricing)
 
@@ -48,7 +48,7 @@
 
 Static analyzers find patterns but can't explain why they matter. LLMs can explain things but hallucinate when given no real grounding. This agent closes that gap: it fetches your actual repository, runs real Semgrep static analysis on it, and hands both the code and the findings to Gemini — so every issue in the final report is backed by a deterministic rule or a model that's actually reading your code, never a guess.
 
-The pipeline is orchestrated by a **3-layer multi-agent system** built on Google ADK 2.3. Nine specialized agents handle routing, analysis, reporting, PR review, and threat modeling — each with its own narrowly scoped tool set and instructions, rather than one monolithic agent doing everything.
+The pipeline is orchestrated by a **3-layer multi-agent system** built on Google ADK 2.3. Eleven specialized agents handle routing, analysis, reporting, PR review, threat modeling, dependency CVE scanning, and cryptography auditing — each with its own narrowly scoped tool set and instructions, rather than one monolithic agent doing everything.
 
 > **No paid services.** Semgrep `--config auto`, Gemini Flash Lite, and the GitHub API are all free-tier. Hard constraint from day one.
 
@@ -56,7 +56,7 @@ The pipeline is orchestrated by a **3-layer multi-agent system** built on Google
 
 ## Multi-Agent Architecture
 
-The system is a directed graph of **8 agents** across three layers. The root orchestrator routes every user request to the right specialist; the analysis coordinator decides whether to delegate to security, quality, validation, or all three.
+The system is a directed graph of **11 agents** across three layers. The root orchestrator routes every user request to the right specialist; the analysis coordinator decides whether to delegate to security, quality, validation, or all three.
 
 ```mermaid
 flowchart TD
@@ -70,6 +70,8 @@ flowchart TD
         Report["📄 report_agent\nexplain findings · save file"]
         PR["🔀 pr_agent\nPR diff · review · post inline comments"]
         TM["🗺️ threat_model_agent\nSTRIDE · attack scenarios · entry points"]
+        Dep["📦 dependency_agent\nOSV CVE scan · fix versions"]
+        Crypto["🔐 crypto_agent\nweak algorithms · insecure randomness · ECB · hardcoded keys"]
     end
 
     subgraph L2["LAYER 2 — Analysis Specialists"]
@@ -78,7 +80,7 @@ flowchart TD
         Val["✅ validator_agent\ncross-check findings\nflag false positives"]
     end
 
-    Root --> Scout & Coord & Report & PR & TM
+    Root --> Scout & Coord & Report & PR & TM & Dep & Crypto
     Coord --> Sec & Qual & Val
 
     classDef root fill:#1a7340,color:#fff,stroke:#0d5c2e
@@ -86,7 +88,7 @@ flowchart TD
     classDef l2   fill:#5c2a2a,color:#fff,stroke:#3d1a1a
 
     class Root root
-    class Scout,Coord,Report,PR l1
+    class Scout,Coord,Report,PR,TM,Dep,Crypto l1
     class Sec,Qual,Val l2
 ```
 
@@ -98,15 +100,15 @@ LAYER 0 - Orchestrator
     |           |              |              |               |
     v           v              v              v               v
 LAYER 1 - Domain Specialists
-+----------+ +---------------------+ +----------+ +--------+ +-------------------+
-|scout_agent| |analysis_coordinator | |pr_agent  | |report  | |threat_model_agent |
-|          | |                     | |          | |_agent  | |                   |
-|- metadata| | routes to Layer 2:  | |- PR diff | |- expl. | |- STRIDE threats   |
-|- file    | |   security_agent    | |- review  | |  issue | |- attack scenarios |
-|  list    | |   quality_agent     | |- post    | |- save  | |- entry points     |
-|- search  | |   validator_agent   | |  inline  | |  file  | |- missing defenses |
-|          | |                     | |  comments| |        | |                   |
-+----------+ +----------+----------+ +----------+ +--------+ +-------------------+
++----------+ +---------------------+ +----------+ +--------+ +-------------------+ +------------------+ +------------------+
+|scout_agent| |analysis_coordinator | |pr_agent  | |report  | |threat_model_agent | |dependency_agent  | |crypto_agent      |
+|          | |                     | |          | |_agent  | |                   | |                  | |                  |
+|- metadata| | routes to Layer 2:  | |- PR diff | |- expl. | |- STRIDE threats   | |- fetch           | |- fetch files     |
+|- file    | |   security_agent    | |- review  | |  issue | |- attack scenarios | |  requirements    | |- detect MD5/SHA1 |
+|  list    | |   quality_agent     | |- post    | |- save  | |- entry points     | |- OSV CVE query   | |- random vs       |
+|- search  | |   validator_agent   | |  inline  | |  file  | |- missing defenses | |- fix versions    | |  secrets         |
+|          | |                     | |  comments| |        | |                   | |                  | |- ECB · hardcoded |
++----------+ +----------+----------+ +----------+ +--------+ +-------------------+ +------------------+ +------------------+
                         |
                         | sub_agents (analysis_coordinator only)
                +--------+--------+
@@ -134,6 +136,8 @@ LAYER 2 - Analysis Specialists
 | `report_agent` | 1 | Deep-dive explanations of individual findings + saves Markdown reports to disk. | `explain_finding_tool`, `generate_report_file_tool` |
 | `pr_agent` | 1 | Pull Request reviewer — fetches only changed files from a PR URL, runs Semgrep + LLM review, and can post findings as **inline GitHub PR comments** on the exact lines. | `fetch_pr_files_tool`, `scan_code_tool`, `generate_review_tool`, `validate_findings_tool`, `post_pr_review_tool` |
 | `threat_model_agent` | 1 | STRIDE threat modeler — identifies assets, entry points, trust boundaries, and generates concrete attack scenarios with step-by-step attacker actions and missing defenses. | `fetch_repo_files_tool`, `threat_model_tool` |
+| `dependency_agent` | 1 | Dependency CVE scanner — fetches `requirements.txt` from the repo and queries the free [OSV](https://osv.dev) database for known vulnerabilities, returning CVE IDs, severity, and recommended fix versions. No API key required. | `fetch_requirements_tool`, `dependency_scan_tool` |
+| `crypto_agent` | 1 | Cryptography auditor — inspects source files for insecure patterns: MD5/SHA1 for passwords, Python `random` for secrets, AES-ECB mode, hardcoded IVs/keys, disabled TLS, and base64-as-encryption. Returns per-finding severity, attacker effort, and safe alternatives. | `fetch_repo_files_tool`, `crypto_audit_tool` |
 | `security_agent` | 2 | Semgrep static analysis + LLM security-focused review. | `fetch_repo_files_tool`, `scan_code_tool`, `generate_review_tool`, `explain_finding_tool` |
 | `quality_agent` | 2 | LLM quality/readability review — no Semgrep, no security angle. | `fetch_repo_files_tool`, `generate_review_tool`, `search_code_in_files_tool` |
 | `validator_agent` | 2 | Cross-checks security findings against source code to flag false positives. | `validate_findings_tool` |
@@ -154,6 +158,10 @@ The root agent reads the user's intent and picks a path:
 "review PR #42 and post to GitHub"         →  pr_agent → post_pr_review_tool
 "threat model this repo"                   →  threat_model_agent
 "how would an attacker exploit this?"      →  threat_model_agent
+"scan dependencies for CVEs"              →  dependency_agent
+"any vulnerabilities in requirements.txt" →  dependency_agent
+"audit crypto / check for weak encryption"→  crypto_agent
+"is random used for secrets anywhere?"    →  crypto_agent
 "explain issue #3"                         →  report_agent
 "save the report"                          →  report_agent
 ```
@@ -540,10 +548,11 @@ code_review_agent/
 │   └── report_generator.py       # Render PipelineResult → Markdown
 │
 ├── Orchestration
-│   └── agent.py                  # CodeReviewAgent + 3-layer 8-agent ADK graph
+│   └── agent.py                  # CodeReviewAgent + 3-layer 11-agent ADK graph
 │                                 #   (build_multi_agent_system → root_agent)
 │                                 #   agents: root · scout · analysis_coordinator
-│                                 #           pr_agent · report_agent
+│                                 #           pr_agent · report_agent · threat_model_agent
+│                                 #           dependency_agent · crypto_agent
 │                                 #           security · quality · validator
 │
 ├── Entry points
@@ -560,7 +569,7 @@ code_review_agent/
 │   └── *_spec.md                 # Interface, behavior, error hierarchy, test table
 │
 └── Tests
-    └── tests/                    # 107 tests, one file per module, all mocked
+    └── tests/                    # 110 tests, one file per module, all mocked
 ```
 
 ---
@@ -578,7 +587,7 @@ code_review_agent/
 
 **Spec-driven development.** Every module started as a written spec (interface, behavior, error hierarchy, test table) before any implementation code. The `*_spec.md` files are the visible record of that.
 
-**Genuine multi-agent architecture.** Eight agents across three layers — root orchestrator, four domain specialists (scout, coordinator, PR reviewer, reporter), and three analysis agents (security, quality, validator). Each has a narrow role, focused instructions, and only the tools it actually needs. The `validator_agent` acts as a peer reviewer, cross-checking the `security_agent`'s findings against actual source code to filter false positives before results reach the user. Agent-to-agent transfers are explicit and visible in the ADK playground. A dedicated `pr_agent` reviews only the changed files in a Pull Request and can post its findings as **inline comments directly on the GitHub PR** — the agent writes back to GitHub, not just to a local report.
+**Genuine multi-agent architecture.** Eleven agents across three layers — root orchestrator, seven domain specialists (scout, coordinator, PR reviewer, reporter, threat modeler, dependency scanner, crypto auditor), and three analysis agents (security, quality, validator). Each has a narrow role, focused instructions, and only the tools it actually needs. The `validator_agent` acts as a peer reviewer, cross-checking the `security_agent`'s findings against actual source code to filter false positives before results reach the user. Agent-to-agent transfers are explicit and visible in the ADK playground. A dedicated `pr_agent` reviews only the changed files in a Pull Request and can post its findings as **inline comments directly on the GitHub PR** — the agent writes back to GitHub, not just to a local report. The `dependency_agent` queries the free [OSV](https://osv.dev) database for known CVEs in pinned dependencies; the `crypto_agent` detects weak cryptography patterns (MD5 passwords, insecure randomness, ECB mode, hardcoded keys) with attacker-effort estimates and safe alternatives.
 
 **Four access surfaces, one pipeline.** The same `CodeReviewAgent` is reachable via CLI (`main.py`), HTTP API (`server.py`/FastAPI), browser chat (`adk web`/ADK Dev UI), and a visual web UI (`streamlit_app.py`/Streamlit) — without duplicating any logic.
 
