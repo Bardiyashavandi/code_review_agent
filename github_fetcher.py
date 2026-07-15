@@ -221,6 +221,10 @@ class GitHubFetcher:
         """
         owner, repo, pr_number = self.parse_pr_url(pr_url)
 
+        # Fetch PR metadata to get the head branch ref (needed for content fetching)
+        pr_meta = self._get(f"{self._base_url}/repos/{owner}/{repo}/pulls/{pr_number}")
+        head_ref = pr_meta["head"]["ref"]
+
         # GitHub returns up to 300 files per PR; pagination not needed here.
         files_url = f"{self._base_url}/repos/{owner}/{repo}/pulls/{pr_number}/files"
         pr_files_data = self._get(files_url)
@@ -251,7 +255,10 @@ class GitHubFetcher:
                 )
                 break
 
-            content_url = f"{self._base_url}/repos/{owner}/{repo}/contents/{filename}"
+            content_url = (
+                f"{self._base_url}/repos/{owner}/{repo}/contents/{filename}"
+                f"?ref={head_ref}"
+            )
             try:
                 content_data = self._get(content_url)
             except GitHubFetcherError as exc:
