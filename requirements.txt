@@ -3,7 +3,7 @@ google-genai==2.9.0
 google-adk==2.3.0
 pytest==9.1.1
 python-dotenv==1.2.2
-fastapi==0.115.12
+fastapi>=0.133,<1       # google-adk 2.3.0 requires >=0.133; was pinned to 0.115.12 which conflicts
 uvicorn[standard]==0.34.3
 streamlit==1.45.1
 requests==2.32.3
