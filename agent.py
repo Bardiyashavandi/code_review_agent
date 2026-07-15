@@ -264,6 +264,62 @@ class CodeReviewAgent:
         """Check requirements.txt content against the OSV vulnerability database."""
         return scan_dependencies(requirements_content)
 
+    def generate_injection_audit(self, files: list[FileResult]) -> dict:
+        """Audit source files for injection vulnerabilities (SQL, cmd, SSTI, XSS, SSRF)."""
+        return self._reviewer.generate_injection_audit(files)
+
+    def generate_auth_audit(self, files: list[FileResult]) -> dict:
+        """Audit source files for authentication and authorization vulnerabilities."""
+        return self._reviewer.generate_auth_audit(files)
+
+    def generate_secrets_audit(self, files: list[FileResult]) -> dict:
+        """Scan source files for hardcoded secrets, credentials, and sensitive values."""
+        return self._reviewer.generate_secrets_audit(files)
+
+    def generate_data_flow_analysis(self, files: list[FileResult]) -> dict:
+        """Perform taint analysis: trace user input to dangerous sinks."""
+        return self._reviewer.generate_data_flow_analysis(files)
+
+    def generate_complexity_report(self, files: list[FileResult]) -> dict:
+        """Analyze cyclomatic complexity, god classes, deep nesting, and duplication."""
+        return self._reviewer.generate_complexity_report(files)
+
+    def generate_test_coverage_report(
+        self, source_files: list[FileResult], test_files: list[FileResult]
+    ) -> dict:
+        """Analyze test coverage gaps — untested functions, missing edge cases."""
+        return self._reviewer.generate_test_coverage_report(source_files, test_files)
+
+    def generate_doc_quality_report(self, files: list[FileResult]) -> dict:
+        """Assess documentation quality — missing docstrings, type hints, stale comments."""
+        return self._reviewer.generate_doc_quality_report(files)
+
+    def map_to_owasp(self, findings: list[dict]) -> dict:
+        """Map findings to OWASP Top 10 2021 categories."""
+        return self._reviewer.map_to_owasp(findings)
+
+    def map_to_cwe(self, findings: list[dict]) -> dict:
+        """Map findings to CWE Top 25 entries."""
+        return self._reviewer.map_to_cwe(findings)
+
+    def deduplicate_findings(self, all_findings: list[dict]) -> dict:
+        """Merge and deduplicate findings from multiple analysis agents."""
+        return self._reviewer.deduplicate_findings(all_findings)
+
+    def generate_risk_scores(self, findings: list[dict]) -> dict:
+        """Generate CVSS-like composite risk scores for security findings."""
+        return self._reviewer.generate_risk_scores(findings)
+
+    def generate_remediation_patches(
+        self, findings: list[dict], files: list[FileResult]
+    ) -> dict:
+        """Generate concrete, copy-pasteable fix patches for security findings."""
+        return self._reviewer.generate_remediation_patches(findings, files)
+
+    def analyze_context(self, files: list[FileResult]) -> dict:
+        """Analyze the codebase to understand framework, architecture, and security surface."""
+        return self._reviewer.analyze_context(files)
+
     # --- Additional, "interesting" tools -----------------------------------
     # Each of these is a distinct capability beyond the core fetch/scan/review
     # pipeline, intended to give the ADK agent more genuine planning choices.
@@ -896,6 +952,213 @@ def make_threat_model_tool(agent: CodeReviewAgent) -> Callable[..., dict]:
     return threat_model_tool
 
 
+def make_injection_audit_tool(agent: CodeReviewAgent) -> Callable[..., dict]:
+    def injection_audit_tool(files: list[dict]) -> dict:
+        """Audit source files for injection vulnerabilities: SQL injection, command injection,
+        SSTI, XSS, SSRF, path traversal, LDAP, XXE, and header injection.
+        files: list of {path, content} from fetch_repo_files_tool.
+        Returns {findings: [{path, line, severity, injection_type, vulnerable_code,
+        attack_vector, attack_chain, impact, fix}], summary}."""
+        if not isinstance(files, list) or not files:
+            raise ValueError("files must be a non-empty list")
+        file_objs = [FileResult(path=f["path"], content=f.get("content",""),
+                                sha="", size=len(f.get("content","")), url="") for f in files]
+        return agent.generate_injection_audit(file_objs)
+    return injection_audit_tool
+
+
+def make_auth_audit_tool(agent: CodeReviewAgent) -> Callable[..., dict]:
+    def auth_audit_tool(files: list[dict]) -> dict:
+        """Audit source files for authentication and authorization vulnerabilities:
+        IDOR, broken auth, privilege escalation, missing access controls, JWT issues.
+        files: list of {path, content} from fetch_repo_files_tool.
+        Returns {findings: [{path, line, severity, category, vulnerable_code,
+        scenario, impact, fix}], summary}."""
+        if not isinstance(files, list) or not files:
+            raise ValueError("files must be a non-empty list")
+        file_objs = [FileResult(path=f["path"], content=f.get("content",""),
+                                sha="", size=len(f.get("content","")), url="") for f in files]
+        return agent.generate_auth_audit(file_objs)
+    return auth_audit_tool
+
+
+def make_secrets_audit_tool(agent: CodeReviewAgent) -> Callable[..., dict]:
+    def secrets_audit_tool(files: list[dict]) -> dict:
+        """Scan source files for hardcoded secrets: API keys, passwords, private keys,
+        JWT signing secrets, database credentials, OAuth client secrets.
+        files: list of {path, content} from fetch_repo_files_tool.
+        Returns {findings: [{path, line, severity, secret_type, description,
+        redacted_value, risk, fix}], summary}."""
+        if not isinstance(files, list) or not files:
+            raise ValueError("files must be a non-empty list")
+        file_objs = [FileResult(path=f["path"], content=f.get("content",""),
+                                sha="", size=len(f.get("content","")), url="") for f in files]
+        return agent.generate_secrets_audit(file_objs)
+    return secrets_audit_tool
+
+
+def make_data_flow_tool(agent: CodeReviewAgent) -> Callable[..., dict]:
+    def data_flow_tool(files: list[dict]) -> dict:
+        """Perform taint analysis on source files: trace untrusted user input from
+        sources (HTTP params, CLI args, file input) through the application to
+        dangerous sinks (DB queries, shell commands, template rendering, SSRF).
+        files: list of {path, content} from fetch_repo_files_tool.
+        Returns {tainted_paths: [{path, source_line, sink_line, source, sink,
+        sink_type, intermediate_steps, sanitizers_present, sanitization_adequate,
+        severity, exploit}], safe_paths, summary}."""
+        if not isinstance(files, list) or not files:
+            raise ValueError("files must be a non-empty list")
+        file_objs = [FileResult(path=f["path"], content=f.get("content",""),
+                                sha="", size=len(f.get("content","")), url="") for f in files]
+        return agent.generate_data_flow_analysis(file_objs)
+    return data_flow_tool
+
+
+def make_complexity_tool(agent: CodeReviewAgent) -> Callable[..., dict]:
+    def complexity_tool(files: list[dict]) -> dict:
+        """Analyze code complexity: cyclomatic complexity per function, deep nesting,
+        god classes, magic numbers, duplicated logic, long parameter lists.
+        Files with complexity > 10 are flagged HIGH; > 20 CRITICAL.
+        files: list of {path, content} from fetch_repo_files_tool.
+        Returns {findings: [{path, line, severity, metric, function_or_class,
+        measured_value, description, refactoring_hint}], most_complex_functions,
+        summary}."""
+        if not isinstance(files, list) or not files:
+            raise ValueError("files must be a non-empty list")
+        file_objs = [FileResult(path=f["path"], content=f.get("content",""),
+                                sha="", size=len(f.get("content","")), url="") for f in files]
+        return agent.generate_complexity_report(file_objs)
+    return complexity_tool
+
+
+def make_test_coverage_tool(agent: CodeReviewAgent) -> Callable[..., dict]:
+    def test_coverage_tool(source_files: list[dict], test_files: list[dict] | None = None) -> dict:
+        """Analyze test coverage gaps by comparing source files against test files.
+        Identifies untested functions, missing error path coverage, missing edge cases,
+        and test quality issues (overly broad mocks, happy-path-only tests).
+        source_files: list of {path, content} for source modules.
+        test_files: list of {path, content} for test files (optional, pass empty list if none).
+        Returns {untested_functions, coverage_gaps, test_quality_issues, summary}."""
+        if not isinstance(source_files, list) or not source_files:
+            raise ValueError("source_files must be a non-empty list")
+        src_objs = [FileResult(path=f["path"], content=f.get("content",""),
+                               sha="", size=len(f.get("content","")), url="")
+                    for f in source_files]
+        tst_objs = [FileResult(path=f["path"], content=f.get("content",""),
+                               sha="", size=len(f.get("content","")), url="")
+                    for f in (test_files or [])]
+        return agent.generate_test_coverage_report(src_objs, tst_objs)
+    return test_coverage_tool
+
+
+def make_doc_quality_tool(agent: CodeReviewAgent) -> Callable[..., dict]:
+    def doc_quality_tool(files: list[dict]) -> dict:
+        """Assess documentation quality: missing docstrings, missing type hints,
+        stale comments, misleading variable/function/class names, TODO debt.
+        files: list of {path, content} from fetch_repo_files_tool.
+        Returns {findings: [{path, line, severity, doc_issue, target,
+        description, suggested_docstring}], coverage_stats, summary}."""
+        if not isinstance(files, list) or not files:
+            raise ValueError("files must be a non-empty list")
+        file_objs = [FileResult(path=f["path"], content=f.get("content",""),
+                                sha="", size=len(f.get("content","")), url="") for f in files]
+        return agent.generate_doc_quality_report(file_objs)
+    return doc_quality_tool
+
+
+def make_owasp_mapping_tool(agent: CodeReviewAgent) -> Callable[..., dict]:
+    def owasp_mapping_tool(findings: list[dict]) -> dict:
+        """Map security findings to OWASP Top 10 2021 categories (A01-A10).
+        findings: list of finding dicts with {severity, title, description}.
+        Returns {mappings: [{finding_index, owasp_category, owasp_name,
+        justification}], category_summary, top_risk_categories, summary}.
+        Use after collecting findings from multiple security agents."""
+        if not isinstance(findings, list) or not findings:
+            raise ValueError("findings must be a non-empty list")
+        return agent.map_to_owasp(findings)
+    return owasp_mapping_tool
+
+
+def make_cwe_mapping_tool(agent: CodeReviewAgent) -> Callable[..., dict]:
+    def cwe_mapping_tool(findings: list[dict]) -> dict:
+        """Map security findings to CWE Top 25 Most Dangerous Software Weaknesses.
+        findings: list of finding dicts with {severity, title, description}.
+        Returns {mappings: [{finding_index, cwe_id, cwe_name, rank_in_top25,
+        justification}], top_cwes_present, summary}.
+        Use after collecting findings from multiple security agents."""
+        if not isinstance(findings, list) or not findings:
+            raise ValueError("findings must be a non-empty list")
+        return agent.map_to_cwe(findings)
+    return cwe_mapping_tool
+
+
+def make_dedup_tool(agent: CodeReviewAgent) -> Callable[..., dict]:
+    def dedup_tool(all_findings: list[dict]) -> dict:
+        """Deduplicate and merge findings from multiple security analysis agents.
+        Identifies exact duplicates (same file+line+type), near-duplicates (same
+        vulnerability at nearby lines), and semantic duplicates (same issue described
+        differently). Produces one clean, merged finding per unique issue.
+        all_findings: list of finding dicts, each with a 'source_agent' field.
+        Returns {deduplicated_findings, original_count, deduplicated_count,
+        merges_performed, summary}."""
+        if not isinstance(all_findings, list) or not all_findings:
+            raise ValueError("all_findings must be a non-empty list")
+        return agent.deduplicate_findings(all_findings)
+    return dedup_tool
+
+
+def make_risk_score_tool(agent: CodeReviewAgent) -> Callable[..., dict]:
+    def risk_score_tool(findings: list[dict]) -> dict:
+        """Generate CVSS-like composite risk scores for security findings.
+        Scores each finding on Impact (0-10), Exploitability (0-10), Scope (0-10),
+        and Detectability (0-10), then computes a weighted composite score.
+        Ranks findings by priority and produces an overall project risk score.
+        findings: list of finding dicts with {severity, title, description}.
+        Returns {scored_findings: [{finding_index, composite_score, risk_level,
+        priority_rank, rationale}], overall_project_score, overall_risk_level,
+        immediate_action_required, summary}."""
+        if not isinstance(findings, list) or not findings:
+            raise ValueError("findings must be a non-empty list")
+        return agent.generate_risk_scores(findings)
+    return risk_score_tool
+
+
+def make_remediation_tool(agent: CodeReviewAgent) -> Callable[..., dict]:
+    def remediation_tool(findings: list[dict], files: list[dict]) -> dict:
+        """Generate concrete, copy-pasteable fix patches for security findings.
+        Produces exact before/after code for each finding, not vague advice.
+        findings: list of finding dicts with {path, line, title, description,
+        vulnerable_code}.
+        files: list of {path, content} source files for context.
+        Returns {patches: [{finding_index, path, line, title, before, after,
+        explanation, dependencies, breaking_change}], summary}."""
+        if not isinstance(findings, list) or not findings:
+            raise ValueError("findings must be a non-empty list")
+        if not isinstance(files, list) or not files:
+            raise ValueError("files must be a non-empty list")
+        file_objs = [FileResult(path=f["path"], content=f.get("content",""),
+                                sha="", size=len(f.get("content","")), url="") for f in files]
+        return agent.generate_remediation_patches(findings, file_objs)
+    return remediation_tool
+
+
+def make_context_analysis_tool(agent: CodeReviewAgent) -> Callable[..., dict]:
+    def context_analysis_tool(files: list[dict]) -> dict:
+        """Analyze the codebase to understand its purpose, framework, architecture,
+        entry points, authentication mechanism, and high-level security attack surface.
+        Use this before deeper analysis to tailor the review to the tech stack.
+        files: list of {path, content} from fetch_repo_files_tool (first 20 files).
+        Returns {application_type, framework, entry_points, authentication,
+        data_storage, external_services, async_pattern, architecture_notes,
+        security_surface_summary}."""
+        if not isinstance(files, list) or not files:
+            raise ValueError("files must be a non-empty list")
+        file_objs = [FileResult(path=f["path"], content=f.get("content",""),
+                                sha="", size=len(f.get("content","")), url="") for f in files]
+        return agent.analyze_context(file_objs)
+    return context_analysis_tool
+
+
 def make_post_pr_review_tool(agent: CodeReviewAgent) -> Callable[..., dict]:
     """Build a tool that posts review findings as inline comments on a GitHub PR."""
 
@@ -931,28 +1194,35 @@ def build_multi_agent_system(
     gemini_api_key: str,
     semgrep_config: str = DEFAULT_SEMGREP_CONFIG,
 ) -> Agent:
-    """Build a 3-layer multi-agent graph for the ADK playground.
+    """Build a 5-layer multi-agent graph for the ADK playground.
 
-    Architecture
-    ------------
-    Layer 0 — root_agent (Orchestrator)
-        Has one direct tool (review_repo_tool) for quick one-shot reviews,
-        plus three Layer-1 sub-agents for deeper, specialized work.
+    Architecture (29 agents total)
+    --------------------------------
+    L0 — root (code_review_agent)
+         One-shot tool + routes to L1 agents.
 
-    Layer 1 — three domain specialists:
-        - scout_agent          : lightweight repo inspection (no LLM review)
-        - analysis_coordinator : decides security vs quality vs both, delegates
-        - report_agent         : explanations + saved Markdown files
+    L1 — Strategic layer (8 agents):
+         planner_agent, context_agent, scout_agent, pr_agent,
+         report_agent, dedup_agent, risk_scorer_agent, remediation_agent
 
-    Layer 2 — two analysis specialists (children of analysis_coordinator):
-        - security_agent : Semgrep + LLM security review + issue deep-dive
-        - quality_agent  : LLM quality/style review (no Semgrep)
+    L2 — Domain coordinators (3 agents):
+         security_coordinator, quality_coordinator, intel_coordinator
 
-    All six agents share a single CodeReviewAgent instance underneath — each
-    just gets a different subset of the eight available tool functions.
+    L3 — Specialist agents (14 agents):
+         Under security_coordinator: sast_agent, injection_agent,
+           auth_agent, crypto_agent, secrets_agent, data_flow_agent
+         Under quality_coordinator: quality_agent, complexity_agent,
+           test_agent, doc_agent
+         Under intel_coordinator: dependency_agent, threat_model_agent,
+           compliance_agent (+ owasp_agent/cwe_agent as L4 children)
+
+    L4 — Sub-specialists (4 agents, innermost):
+         validator_agent (under sast_agent)
+         taint_validator_agent (under data_flow_agent)
+         owasp_agent (under compliance_agent)
+         cwe_agent (under compliance_agent)
     """
 
-    # ── One shared pipeline instance for all agents ─────────────────────────
     pipeline = CodeReviewAgent(
         github_token=github_token,
         gemini_api_key=gemini_api_key,
@@ -960,62 +1230,112 @@ def build_multi_agent_system(
     )
 
     def _ft(factory) -> FunctionTool:
-        """Create a fresh FunctionTool from a tool factory, bound to `pipeline`."""
         return FunctionTool(factory(pipeline))
 
-    # ── Layer 2c: Validator Agent ────────────────────────────────────────────
+    # ══════════════════════════════════════════════════════════════════════════
+    # LAYER 4 — Sub-specialists (no sub_agents, innermost leaves)
+    # ══════════════════════════════════════════════════════════════════════════
+
     validator_agent = Agent(
         name="validator_agent",
         model=DEFAULT_MODEL,
-        description=(
-            "Findings Validator: cross-checks security review findings against "
-            "the actual source code to identify false positives before reporting."
-        ),
+        description="Findings Validator: cross-checks security findings against source code to flag false positives.",
         instruction=(
-            "You are the Findings Validator. You act as a peer reviewer for the "
-            "security_agent's output — your job is to catch false positives before "
-            "they reach the user.\n\n"
+            "You are the Findings Validator. Your sole job is catching false positives "
+            "before they reach the user.\n\n"
             "WORKFLOW:\n"
-            "1. You receive a list of security findings and the source files they "
-            "   reference (passed from the analysis_coordinator after security_agent "
-            "   completes).\n"
-            "2. Call validate_findings_tool with those issues and files.\n"
-            "3. Report the validation results: how many findings were confirmed "
-            "   (HIGH/MEDIUM confidence) vs. flagged as probable false positives (LOW).\n"
-            "4. List any false-positive findings by index with the validator's note.\n"
-            "5. Transfer back to analysis_coordinator.\n\n"
-            "Be concise — one paragraph is enough. The goal is a quick confidence "
-            "check, not a full re-review."
+            "1. Call validate_findings_tool with the issues and source files.\n"
+            "2. Report: confirmed findings (HIGH/MEDIUM confidence) vs. probable false "
+            "   positives (LOW confidence), with the validator's note for each.\n"
+            "3. Transfer back to sast_agent.\n\n"
+            "Be concise — one paragraph. This is a confidence check, not a re-review."
         ),
-        tools=[
-            _ft(make_validate_findings_tool),
-        ],
+        tools=[_ft(make_validate_findings_tool)],
     )
 
-    # ── Layer 2a: Security Analyst ───────────────────────────────────────────
-    security_agent = Agent(
-        name="security_agent",
+    taint_validator_agent = Agent(
+        name="taint_validator_agent",
         model=DEFAULT_MODEL,
-        description=(
-            "Security Analyst: runs Semgrep static analysis and an LLM "
-            "security-focused review; can explain individual findings in depth."
-        ),
+        description="Taint Validator: confirms that data-flow taint paths are actually reachable and exploitable.",
         instruction=(
-            "You are the Security Analyst. Your job: find and explain security "
-            "vulnerabilities in Python repositories.\n\n"
+            "You are the Taint Path Validator. The data_flow_agent has identified "
+            "potential taint paths. Your job: verify each path is actually reachable "
+            "and the sink is genuinely dangerous in context.\n\n"
             "WORKFLOW:\n"
-            "1. fetch_repo_files_tool — pull Python files from the repo.\n"
-            "2. scan_code_tool — run Semgrep on those files.\n"
-            "3. generate_review_tool — pass files + Semgrep findings to Gemini "
-            "   for a security-focused structured review.\n"
-            "4. explain_finding_tool — if asked to elaborate on a specific issue, "
-            "   use this instead of re-running the full review.\n\n"
-            "Always rank issues CRITICAL → HIGH → MEDIUM → LOW. Include file:line "
-            "and rule_id for every finding. If Semgrep returns nothing, still run "
-            "generate_review_tool — the LLM catches semantic issues Semgrep misses.\n\n"
-            "Stay purely security-focused. When done, transfer back to your parent "
-            "(analysis_coordinator) so it can decide whether quality review is also "
-            "needed."
+            "1. You receive tainted paths from data_flow_agent.\n"
+            "2. For each path: check whether the source is actually reachable from an "
+            "   external caller, whether any intermediate sanitizers (not noted by the "
+            "   data_flow_agent) are present, and whether the sink is actually dangerous "
+            "   given the surrounding code context.\n"
+            "3. Classify each: CONFIRMED (real, exploitable), PARTIAL (real but harder "
+            "   to exploit than stated), or FALSE_POSITIVE (not actually reachable).\n"
+            "4. Transfer back to data_flow_agent.\n\n"
+            "Be precise — cite the specific code that confirms or refutes each path."
+        ),
+        tools=[_ft(make_fetch_repo_files_tool), _ft(make_search_code_tool)],
+    )
+
+    owasp_agent = Agent(
+        name="owasp_agent",
+        model=DEFAULT_MODEL,
+        description="OWASP Mapper: maps security findings to OWASP Top 10 2021 categories (A01–A10).",
+        instruction=(
+            "You are the OWASP Mapper. You receive a list of security findings and "
+            "map each one to the most relevant OWASP Top 10 2021 category.\n\n"
+            "WORKFLOW:\n"
+            "1. Call owasp_mapping_tool with the findings list.\n"
+            "2. Present the mapping table: finding → OWASP category, with justification.\n"
+            "3. Show which OWASP categories are most heavily represented.\n"
+            "4. Transfer back to compliance_agent.\n\n"
+            "Categories: A01 Broken Access Control, A02 Cryptographic Failures, "
+            "A03 Injection, A04 Insecure Design, A05 Security Misconfiguration, "
+            "A06 Vulnerable and Outdated Components, A07 Auth Failures, "
+            "A08 Software Integrity Failures, A09 Logging/Monitoring Failures, "
+            "A10 SSRF."
+        ),
+        tools=[_ft(make_owasp_mapping_tool)],
+    )
+
+    cwe_agent = Agent(
+        name="cwe_agent",
+        model=DEFAULT_MODEL,
+        description="CWE Mapper: maps security findings to CWE Top 25 Most Dangerous Software Weaknesses.",
+        instruction=(
+            "You are the CWE Mapper. You receive a list of security findings and "
+            "map each one to the most relevant CWE Top 25 entry.\n\n"
+            "WORKFLOW:\n"
+            "1. Call cwe_mapping_tool with the findings list.\n"
+            "2. Present: finding → CWE ID + name + rank in Top 25.\n"
+            "3. Highlight if any findings map to CWE-89 (SQL Injection), CWE-79 (XSS), "
+            "   CWE-78 (Command Injection), or CWE-798 (Hard-coded Credentials) — "
+            "   these are the most commonly exploited.\n"
+            "4. Transfer back to compliance_agent."
+        ),
+        tools=[_ft(make_cwe_mapping_tool)],
+    )
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # LAYER 3 — Specialist Agents
+    # ══════════════════════════════════════════════════════════════════════════
+
+    # ── Under security_coordinator ──────────────────────────────────────────
+
+    sast_agent = Agent(
+        name="sast_agent",
+        model=DEFAULT_MODEL,
+        description="SAST Analyst: Semgrep static analysis + LLM security review. Can delegate to validator_agent.",
+        instruction=(
+            "You are the SAST Analyst. You run deterministic static analysis (Semgrep) "
+            "combined with an LLM security review to catch what Semgrep misses.\n\n"
+            "WORKFLOW:\n"
+            "1. fetch_repo_files_tool — pull Python files.\n"
+            "2. scan_code_tool — run Semgrep (finds rule-matched vulnerabilities).\n"
+            "3. generate_review_tool — LLM security pass on the same files.\n"
+            "4. (optional) transfer to validator_agent to filter false positives.\n"
+            "5. explain_finding_tool — for follow-up deep-dives on specific findings.\n\n"
+            "CRITICAL → HIGH → MEDIUM → LOW priority. Include file:line and rule_id. "
+            "If Semgrep finds nothing, still run the LLM review. "
+            "Transfer back to security_coordinator when done."
         ),
         tools=[
             _ft(make_fetch_repo_files_tool),
@@ -1023,29 +1343,161 @@ def build_multi_agent_system(
             _ft(make_generate_review_tool),
             _ft(make_explain_finding_tool),
         ],
+        sub_agents=[validator_agent],
     )
 
-    # ── Layer 2b: Quality Reviewer ───────────────────────────────────────────
+    injection_agent = Agent(
+        name="injection_agent",
+        model=DEFAULT_MODEL,
+        description=(
+            "Injection Specialist: finds SQL injection, command injection, SSTI, XSS, "
+            "SSRF, path traversal, LDAP, XXE, and header injection vulnerabilities."
+        ),
+        instruction=(
+            "You are the Injection Specialist. You go deeper than SAST on injection "
+            "vulnerabilities — tracing every path where untrusted data enters a "
+            "dangerous sink.\n\n"
+            "WORKFLOW:\n"
+            "1. fetch_repo_files_tool — pull Python files.\n"
+            "2. injection_audit_tool — deep injection analysis: SQL, command, SSTI, "
+            "   XSS, SSRF, path traversal, LDAP, XXE, header injection.\n\n"
+            "For each finding: show the attack_vector (what an attacker sends), "
+            "the attack_chain (step-by-step from input to exploit), the impact, "
+            "and the exact fix. Be concrete — name the payload, name the sink.\n\n"
+            "Transfer back to security_coordinator when done."
+        ),
+        tools=[
+            _ft(make_fetch_repo_files_tool),
+            _ft(make_injection_audit_tool),
+        ],
+    )
+
+    auth_agent = Agent(
+        name="auth_agent",
+        model=DEFAULT_MODEL,
+        description=(
+            "Auth Specialist: finds broken authentication, IDOR, privilege escalation, "
+            "missing access controls, JWT issues, and OAuth flaws."
+        ),
+        instruction=(
+            "You are the Authentication & Authorization Specialist. You focus "
+            "exclusively on identity: who is allowed to do what, and what happens "
+            "when those checks are missing or bypassable.\n\n"
+            "WORKFLOW:\n"
+            "1. fetch_repo_files_tool — pull Python files.\n"
+            "2. auth_audit_tool — deep auth/authz analysis: IDOR, broken auth, "
+            "   privilege escalation, missing access controls, JWT, OAuth.\n\n"
+            "For each finding: describe the concrete attack scenario (what does "
+            "a logged-in attacker with basic access do?), the impact (access "
+            "other users' data / escalate to admin / account takeover), and "
+            "the precise fix.\n\n"
+            "Transfer back to security_coordinator when done."
+        ),
+        tools=[
+            _ft(make_fetch_repo_files_tool),
+            _ft(make_auth_audit_tool),
+        ],
+    )
+
+    crypto_agent = Agent(
+        name="crypto_agent",
+        model=DEFAULT_MODEL,
+        description=(
+            "Cryptography Auditor: detects weak, broken, or misused cryptography — "
+            "MD5/SHA1 password hashing, predictable randomness, ECB mode, disabled TLS."
+        ),
+        instruction=(
+            "You are the Cryptography Auditor. You find cryptographic mistakes "
+            "that look correct to most developers but are actually exploitable.\n\n"
+            "WORKFLOW:\n"
+            "1. fetch_repo_files_tool — fetch the source files.\n"
+            "2. crypto_audit_tool — pass the files for cryptographic analysis.\n\n"
+            "For each finding: explain WHY it is dangerous (concrete attack, not just "
+            "'it is weak'), the attacker effort, and the exact safe replacement.\n\n"
+            "Transfer back to security_coordinator when done."
+        ),
+        tools=[
+            _ft(make_fetch_repo_files_tool),
+            _ft(make_crypto_audit_tool),
+        ],
+    )
+
+    secrets_agent = Agent(
+        name="secrets_agent",
+        model=DEFAULT_MODEL,
+        description=(
+            "Secrets Scanner: finds hardcoded API keys, passwords, private keys, "
+            "JWT secrets, and database credentials in source code."
+        ),
+        instruction=(
+            "You are the Secrets Scanner. You look for sensitive values that have been "
+            "accidentally committed to source code — the kind of thing that leads to "
+            "breach headlines.\n\n"
+            "WORKFLOW:\n"
+            "1. fetch_repo_files_tool — fetch the source files.\n"
+            "2. secrets_audit_tool — scan for hardcoded secrets: API keys, passwords, "
+            "   private keys, JWT signing secrets, DB credentials, OAuth secrets.\n"
+            "3. search_code_in_files_tool — additionally grep for common patterns "
+            "   like 'password', 'secret', 'api_key', 'token', 'AKIA' to catch "
+            "   anything the LLM might miss.\n\n"
+            "For each finding: describe what the secret unlocks and the blast radius "
+            "if an attacker finds it. NEVER print the full secret value — redact to "
+            "first 4 chars + ***.\n\n"
+            "Transfer back to security_coordinator when done."
+        ),
+        tools=[
+            _ft(make_fetch_repo_files_tool),
+            _ft(make_secrets_audit_tool),
+            _ft(make_search_code_tool),
+        ],
+    )
+
+    data_flow_agent = Agent(
+        name="data_flow_agent",
+        model=DEFAULT_MODEL,
+        description=(
+            "Taint Analyst: traces untrusted user input from entry points (HTTP params, "
+            "CLI args) through the application to dangerous sinks (DB, shell, templates)."
+        ),
+        instruction=(
+            "You are the Taint Analyst. You perform data flow analysis — tracing every "
+            "path where untrusted input moves through the application without adequate "
+            "sanitization.\n\n"
+            "WORKFLOW:\n"
+            "1. fetch_repo_files_tool — fetch the source files.\n"
+            "2. data_flow_tool — full taint analysis: source → intermediate steps → "
+            "   sink, with sanitizer adequacy assessment.\n"
+            "3. (optional) transfer to taint_validator_agent to confirm reachability "
+            "   of the highest-severity paths.\n\n"
+            "For each tainted path: show the full chain from where user data enters "
+            "to where it reaches a dangerous operation, the missing sanitizer, "
+            "and the concrete exploit.\n\n"
+            "Transfer back to security_coordinator when done."
+        ),
+        tools=[
+            _ft(make_fetch_repo_files_tool),
+            _ft(make_data_flow_tool),
+        ],
+        sub_agents=[taint_validator_agent],
+    )
+
+    # ── Under quality_coordinator ───────────────────────────────────────────
+
     quality_agent = Agent(
         name="quality_agent",
         model=DEFAULT_MODEL,
-        description=(
-            "Quality Reviewer: LLM-based code quality, readability, and best-practice "
-            "assessment — no security angle, no Semgrep."
-        ),
+        description="Quality Reviewer: LLM code quality, readability, and best-practice review. No security angle.",
         instruction=(
             "You are the Quality Reviewer. You assess code quality, readability, and "
-            "Python best practices — NOT security vulnerabilities.\n\n"
+            "Python best practices — NOT security.\n\n"
             "WORKFLOW:\n"
             "1. fetch_repo_files_tool — pull the Python files.\n"
-            "2. (optional) search_code_in_files_tool — quickly spot anti-patterns "
-            "   like bare 'except:', 'global', magic numbers, or deep nesting before "
-            "   the LLM pass, so you can call them out specifically.\n"
-            "3. generate_review_tool — LLM review covering: naming conventions, "
-            "   function complexity, docstring coverage, DRY, error handling, PEP 8.\n\n"
-            "Severity guide: LOW/MEDIUM for style; HIGH only when a quality flaw is "
-            "likely to cause a runtime bug. Do NOT call scan_code_tool.\n\n"
-            "When done, transfer back to your parent (analysis_coordinator)."
+            "2. (optional) search_code_in_files_tool — spot anti-patterns like bare "
+            "   'except:', 'global', magic numbers.\n"
+            "3. generate_review_tool — LLM quality review: naming, complexity, "
+            "   docstring coverage, DRY, error handling, PEP 8.\n\n"
+            "Severity: LOW/MEDIUM for style; HIGH only when a quality flaw is likely "
+            "to cause a runtime bug. Transfer back to quality_coordinator when done."
         ),
         tools=[
             _ft(make_fetch_repo_files_tool),
@@ -1054,57 +1506,328 @@ def build_multi_agent_system(
         ],
     )
 
-    # ── Layer 1a: Analysis Coordinator ──────────────────────────────────────
-    analysis_coordinator = Agent(
-        name="analysis_coordinator",
+    complexity_agent = Agent(
+        name="complexity_agent",
         model=DEFAULT_MODEL,
         description=(
-            "Analysis Coordinator: decides whether to run a security review, a quality "
-            "review, or both, then delegates to the right specialist and aggregates "
-            "the combined results."
+            "Complexity Analyst: measures cyclomatic complexity, deep nesting, "
+            "god classes, magic numbers, and code duplication."
         ),
         instruction=(
-            "You are the Analysis Coordinator. You manage two specialist agents:\n"
-            "  • security_agent — Semgrep + LLM security review\n"
-            "  • quality_agent  — LLM quality/readability review\n\n"
-            "ROUTING:\n"
-            "- 'Security review' / 'vulnerabilities' / 'CVE' / 'exploit' "
-            "  → transfer to security_agent only.\n"
-            "- 'Quality review' / 'style' / 'readability' / 'best practices' "
-            "  → transfer to quality_agent only.\n"
-            "- 'Full review' / 'both' / 'deep dive' / no clear preference "
-            "  → transfer to security_agent first; after it returns, transfer to "
-            "  quality_agent; then aggregate.\n\n"
-            "AGGREGATION (after specialists return):\n"
-            "Summarize the combined findings for the user:\n"
-            "  1. Security issues (CRITICAL → HIGH → MEDIUM → LOW)\n"
-            "  2. Quality issues (HIGH → MEDIUM → LOW)\n"
-            "State how many total issues each specialist found."
+            "You are the Complexity Analyst. Overly complex code is hard to test, "
+            "hard to review, and harbors bugs. Your job: find and measure it.\n\n"
+            "WORKFLOW:\n"
+            "1. fetch_repo_files_tool — fetch the source files.\n"
+            "2. complexity_tool — analyze cyclomatic complexity per function, "
+            "   nesting depth, function length, god classes, magic numbers, "
+            "   duplicated logic, and long parameter lists.\n\n"
+            "Present the most complex functions ranked by complexity score. "
+            "Give a concrete refactoring hint for each (not vague 'simplify it', "
+            "but specific: 'extract X into a helper', 'use early return to reduce "
+            "nesting', 'replace magic number 86400 with SECONDS_PER_DAY constant').\n\n"
+            "Transfer back to quality_coordinator when done."
         ),
-        sub_agents=[security_agent, quality_agent, validator_agent],
+        tools=[
+            _ft(make_fetch_repo_files_tool),
+            _ft(make_complexity_tool),
+        ],
     )
 
-    # ── Layer 1b: Repo Scout ─────────────────────────────────────────────────
+    test_agent = Agent(
+        name="test_agent",
+        model=DEFAULT_MODEL,
+        description=(
+            "Test Coverage Analyst: identifies untested functions, missing edge cases, "
+            "untested error paths, and test quality issues."
+        ),
+        instruction=(
+            "You are the Test Coverage Analyst. Tests are the safety net for every "
+            "change. Your job: find the holes in that net.\n\n"
+            "WORKFLOW:\n"
+            "1. fetch_repo_files_tool — fetch ALL files (source + tests).\n"
+            "   Separate them: source files are in the main dirs, test files have "
+            "   names starting with test_ or are in a tests/ directory.\n"
+            "2. test_coverage_tool — pass source_files and test_files separately "
+            "   to identify: untested functions, missing error path coverage, "
+            "   missing boundary tests, broad mocks hiding real behavior.\n\n"
+            "Highlight: which security-critical functions (auth checks, input "
+            "validation) have NO tests — these are the highest-priority gaps.\n\n"
+            "Transfer back to quality_coordinator when done."
+        ),
+        tools=[
+            _ft(make_fetch_repo_files_tool),
+            _ft(make_test_coverage_tool),
+        ],
+    )
+
+    doc_agent = Agent(
+        name="doc_agent",
+        model=DEFAULT_MODEL,
+        description=(
+            "Documentation Auditor: finds missing docstrings, missing type hints, "
+            "stale comments, misleading names, and TODO debt."
+        ),
+        instruction=(
+            "You are the Documentation Auditor. Good documentation makes code "
+            "reviewable and maintainable. Bad documentation hides bugs.\n\n"
+            "WORKFLOW:\n"
+            "1. fetch_repo_files_tool — fetch the source files.\n"
+            "2. doc_quality_tool — assess: missing docstrings on public functions, "
+            "   missing type hints, stale/contradictory comments, misleading names, "
+            "   TODO/FIXME debt.\n\n"
+            "Present the coverage_stats (% of public functions documented), "
+            "list the most impactful gaps (missing docs on core business logic "
+            "is worse than missing docs on a utility helper), and suggest concrete "
+            "docstring examples for the top 3 missing ones.\n\n"
+            "Transfer back to quality_coordinator when done."
+        ),
+        tools=[
+            _ft(make_fetch_repo_files_tool),
+            _ft(make_doc_quality_tool),
+        ],
+    )
+
+    # ── Under intel_coordinator ─────────────────────────────────────────────
+
+    dependency_agent = Agent(
+        name="dependency_agent",
+        model=DEFAULT_MODEL,
+        description="Dependency CVE Scanner: checks requirements.txt against the OSV database for known CVEs.",
+        instruction=(
+            "You are the Dependency Security Scanner. You check the project's "
+            "third-party libraries for known vulnerabilities.\n\n"
+            "WORKFLOW:\n"
+            "1. fetch_requirements_tool — fetch requirements.txt from the repo.\n"
+            "   If not found, say so and stop.\n"
+            "2. dependency_scan_tool — check each package against OSV.\n\n"
+            "For each vulnerable package: CVE ID, severity, what the vulnerability "
+            "allows, and the exact upgrade version. Group CRITICAL first. "
+            "Transfer back to intel_coordinator when done."
+        ),
+        tools=[
+            _ft(make_fetch_requirements_tool),
+            _ft(make_dependency_scan_tool),
+        ],
+    )
+
+    threat_model_agent = Agent(
+        name="threat_model_agent",
+        model=DEFAULT_MODEL,
+        description="Threat Modeler: STRIDE threat model — assets, entry points, attack scenarios, missing defenses.",
+        instruction=(
+            "You are the Threat Modeler. You help developers think like attackers.\n\n"
+            "WORKFLOW:\n"
+            "1. fetch_repo_files_tool — fetch the source files.\n"
+            "2. threat_model_tool — generate full STRIDE threat model: assets, "
+            "   entry points, trust boundaries, threats per STRIDE category, "
+            "   top attack scenarios with step-by-step attacker actions + tools, "
+            "   and missing defenses.\n\n"
+            "Be educational and concrete. Name real attack tools (sqlmap, burp, "
+            "curl). Transfer back to intel_coordinator when done."
+        ),
+        tools=[
+            _ft(make_fetch_repo_files_tool),
+            _ft(make_threat_model_tool),
+        ],
+    )
+
+    compliance_agent = Agent(
+        name="compliance_agent",
+        model=DEFAULT_MODEL,
+        description=(
+            "Compliance Checker: maps findings to OWASP Top 10 and CWE Top 25, "
+            "producing a standards-based compliance view of the risk landscape."
+        ),
+        instruction=(
+            "You are the Compliance Checker. You take the security findings produced "
+            "by other agents and map them to industry standards.\n\n"
+            "WORKFLOW:\n"
+            "1. You receive a list of security findings (passed from intel_coordinator "
+            "   after other agents have run).\n"
+            "2. Transfer to owasp_agent — maps findings to OWASP Top 10 2021.\n"
+            "3. After owasp_agent returns, transfer to cwe_agent — maps findings "
+            "   to CWE Top 25.\n"
+            "4. Aggregate both mappings into a consolidated compliance view:\n"
+            "   - Which OWASP categories are violated and with what severity\n"
+            "   - Which CWE Top 25 entries are present\n"
+            "   - Overall compliance risk summary\n"
+            "5. Transfer back to intel_coordinator.\n\n"
+            "This is standards mapping, not new analysis. You do not fetch files "
+            "or run new analyses yourself."
+        ),
+        tools=[_ft(make_owasp_mapping_tool), _ft(make_cwe_mapping_tool)],
+        sub_agents=[owasp_agent, cwe_agent],
+    )
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # LAYER 2 — Domain Coordinators
+    # ══════════════════════════════════════════════════════════════════════════
+
+    security_coordinator = Agent(
+        name="security_coordinator",
+        model=DEFAULT_MODEL,
+        description=(
+            "Security Coordinator: orchestrates all 6 security specialist agents "
+            "(SAST, injection, auth, crypto, secrets, data flow) and aggregates results."
+        ),
+        instruction=(
+            "You are the Security Coordinator. You manage six security specialist "
+            "agents and decide which ones to invoke based on the user's request.\n\n"
+            "YOUR SPECIALISTS:\n"
+            "  • sast_agent        — Semgrep + LLM general security review\n"
+            "  • injection_agent   — SQL/cmd/SSTI/XSS/SSRF/path traversal\n"
+            "  • auth_agent        — IDOR, broken auth, privilege escalation\n"
+            "  • crypto_agent      — weak hashing, ECB, predictable randomness\n"
+            "  • secrets_agent     — hardcoded API keys, passwords, private keys\n"
+            "  • data_flow_agent   — taint analysis: input → dangerous sink\n\n"
+            "ROUTING:\n"
+            "- 'Full security review' / 'comprehensive' → all six agents sequentially\n"
+            "- 'Injection' / 'SQL injection' / 'XSS' → injection_agent\n"
+            "- 'Auth' / 'IDOR' / 'access control' → auth_agent\n"
+            "- 'Crypto' / 'encryption' → crypto_agent\n"
+            "- 'Secrets' / 'credentials' → secrets_agent\n"
+            "- 'Data flow' / 'taint' → data_flow_agent\n"
+            "- General 'security review' → sast_agent first, then injection + auth\n\n"
+            "AGGREGATION: After specialists return, consolidate by severity. "
+            "State which agents ran and how many findings each produced. "
+            "Transfer back to planner_agent when done."
+        ),
+        sub_agents=[sast_agent, injection_agent, auth_agent, crypto_agent,
+                    secrets_agent, data_flow_agent],
+    )
+
+    quality_coordinator = Agent(
+        name="quality_coordinator",
+        model=DEFAULT_MODEL,
+        description=(
+            "Quality Coordinator: orchestrates quality_agent, complexity_agent, "
+            "test_agent, and doc_agent for a comprehensive quality assessment."
+        ),
+        instruction=(
+            "You are the Quality Coordinator. You manage four quality specialist agents.\n\n"
+            "YOUR SPECIALISTS:\n"
+            "  • quality_agent    — general code quality + best practices\n"
+            "  • complexity_agent — cyclomatic complexity, god classes, deep nesting\n"
+            "  • test_agent       — test coverage gaps, missing edge cases\n"
+            "  • doc_agent        — missing docstrings, type hints, TODO debt\n\n"
+            "ROUTING:\n"
+            "- 'Full quality review' → all four agents sequentially\n"
+            "- 'Complexity' / 'refactoring' → complexity_agent\n"
+            "- 'Tests' / 'coverage' → test_agent\n"
+            "- 'Documentation' / 'docstrings' → doc_agent\n"
+            "- General 'quality review' → quality_agent + complexity_agent\n\n"
+            "AGGREGATION: After specialists return, summarize by category. "
+            "Transfer back to planner_agent when done."
+        ),
+        sub_agents=[quality_agent, complexity_agent, test_agent, doc_agent],
+    )
+
+    intel_coordinator = Agent(
+        name="intel_coordinator",
+        model=DEFAULT_MODEL,
+        description=(
+            "Intel Coordinator: orchestrates threat intelligence agents — dependency CVE "
+            "scanning, STRIDE threat modeling, and standards compliance (OWASP/CWE)."
+        ),
+        instruction=(
+            "You are the Intelligence Coordinator. You manage threat intelligence, "
+            "dependency scanning, and standards compliance.\n\n"
+            "YOUR SPECIALISTS:\n"
+            "  • dependency_agent   — OSV CVE scan on requirements.txt\n"
+            "  • threat_model_agent — STRIDE threat model\n"
+            "  • compliance_agent   — OWASP Top 10 + CWE Top 25 mapping\n\n"
+            "ROUTING:\n"
+            "- 'Full intel' / 'comprehensive' → all three sequentially\n"
+            "- 'Dependencies' / 'CVE' → dependency_agent\n"
+            "- 'Threat model' / 'STRIDE' / 'attack surface' → threat_model_agent\n"
+            "- 'OWASP' / 'CWE' / 'compliance' → compliance_agent\n\n"
+            "AGGREGATION: After specialists return, summarize. "
+            "Transfer back to planner_agent when done."
+        ),
+        sub_agents=[dependency_agent, threat_model_agent, compliance_agent],
+    )
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # LAYER 1 — Strategic / Cross-cutting Agents
+    # ══════════════════════════════════════════════════════════════════════════
+
+    context_agent = Agent(
+        name="context_agent",
+        model=DEFAULT_MODEL,
+        description=(
+            "Context Analyzer: identifies the codebase's framework, architecture, "
+            "entry points, authentication mechanism, and security attack surface "
+            "before deeper analysis begins."
+        ),
+        instruction=(
+            "You are the Context Analyzer. Before running any security or quality "
+            "analysis, it helps to understand WHAT the code is. Your job: characterize "
+            "the codebase so downstream agents can give more targeted advice.\n\n"
+            "WORKFLOW:\n"
+            "1. get_repo_metadata_tool — fast check: language, size, stars.\n"
+            "2. fetch_repo_files_tool — fetch up to 20 files (the first 20 are enough "
+            "   to identify the framework and architecture).\n"
+            "3. context_analysis_tool — structured analysis: application type, "
+            "   framework (Flask/Django/FastAPI/etc.), entry points, auth mechanism, "
+            "   data storage, external services, async pattern.\n\n"
+            "Present: what is this codebase (1 sentence), what framework it uses, "
+            "what the main attack surface is (2-3 sentences).\n\n"
+            "Transfer back to the root orchestrator when done."
+        ),
+        tools=[
+            _ft(make_get_repo_metadata_tool),
+            _ft(make_fetch_repo_files_tool),
+            _ft(make_context_analysis_tool),
+        ],
+    )
+
+    planner_agent = Agent(
+        name="planner_agent",
+        model=DEFAULT_MODEL,
+        description=(
+            "Execution Planner: decides which coordinators to invoke for a given "
+            "request and sequences them — security, quality, and/or intel. "
+            "All three coordinators are its sub-agents."
+        ),
+        instruction=(
+            "You are the Execution Planner. You receive a user request and decide "
+            "which of the three domain coordinators to invoke, in what order.\n\n"
+            "YOUR COORDINATORS:\n"
+            "  • security_coordinator — 6 security agents (SAST, injection, auth, "
+            "    crypto, secrets, data flow)\n"
+            "  • quality_coordinator  — 4 quality agents (general, complexity, "
+            "    test coverage, documentation)\n"
+            "  • intel_coordinator    — 3 intel agents (CVE scan, threat model, "
+            "    OWASP/CWE compliance)\n\n"
+            "PLANNING RULES:\n"
+            "- 'Full deep review' / 'everything' / 'comprehensive' → all three\n"
+            "- 'Security review' / 'vulnerabilities' / 'pentesting' → security_coordinator\n"
+            "- 'Quality review' / 'readability' / 'best practices' → quality_coordinator\n"
+            "- 'Threat model' / 'CVE scan' / 'OWASP' / 'compliance' → intel_coordinator\n"
+            "- Mixed: 'security and quality' → security_coordinator then quality_coordinator\n\n"
+            "After all requested coordinators return, produce a consolidated "
+            "EXECUTIVE SUMMARY:\n"
+            "  - Total findings by severity\n"
+            "  - Top 3 most critical issues to fix immediately\n"
+            "  - Which agents ran and what each found\n"
+            "Transfer back to the root orchestrator when done."
+        ),
+        sub_agents=[security_coordinator, quality_coordinator, intel_coordinator],
+    )
+
     scout_agent = Agent(
         name="scout_agent",
         model=DEFAULT_MODEL,
-        description=(
-            "Repo Scout: lightweight repository inspection — metadata, file listing, "
-            "and pattern search — without running any LLM review."
-        ),
+        description="Repo Scout: lightweight metadata, file listing, and pattern search — no LLM review.",
         instruction=(
-            "You are the Repo Scout. You inspect a GitHub repository at surface level "
-            "so the user can decide whether and how to proceed — without a full review.\n\n"
+            "You are the Repo Scout. You inspect a GitHub repository at surface level.\n\n"
             "TOOLS:\n"
-            "- get_repo_metadata_tool: language, stars, size, open issues, default "
-            "  branch. Always start here — it's fast and costs no LLM tokens.\n"
-            "- fetch_repo_files_tool: retrieve actual Python file paths + contents.\n"
-            "- search_code_in_files_tool: grep across fetched files for a regex "
-            "  pattern (e.g. 'eval(', 'TODO', 'password').\n\n"
-            "Suggested flow: metadata first, fetch if the user wants files, then "
-            "search if they ask 'does it use X?'. Keep responses concise. You are "
-            "NOT doing security or quality analysis — transfer back to the "
-            "orchestrator if the user asks for that."
+            "- get_repo_metadata_tool: language, stars, size, open issues, default branch.\n"
+            "- fetch_repo_files_tool: retrieve file paths and contents.\n"
+            "- search_code_in_files_tool: grep for a regex pattern.\n\n"
+            "Start with metadata. Fetch files if needed. Search if asked. "
+            "You are NOT doing analysis — transfer back to the orchestrator "
+            "if the user asks for security or quality review."
         ),
         tools=[
             _ft(make_get_repo_metadata_tool),
@@ -1113,32 +1836,20 @@ def build_multi_agent_system(
         ],
     )
 
-    # ── Layer 1d: PR Reviewer ────────────────────────────────────────────────
     pr_agent = Agent(
         name="pr_agent",
         model=DEFAULT_MODEL,
-        description=(
-            "PR Reviewer: reviews only the Python files changed in a GitHub Pull "
-            "Request — not the entire repository."
-        ),
+        description="PR Reviewer: reviews only the Python files changed in a GitHub Pull Request.",
         instruction=(
-            "You are the PR Reviewer. You focus on changes introduced by a specific "
-            "Pull Request, not the whole repository.\n\n"
+            "You are the PR Reviewer. You focus on PR diffs only.\n\n"
             "WORKFLOW:\n"
-            "1. fetch_pr_files_tool — given a PR URL "
-            "(https://github.com/owner/repo/pull/123), fetch only the Python files "
-            "that were added or modified in that PR.\n"
-            "2. scan_code_tool — run Semgrep on those changed files.\n"
-            "3. generate_review_tool — LLM review of the changed files + findings.\n"
-            "4. (optional) validate_findings_tool — cross-check the findings against "
-            "the actual code if the user wants a false-positive filter pass.\n"
-            "5. (optional) post_pr_review_tool — post the findings as inline comments "
-            "directly on the GitHub PR. Use when the user says 'post', 'comment', "
-            "'post to GitHub', or 'post the review'. Pass the issues list from "
-            "generate_review_tool and a brief summary.\n\n"
-            "Always start your response by stating: which PR you reviewed, how many "
-            "Python files changed, and the total issues found. Prioritize findings "
-            "by CRITICAL → HIGH → MEDIUM → LOW."
+            "1. fetch_pr_files_tool — changed files from the PR URL.\n"
+            "2. scan_code_tool — Semgrep on changed files.\n"
+            "3. generate_review_tool — LLM review.\n"
+            "4. (optional) validate_findings_tool — false-positive filter.\n"
+            "5. (optional) post_pr_review_tool — post inline GitHub comments.\n\n"
+            "State which PR, how many files changed, and total issues. "
+            "Prioritize CRITICAL → HIGH → MEDIUM → LOW."
         ),
         tools=[
             _ft(make_fetch_pr_files_tool),
@@ -1149,27 +1860,16 @@ def build_multi_agent_system(
         ],
     )
 
-    # ── Layer 1c: Report Writer ──────────────────────────────────────────────
     report_agent = Agent(
         name="report_agent",
         model=DEFAULT_MODEL,
-        description=(
-            "Report Writer: produces deep-dive explanations of specific findings "
-            "and saves full Markdown review reports to disk."
-        ),
+        description="Report Writer: deep-dive explanations of findings and saves Markdown reports to disk.",
         instruction=(
-            "You are the Report Writer. You work with already-produced review results. "
-            "You do NOT fetch files, run Semgrep, or generate new reviews.\n\n"
+            "You are the Report Writer. You work with already-produced findings.\n\n"
             "TOOLS:\n"
-            "- explain_finding_tool: given one known finding (path, title, description, "
-            "  severity, optional code snippet), ask Gemini for a focused 3-6 sentence "
-            "  explanation — why it matters in practice, exact fix. Use for "
-            "  'explain issue #N' or 'go deeper on that finding'.\n"
-            "- generate_report_file_tool: render files + issues + summary as a "
-            "  Markdown file and save to disk. Returns the output_path. Use when the "
-            "  user says 'save the report' or 'write it to a file'.\n\n"
-            "If no review has been done yet, tell the user to ask for a security or "
-            "quality review first."
+            "- explain_finding_tool: focused 3-6 sentence explanation of one issue.\n"
+            "- generate_report_file_tool: render findings as Markdown and save.\n\n"
+            "If no review has been done yet, tell the user to run a review first."
         ),
         tools=[
             _ft(make_explain_finding_tool),
@@ -1177,165 +1877,131 @@ def build_multi_agent_system(
         ],
     )
 
-    # ── Layer 1d: Dependency CVE Scanner ────────────────────────────────────
-    dependency_agent = Agent(
-        name="dependency_agent",
+    dedup_agent = Agent(
+        name="dedup_agent",
         model=DEFAULT_MODEL,
         description=(
-            "Dependency CVE Scanner: checks a repo's requirements.txt against "
-            "the OSV vulnerability database and reports known CVEs with severity "
-            "and fix versions."
+            "Deduplication Agent: merges duplicate and overlapping findings from "
+            "multiple analysis agents into one clean, consolidated list."
         ),
         instruction=(
-            "You are the Dependency Security Scanner. You check third-party "
-            "libraries for known vulnerabilities — not the project's own code, "
-            "but the code it depends on.\n\n"
+            "You are the Deduplication Agent. When multiple security agents run on "
+            "the same codebase, they often find the same vulnerabilities described "
+            "differently. Your job: produce one clean list.\n\n"
             "WORKFLOW:\n"
-            "1. fetch_requirements_tool — fetch requirements.txt from the repo URL.\n"
-            "   If not found, tell the user and stop.\n"
-            "2. dependency_scan_tool — pass the requirements content to check each "
-            "   package against the OSV vulnerability database.\n\n"
-            "PRESENTING RESULTS:\n"
-            "For each vulnerable package: state the CVE ID, severity, what the "
-            "vulnerability allows an attacker to do, and the exact version to "
-            "upgrade to. Group by severity (CRITICAL first). For clean packages "
-            "just give a count. Mention any packages with no pinned version as "
-            "a risk (can't be checked and may pull in vulnerable versions).\n\n"
-            "Trigger phrases: 'dependency scan', 'check dependencies', 'CVE scan', "
-            "'are my dependencies safe', 'check requirements'."
+            "1. You receive a combined list of findings from multiple agents, "
+            "   each tagged with a 'source_agent' field.\n"
+            "2. Call dedup_tool — identifies exact duplicates (same file+line+type), "
+            "   near-duplicates (same vuln, nearby lines), and semantic duplicates "
+            "   (same issue, different wording). Merges into one richer finding.\n"
+            "3. Report: original count → deduplicated count, how many merges.\n\n"
+            "Transfer back to the root orchestrator when done. Use trigger phrases: "
+            "'deduplicate', 'merge findings', 'combine results'."
         ),
-        tools=[
-            _ft(make_fetch_requirements_tool),
-            _ft(make_dependency_scan_tool),
-        ],
+        tools=[_ft(make_dedup_tool)],
     )
 
-    # ── Layer 1e: Crypto Auditor ─────────────────────────────────────────────
-    crypto_agent = Agent(
-        name="crypto_agent",
+    risk_scorer_agent = Agent(
+        name="risk_scorer_agent",
         model=DEFAULT_MODEL,
         description=(
-            "Cryptography Auditor: detects weak, broken, or misused cryptography "
-            "in source code — MD5/SHA1 password hashing, predictable randomness, "
-            "ECB cipher mode, disabled TLS, obsolete algorithms."
+            "Risk Scorer: assigns CVSS-like composite risk scores to findings "
+            "and produces an overall project risk rating."
         ),
         instruction=(
-            "You are the Cryptography Auditor. You find cryptographic mistakes "
-            "that look correct to most developers but are actually exploitable.\n\n"
+            "You are the Risk Scorer. Not all security findings are equal — "
+            "your job is to quantify which ones matter most.\n\n"
             "WORKFLOW:\n"
-            "1. fetch_repo_files_tool — fetch the source files.\n"
-            "2. crypto_audit_tool — pass the files for cryptographic analysis.\n\n"
-            "PRESENTING RESULTS:\n"
-            "For each finding, explain: what the weak pattern is, WHY it is "
-            "dangerous (not just that it is — give the concrete attack), how much "
-            "effort an attacker needs, and the exact correct replacement. Be "
-            "educational — assume the developer doesn't know why MD5 is broken "
-            "or why `random` is predictable.\n\n"
-            "Trigger phrases: 'crypto audit', 'cryptography review', 'weak crypto', "
-            "'check encryption', 'hash audit', 'is my crypto secure'."
+            "1. You receive a list of (ideally deduplicated) security findings.\n"
+            "2. Call risk_score_tool — scores each finding on Impact, Exploitability, "
+            "   Scope, and Detectability (all 0-10), computes a weighted composite "
+            "   score, and ranks findings by priority.\n"
+            "3. Present: the top 5 highest-risk findings with their scores, "
+            "   the overall project risk level, and which findings require "
+            "   IMMEDIATE action.\n\n"
+            "Transfer back to the root orchestrator when done. Use trigger phrases: "
+            "'risk score', 'prioritize findings', 'CVSS', 'risk rating'."
         ),
-        tools=[
-            _ft(make_fetch_repo_files_tool),
-            _ft(make_crypto_audit_tool),
-        ],
+        tools=[_ft(make_risk_score_tool)],
     )
 
-    # ── Layer 1f: Threat Model Agent ─────────────────────────────────────────
-    threat_model_agent = Agent(
-        name="threat_model_agent",
+    remediation_agent = Agent(
+        name="remediation_agent",
         model=DEFAULT_MODEL,
         description=(
-            "Threat Modeler: produces a full STRIDE threat model for a repository — "
-            "assets, entry points, trust boundaries, attack scenarios with step-by-step "
-            "attacker actions, and missing defenses. Educational and concrete."
+            "Remediation Agent: generates concrete, copy-pasteable code fix patches "
+            "for security findings — not vague advice, but real before/after code."
         ),
         instruction=(
-            "You are the Threat Modeler. Your job is to help developers understand "
-            "how attackers think about their codebase — not just what is vulnerable, "
-            "but WHY, HOW an attacker would exploit it, and WHAT is missing.\n\n"
+            "You are the Remediation Agent. Findings without fixes are just complaints. "
+            "Your job: turn every security finding into actionable, copy-pasteable code.\n\n"
             "WORKFLOW:\n"
-            "1. fetch_repo_files_tool — fetch the source files from the repo URL.\n"
-            "2. threat_model_tool — pass the files to generate a full STRIDE threat "
-            "   model with: assets, entry points, trust boundaries, STRIDE threats "
-            "   (Spoofing/Tampering/Repudiation/Info Disclosure/DoS/Privilege "
-            "   Escalation), top attack scenarios with step-by-step attacker actions "
-            "   and tools used, and missing defenses.\n\n"
-            "PRESENTING RESULTS:\n"
-            "Present the threat model clearly and educationally. For each attack "
-            "scenario explain: what the attacker's goal is, the exact steps they would "
-            "take, what real tools they would use (sqlmap, burp suite, curl, etc.), "
-            "the impact if successful, and what the code is currently missing.\n\n"
-            "Use trigger phrases: 'threat model', 'threat analysis', 'attack surface', "
-            "'how would an attacker', 'security architecture', 'what can go wrong'."
+            "1. You receive a list of security findings AND the source files they "
+            "   reference (passed from the orchestrator after analysis is complete).\n"
+            "2. fetch_repo_files_tool — fetch any files needed for context.\n"
+            "3. remediation_tool — generates exact before/after code patches for "
+            "   each finding: vulnerable code → fixed code, one-line explanation, "
+            "   required library changes, and whether it's a breaking change.\n"
+            "4. Present the patches in order of priority (CRITICAL first).\n\n"
+            "Patches must be syntactically correct Python. Address root causes, "
+            "not symptoms. Transfer back when done. Use trigger phrases: "
+            "'fix this', 'generate patches', 'how do I fix', 'remediation plan'."
         ),
         tools=[
             _ft(make_fetch_repo_files_tool),
-            _ft(make_threat_model_tool),
+            _ft(make_remediation_tool),
         ],
     )
 
-    # ── Layer 0: Root Orchestrator ───────────────────────────────────────────
+    # ══════════════════════════════════════════════════════════════════════════
+    # LAYER 0 — Root Orchestrator
+    # ══════════════════════════════════════════════════════════════════════════
+
     root = Agent(
         name="code_review_agent",
         model=DEFAULT_MODEL,
         description=(
-            "Master orchestrator of a 3-layer multi-agent code review system. "
-            "Routes user requests to specialist agents or runs a one-shot quick review."
+            "Master orchestrator of a 5-layer, 29-agent code security and quality "
+            "analysis system. Routes requests to the right specialist or coordinator."
         ),
         instruction=(
-            "You are the master orchestrator of a 3-layer multi-agent code review "
-            "system with 11 specialized agents.\n\n"
-            "ARCHITECTURE:\n"
-            "  Layer 0: you (orchestrator)\n"
-            "  Layer 1: scout_agent | analysis_coordinator | report_agent | "
-            "pr_agent | threat_model_agent | dependency_agent | crypto_agent\n"
-            "  Layer 2: security_agent | quality_agent | validator_agent "
-            "(inside analysis_coordinator)\n\n"
-            "YOUR DIRECT TOOL (fastest path):\n"
-            "- review_repo_tool: one-shot full review (fetch + Semgrep + LLM in one "
-            "  call). Use when the user wants a quick complete review of a whole repo.\n\n"
-            "SUB-AGENTS (delegate with transfer_to_agent):\n"
-            "- scout_agent: lightweight repo inspection — metadata, file list, "
-            "  pattern search. Use for 'what is this repo?', 'how big?', "
-            "  'does it use X?'\n"
-            "- analysis_coordinator: deep repo review — delegates to security_agent, "
-            "  quality_agent, and validator_agent as needed. Use for 'security review',"
-            "  'quality review', 'full deep review', 'find vulnerabilities'.\n"
-            "- pr_agent: Pull Request review — reviews only changed files in a PR. "
-            "  Use when the user provides a PR URL "
-            "(https://github.com/owner/repo/pull/N) or asks to 'review this PR'.\n"
-            "- report_agent: output and explanations. Use for 'explain issue #N', "
-            "  'save the report', 'write it to a file'.\n"
-            "- threat_model_agent: STRIDE threat model — assets, entry points, trust "
-            "  boundaries, attack scenarios, missing defenses. Use for 'threat model', "
-            "  'threat analysis', 'attack surface', 'how would an attacker', "
-            "  'what can go wrong'.\n"
-            "- dependency_agent: CVE scanner for requirements.txt — checks each "
-            "  dependency against the OSV database. Use for 'dependency scan', "
-            "  'check dependencies', 'CVE scan', 'are my deps safe'.\n"
-            "- crypto_agent: cryptography auditor — finds weak hashing, predictable "
-            "  randomness, ECB mode, disabled TLS, obsolete algorithms. Use for "
-            "  'crypto audit', 'check encryption', 'weak crypto', 'hash audit'.\n\n"
-            "ROUTING RULES:\n"
-            "1. Repo URL + 'quick review' / no specific focus → review_repo_tool.\n"
-            "2. 'What is this repo?' / 'scout' / 'list files' → scout_agent.\n"
-            "3. 'Security review' / 'quality review' / 'deep dive' → "
-            "   analysis_coordinator.\n"
-            "4. PR URL or 'review this PR' / 'review the diff' → pr_agent.\n"
-            "5. 'Explain issue' / 'save report' → report_agent.\n"
-            "6. 'Threat model' / 'attack surface' / 'how would an attacker' → "
-            "   threat_model_agent.\n"
-            "7. 'Dependency scan' / 'CVE scan' / 'check requirements' → "
-            "   dependency_agent.\n"
-            "8. 'Crypto audit' / 'check encryption' / 'weak crypto' → crypto_agent.\n"
-            "9. Off-topic requests → politely decline.\n\n"
-            "Always tell the user which agent you are delegating to and why."
+            "You are the master orchestrator of a 5-layer multi-agent code review "
+            "and security analysis system with 29 specialized agents.\n\n"
+            "ARCHITECTURE OVERVIEW:\n"
+            "  L0: you (root orchestrator)\n"
+            "  L1: planner_agent | context_agent | scout_agent | pr_agent |\n"
+            "      report_agent | dedup_agent | risk_scorer_agent | remediation_agent\n"
+            "  L2: security_coordinator | quality_coordinator | intel_coordinator\n"
+            "  L3: sast_agent | injection_agent | auth_agent | crypto_agent |\n"
+            "      secrets_agent | data_flow_agent | quality_agent |\n"
+            "      complexity_agent | test_agent | doc_agent |\n"
+            "      dependency_agent | threat_model_agent | compliance_agent\n"
+            "  L4: validator_agent | taint_validator_agent | owasp_agent | cwe_agent\n\n"
+            "YOUR DIRECT TOOL:\n"
+            "- review_repo_tool: one-shot quick review. Use when the user wants "
+            "  a fast answer without deep analysis.\n\n"
+            "ROUTING (delegate with transfer_to_agent):\n"
+            "1. 'Quick review' / 'fast check' → review_repo_tool (direct)\n"
+            "2. 'What is this repo?' / 'scout' / 'list files' → scout_agent\n"
+            "3. 'Understand the architecture first' / 'what framework?' → context_agent\n"
+            "4. 'Security review' / 'quality review' / 'full review' / 'everything'\n"
+            "   → planner_agent (it decides which coordinators to invoke)\n"
+            "5. PR URL or 'review this PR' → pr_agent\n"
+            "6. 'Explain issue #N' / 'save the report' → report_agent\n"
+            "7. 'Deduplicate findings' / 'merge results' → dedup_agent\n"
+            "8. 'Risk score' / 'prioritize' / 'CVSS' → risk_scorer_agent\n"
+            "9. 'Fix this' / 'generate patches' / 'remediation' → remediation_agent\n"
+            "10. Off-topic requests → politely decline.\n\n"
+            "Always tell the user which agent you are delegating to and why. "
+            "For multi-step requests: context_agent first (optional), then "
+            "planner_agent for analysis, then dedup_agent + risk_scorer_agent "
+            "to consolidate, then remediation_agent for fixes."
         ),
-        tools=[
-            FunctionTool(make_review_repo_tool(pipeline)),
+        tools=[FunctionTool(make_review_repo_tool(pipeline))],
+        sub_agents=[
+            planner_agent, context_agent, scout_agent, pr_agent,
+            report_agent, dedup_agent, risk_scorer_agent, remediation_agent,
         ],
-        sub_agents=[scout_agent, analysis_coordinator, report_agent, pr_agent,
-                    threat_model_agent, dependency_agent, crypto_agent],
     )
 
     return root

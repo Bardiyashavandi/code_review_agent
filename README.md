@@ -11,8 +11,8 @@
 [![Streamlit](https://img.shields.io/badge/Streamlit-1.45-FF4B4B?logo=streamlit&logoColor=white)](https://streamlit.io)
 [![Tests](https://img.shields.io/badge/tests-110%20passing-22c55e?logo=pytest&logoColor=white)](./tests)
 [![CI](https://github.com/Bardiyashavandi/code_review_agent/actions/workflows/ci.yml/badge.svg)](https://github.com/Bardiyashavandi/code_review_agent/actions/workflows/ci.yml)
-[![Agents](https://img.shields.io/badge/agents-11-blueviolet)](#multi-agent-architecture)
-[![Layers](https://img.shields.io/badge/layers-3-orange)](#multi-agent-architecture)
+[![Agents](https://img.shields.io/badge/agents-29-blueviolet)](#multi-agent-architecture)
+[![Layers](https://img.shields.io/badge/layers-5-orange)](#multi-agent-architecture)
 [![Cost](https://img.shields.io/badge/cost-%240-success)](https://ai.google.dev/pricing)
 
 **Kaggle 5-Day AI Agents Intensive Capstone — track: Agents for Business**
@@ -48,7 +48,7 @@
 
 Static analyzers find patterns but can't explain why they matter. LLMs can explain things but hallucinate when given no real grounding. This agent closes that gap: it fetches your actual repository, runs real Semgrep static analysis on it, and hands both the code and the findings to Gemini — so every issue in the final report is backed by a deterministic rule or a model that's actually reading your code, never a guess.
 
-The pipeline is orchestrated by a **3-layer multi-agent system** built on Google ADK 2.3. Eleven specialized agents handle routing, analysis, reporting, PR review, threat modeling, dependency CVE scanning, and cryptography auditing — each with its own narrowly scoped tool set and instructions, rather than one monolithic agent doing everything.
+The pipeline is orchestrated by a **5-layer multi-agent system** built on Google ADK 2.3. Twenty-nine specialized agents handle routing, analysis, reporting, PR review, threat modeling, dependency CVE scanning, cryptography auditing, injection detection, auth auditing, secrets scanning, taint analysis, complexity measurement, test coverage, documentation quality, OWASP/CWE compliance mapping, risk scoring, and automated remediation — each with its own narrowly scoped tool set and instructions, rather than one monolithic agent doing everything.
 
 > **No paid services.** Semgrep `--config auto`, Gemini Flash Lite, and the GitHub API are all free-tier. Hard constraint from day one.
 
@@ -56,117 +56,203 @@ The pipeline is orchestrated by a **3-layer multi-agent system** built on Google
 
 ## Multi-Agent Architecture
 
-The system is a directed graph of **11 agents** across three layers. The root orchestrator routes every user request to the right specialist; the analysis coordinator decides whether to delegate to security, quality, validation, or all three.
+The system is a directed graph of **29 agents** across five layers. The root orchestrator routes every user request to the right specialist or coordinator; the planner decides which domain coordinators to invoke; coordinators manage their own specialists; and sub-specialists handle the deepest, most targeted tasks.
 
 ```mermaid
 flowchart TD
-    subgraph L0["LAYER 0 — Orchestrator"]
-        Root(["⭐ code_review_agent\n―――――――――――――――――――――\ntool: review_repo_tool\none-shot fast path"])
+    subgraph L0["LAYER 0 — Root Orchestrator"]
+        Root(["⭐ code_review_agent\n―――――――――――――――――――\ntool: review_repo_tool\none-shot fast path"])
     end
 
-    subgraph L1["LAYER 1 — Domain Specialists"]
+    subgraph L1["LAYER 1 — Strategic Agents"]
+        Planner["🧠 planner_agent\nsequences L2 coordinators"]
+        Context["🔭 context_agent\nframework · entry points · attack surface"]
         Scout["🔍 scout_agent\nmetadata · file list · search"]
-        Coord["🎯 analysis_coordinator\nroutes to Layer 2 specialists"]
-        Report["📄 report_agent\nexplain findings · save file"]
-        PR["🔀 pr_agent\nPR diff · review · post inline comments"]
-        TM["🗺️ threat_model_agent\nSTRIDE · attack scenarios · entry points"]
+        PR["🔀 pr_agent\nPR diff · Semgrep · post inline comments"]
+        Report["📄 report_agent\nexplain findings · save Markdown"]
+        Dedup["🔁 dedup_agent\nmerge cross-agent duplicates"]
+        Risk["📊 risk_scorer_agent\nCVSS-like composite scoring"]
+        Remed["🔧 remediation_agent\nbefore/after code patches"]
+    end
+
+    subgraph L2["LAYER 2 — Domain Coordinators"]
+        SecCoord["🎯 security_coordinator\norchestrates 6 security agents"]
+        QualCoord["✨ quality_coordinator\norchestrates 4 quality agents"]
+        IntelCoord["🗺️ intel_coordinator\norchestrates 3 intel agents"]
+    end
+
+    subgraph L3["LAYER 3 — Specialist Agents"]
+        SAST["🔒 sast_agent\nSemgrep + LLM security review"]
+        Inj["💉 injection_agent\nSQL · cmd · SSTI · XSS · SSRF · path"]
+        Auth["🔑 auth_agent\nIDOR · broken auth · privilege escalation"]
+        Crypto["🔐 crypto_agent\nMD5 · ECB · predictable random · hardcoded keys"]
+        Sec2["🔓 secrets_agent\nAPI keys · passwords · private keys"]
+        DF["🌊 data_flow_agent\ntaint analysis: source → sink"]
+        Qual["📐 quality_agent\ncode quality + best practices"]
+        Cx["🧮 complexity_agent\ncyclomatic · nesting · god classes"]
+        Test["🧪 test_agent\ncoverage gaps · missing edge cases"]
+        Doc["📝 doc_agent\ndocstrings · type hints · TODO debt"]
         Dep["📦 dependency_agent\nOSV CVE scan · fix versions"]
-        Crypto["🔐 crypto_agent\nweak algorithms · insecure randomness · ECB · hardcoded keys"]
+        TM["🗡️ threat_model_agent\nSTRIDE · attack scenarios · entry points"]
+        Comp["📋 compliance_agent\nOWASP Top 10 + CWE Top 25 mapping"]
     end
 
-    subgraph L2["LAYER 2 — Analysis Specialists"]
-        Sec["🔒 security_agent\nSemgrep + LLM security review\nexplain findings"]
-        Qual["✨ quality_agent\nLLM quality review\npattern search"]
-        Val["✅ validator_agent\ncross-check findings\nflag false positives"]
+    subgraph L4["LAYER 4 — Sub-Specialists"]
+        Val["✅ validator_agent\nflag false positives"]
+        TVal["🔬 taint_validator_agent\nconfirm path reachability"]
+        OWASP["🏷️ owasp_agent\nmap findings to OWASP Top 10 2021"]
+        CWE["🏷️ cwe_agent\nmap findings to CWE Top 25"]
     end
 
-    Root --> Scout & Coord & Report & PR & TM & Dep & Crypto
-    Coord --> Sec & Qual & Val
+    Root --> Planner & Context & Scout & PR & Report & Dedup & Risk & Remed
+    Planner --> SecCoord & QualCoord & IntelCoord
+    SecCoord --> SAST & Inj & Auth & Crypto & Sec2 & DF
+    QualCoord --> Qual & Cx & Test & Doc
+    IntelCoord --> Dep & TM & Comp
+    SAST --> Val
+    DF --> TVal
+    Comp --> OWASP & CWE
 
-    classDef root fill:#1a7340,color:#fff,stroke:#0d5c2e
-    classDef l1   fill:#1d3557,color:#fff,stroke:#14253d
-    classDef l2   fill:#5c2a2a,color:#fff,stroke:#3d1a1a
+    classDef root  fill:#1a7340,color:#fff,stroke:#0d5c2e
+    classDef l1    fill:#1d3557,color:#fff,stroke:#14253d
+    classDef l2    fill:#5c2a2a,color:#fff,stroke:#3d1a1a
+    classDef l3    fill:#5c4200,color:#fff,stroke:#3d2c00
+    classDef l4    fill:#2a2a5c,color:#fff,stroke:#1a1a3d
 
     class Root root
-    class Scout,Coord,Report,PR,TM,Dep,Crypto l1
-    class Sec,Qual,Val l2
+    class Planner,Context,Scout,PR,Report,Dedup,Risk,Remed l1
+    class SecCoord,QualCoord,IntelCoord l2
+    class SAST,Inj,Auth,Crypto,Sec2,DF,Qual,Cx,Test,Doc,Dep,TM,Comp l3
+    class Val,TVal,OWASP,CWE l4
 ```
 
 ```
-LAYER 0 - Orchestrator
-+-----------------------------------------------------------------------+
-|  code_review_agent (root)          tool: review_repo_tool (one-shot)  |
-+-----------------------------------------------------------------------+
-    |           |              |              |               |
-    v           v              v              v               v
-LAYER 1 - Domain Specialists
-+----------+ +---------------------+ +----------+ +--------+ +-------------------+ +------------------+ +------------------+
-|scout_agent| |analysis_coordinator | |pr_agent  | |report  | |threat_model_agent | |dependency_agent  | |crypto_agent      |
-|          | |                     | |          | |_agent  | |                   | |                  | |                  |
-|- metadata| | routes to Layer 2:  | |- PR diff | |- expl. | |- STRIDE threats   | |- fetch           | |- fetch files     |
-|- file    | |   security_agent    | |- review  | |  issue | |- attack scenarios | |  requirements    | |- detect MD5/SHA1 |
-|  list    | |   quality_agent     | |- post    | |- save  | |- entry points     | |- OSV CVE query   | |- random vs       |
-|- search  | |   validator_agent   | |  inline  | |  file  | |- missing defenses | |- fix versions    | |  secrets         |
-|          | |                     | |  comments| |        | |                   | |                  | |- ECB · hardcoded |
-+----------+ +----------+----------+ +----------+ +--------+ +-------------------+ +------------------+ +------------------+
-                        |
-                        | sub_agents (analysis_coordinator only)
-               +--------+--------+
-               |        |        |
-               v        v        v
-LAYER 2 - Analysis Specialists
-+------------------+  +------------------+  +-----------------+
-| security_agent   |  | quality_agent    |  | validator_agent |
-|                  |  |                  |  |                 |
-| - fetch files    |  | - fetch files    |  | - cross-check   |
-| - Semgrep scan   |  | - LLM quality    |  |   findings vs   |
-| - LLM sec review |  |   review         |  |   source code   |
-| - explain finding|  | - pattern search |  | - flag false    |
-|                  |  |                  |  |   positives     |
-+------------------+  +------------------+  +-----------------+
+LAYER 0 ─ Root Orchestrator
+┌────────────────────────────────────────────────────────────────────┐
+│  code_review_agent          tool: review_repo_tool (one-shot)      │
+└────────────────────────────────────────────────────────────────────┘
+  │
+  ├─ planner_agent      ──── routes to L2 coordinators based on intent
+  ├─ context_agent      ──── framework/stack/entry-point detection
+  ├─ scout_agent        ──── metadata · file list · search (no LLM)
+  ├─ pr_agent           ──── PR diff review · post inline GitHub comments
+  ├─ report_agent       ──── explain findings · save Markdown report
+  ├─ dedup_agent        ──── merge cross-agent duplicate findings
+  ├─ risk_scorer_agent  ──── CVSS-like Impact×0.4 + Exploit×0.3 + ... scoring
+  └─ remediation_agent  ──── before/after code patch generation
+
+LAYER 2 ─ Domain Coordinators (children of planner_agent)
+┌──────────────────────┐  ┌──────────────────────┐  ┌──────────────────────┐
+│  security_coordinator│  │  quality_coordinator  │  │  intel_coordinator   │
+│  ─ 6 specialists     │  │  ─ 4 specialists      │  │  ─ 3 specialists     │
+└──────────────────────┘  └──────────────────────┘  └──────────────────────┘
+
+LAYER 3 ─ Specialists
+Under security_coordinator:         Under quality_coordinator:      Under intel_coordinator:
+  sast_agent      (Semgrep+LLM)       quality_agent   (best practices)  dependency_agent (OSV CVEs)
+  injection_agent (SQL/XSS/SSRF)      complexity_agent (cyclomatic)     threat_model_agent (STRIDE)
+  auth_agent      (IDOR/broken auth)   test_agent       (coverage gaps)  compliance_agent (OWASP/CWE)
+  crypto_agent    (weak algorithms)    doc_agent        (docstrings)
+  secrets_agent   (hardcoded creds)
+  data_flow_agent (taint analysis)
+
+LAYER 4 ─ Sub-Specialists (innermost)
+  validator_agent       ← child of sast_agent       (false-positive filter)
+  taint_validator_agent ← child of data_flow_agent  (confirms path reachability)
+  owasp_agent           ← child of compliance_agent (OWASP Top 10 2021 mapping)
+  cwe_agent             ← child of compliance_agent (CWE Top 25 mapping)
 ```
 
 ### Agent roles
 
-| Agent | Layer | Role | Tools |
+**Layer 0 — Root**
+
+| Agent | Role | Tools |
+|---|---|---|
+| `code_review_agent` | Root orchestrator — one-shot fast path or delegates to L1 agents | `review_repo_tool` |
+
+**Layer 1 — Strategic**
+
+| Agent | Role | Tools |
+|---|---|---|
+| `planner_agent` | Sequences domain coordinators; produces consolidated executive summary | *(sub-agents: L2 coordinators)* |
+| `context_agent` | Detects framework, entry points, attack surface before deeper analysis | `get_repo_metadata_tool`, `fetch_repo_files_tool`, `context_analysis_tool` |
+| `scout_agent` | Lightweight metadata, file listing, pattern search — no LLM review | `get_repo_metadata_tool`, `fetch_repo_files_tool`, `search_code_in_files_tool` |
+| `pr_agent` | PR diff review — fetches only changed files, runs Semgrep + LLM, can post **inline GitHub PR comments** | `fetch_pr_files_tool`, `scan_code_tool`, `generate_review_tool`, `validate_findings_tool`, `post_pr_review_tool` |
+| `report_agent` | Deep-dive explanations of individual findings + saves Markdown reports | `explain_finding_tool`, `generate_report_file_tool` |
+| `dedup_agent` | Merges duplicate/overlapping findings from multiple agents | `dedup_tool` |
+| `risk_scorer_agent` | Assigns CVSS-like composite risk scores; ranks findings by priority | `risk_score_tool` |
+| `remediation_agent` | Generates copy-pasteable before/after code patches for findings | `fetch_repo_files_tool`, `remediation_tool` |
+
+**Layer 2 — Domain Coordinators**
+
+| Agent | Role |
+|---|---|
+| `security_coordinator` | Orchestrates 6 security specialists; aggregates by severity |
+| `quality_coordinator` | Orchestrates 4 quality specialists |
+| `intel_coordinator` | Orchestrates 3 intel specialists (CVE, threat model, compliance) |
+
+**Layer 3 — Specialists**
+
+| Agent | Domain | Role | Tools |
 |---|---|---|---|
-| `code_review_agent` | 0 | Root orchestrator — routes requests, handles quick one-shot reviews directly | `review_repo_tool` |
-| `scout_agent` | 1 | Lightweight repo inspection — metadata, file listing, pattern search. No LLM review. | `get_repo_metadata_tool`, `fetch_repo_files_tool`, `search_code_in_files_tool` |
-| `analysis_coordinator` | 1 | Decides security vs quality vs validation. Delegates to Layer 2 and aggregates results. | *(sub-agents only)* |
-| `report_agent` | 1 | Deep-dive explanations of individual findings + saves Markdown reports to disk. | `explain_finding_tool`, `generate_report_file_tool` |
-| `pr_agent` | 1 | Pull Request reviewer — fetches only changed files from a PR URL, runs Semgrep + LLM review, and can post findings as **inline GitHub PR comments** on the exact lines. | `fetch_pr_files_tool`, `scan_code_tool`, `generate_review_tool`, `validate_findings_tool`, `post_pr_review_tool` |
-| `threat_model_agent` | 1 | STRIDE threat modeler — identifies assets, entry points, trust boundaries, and generates concrete attack scenarios with step-by-step attacker actions and missing defenses. | `fetch_repo_files_tool`, `threat_model_tool` |
-| `dependency_agent` | 1 | Dependency CVE scanner — fetches `requirements.txt` from the repo and queries the free [OSV](https://osv.dev) database for known vulnerabilities, returning CVE IDs, severity, and recommended fix versions. No API key required. | `fetch_requirements_tool`, `dependency_scan_tool` |
-| `crypto_agent` | 1 | Cryptography auditor — inspects source files for insecure patterns: MD5/SHA1 for passwords, Python `random` for secrets, AES-ECB mode, hardcoded IVs/keys, disabled TLS, and base64-as-encryption. Returns per-finding severity, attacker effort, and safe alternatives. | `fetch_repo_files_tool`, `crypto_audit_tool` |
-| `security_agent` | 2 | Semgrep static analysis + LLM security-focused review. | `fetch_repo_files_tool`, `scan_code_tool`, `generate_review_tool`, `explain_finding_tool` |
-| `quality_agent` | 2 | LLM quality/readability review — no Semgrep, no security angle. | `fetch_repo_files_tool`, `generate_review_tool`, `search_code_in_files_tool` |
-| `validator_agent` | 2 | Cross-checks security findings against source code to flag false positives. | `validate_findings_tool` |
+| `sast_agent` | Security | Semgrep static analysis + LLM security review; delegates to `validator_agent` | `fetch_repo_files_tool`, `scan_code_tool`, `generate_review_tool`, `explain_finding_tool` |
+| `injection_agent` | Security | SQL, command, SSTI, XSS, SSRF, path traversal, LDAP, XXE detection | `fetch_repo_files_tool`, `injection_audit_tool` |
+| `auth_agent` | Security | Broken auth, IDOR, privilege escalation, JWT, OAuth flaws | `fetch_repo_files_tool`, `auth_audit_tool` |
+| `crypto_agent` | Security | Weak hashing, ECB mode, predictable randomness, hardcoded keys, disabled TLS | `fetch_repo_files_tool`, `crypto_audit_tool` |
+| `secrets_agent` | Security | Hardcoded API keys, passwords, private keys, JWT signing secrets | `fetch_repo_files_tool`, `secrets_audit_tool`, `search_code_in_files_tool` |
+| `data_flow_agent` | Security | Taint analysis — traces input sources to dangerous sinks | `fetch_repo_files_tool`, `data_flow_tool` |
+| `quality_agent` | Quality | Code quality, readability, Python best practices | `fetch_repo_files_tool`, `generate_review_tool`, `search_code_in_files_tool` |
+| `complexity_agent` | Quality | Cyclomatic complexity, nesting depth, god classes, magic numbers | `fetch_repo_files_tool`, `complexity_tool` |
+| `test_agent` | Quality | Test coverage gaps, missing edge cases, untested security-critical paths | `fetch_repo_files_tool`, `test_coverage_tool` |
+| `doc_agent` | Quality | Missing docstrings, type hints, stale comments, TODO debt | `fetch_repo_files_tool`, `doc_quality_tool` |
+| `dependency_agent` | Intel | OSV CVE scan on `requirements.txt` — CVE IDs, severity, fix versions | `fetch_requirements_tool`, `dependency_scan_tool` |
+| `threat_model_agent` | Intel | STRIDE threat model — assets, entry points, attack scenarios | `fetch_repo_files_tool`, `threat_model_tool` |
+| `compliance_agent` | Intel | Maps findings to OWASP Top 10 + CWE Top 25 via sub-agents | `owasp_mapping_tool`, `cwe_mapping_tool` |
+
+**Layer 4 — Sub-Specialists**
+
+| Agent | Parent | Role | Tools |
+|---|---|---|---|
+| `validator_agent` | `sast_agent` | Cross-checks findings against source code to flag false positives | `validate_findings_tool` |
+| `taint_validator_agent` | `data_flow_agent` | Confirms taint paths are actually reachable and exploitable | `fetch_repo_files_tool`, `search_code_in_files_tool` |
+| `owasp_agent` | `compliance_agent` | Maps findings to OWASP Top 10 2021 (A01–A10) | `owasp_mapping_tool` |
+| `cwe_agent` | `compliance_agent` | Maps findings to CWE Top 25 Most Dangerous Weaknesses | `cwe_mapping_tool` |
 
 ### How routing works
 
 The root agent reads the user's intent and picks a path:
 
 ```
-"quick review <url>"                       →  review_repo_tool (one call, done)
-"what is this repo?"                       →  scout_agent
-"security review <url>"                    →  analysis_coordinator → security_agent
-"quality review <url>"                     →  analysis_coordinator → quality_agent
-"full deep review <url>"                   →  analysis_coordinator → security_agent
-                                                                   → validator_agent
-                                                                   → quality_agent
+"quick review <url>"                        →  review_repo_tool (one call, done)
+"what is this repo?"                        →  scout_agent
+"what framework does this use?"             →  context_agent
+"security review <url>"                     →  planner_agent → security_coordinator
+                                                   → sast_agent + injection_agent + auth_agent
+"full deep review <url>"                    →  planner_agent → security_coordinator
+                                                              → quality_coordinator
+                                                              → intel_coordinator
+"injection vulnerabilities"                 →  planner_agent → security_coordinator → injection_agent
+"check for hardcoded credentials"           →  planner_agent → security_coordinator → secrets_agent
+"data flow analysis"                        →  planner_agent → security_coordinator → data_flow_agent
+                                                                → taint_validator_agent
+"quality review <url>"                      →  planner_agent → quality_coordinator
+"how complex is this codebase?"             →  planner_agent → quality_coordinator → complexity_agent
+"test coverage gaps"                        →  planner_agent → quality_coordinator → test_agent
+"OWASP compliance" / "CWE mapping"         →  planner_agent → intel_coordinator
+                                                   → compliance_agent → owasp_agent + cwe_agent
+"threat model this repo"                    →  planner_agent → intel_coordinator → threat_model_agent
+"scan dependencies for CVEs"               →  planner_agent → intel_coordinator → dependency_agent
 "review this PR: github.com/.../pull/42"   →  pr_agent
 "review PR #42 and post to GitHub"         →  pr_agent → post_pr_review_tool
-"threat model this repo"                   →  threat_model_agent
-"how would an attacker exploit this?"      →  threat_model_agent
-"scan dependencies for CVEs"              →  dependency_agent
-"any vulnerabilities in requirements.txt" →  dependency_agent
-"audit crypto / check for weak encryption"→  crypto_agent
-"is random used for secrets anywhere?"    →  crypto_agent
-"explain issue #3"                         →  report_agent
-"save the report"                          →  report_agent
+"deduplicate findings"                      →  dedup_agent
+"risk score" / "prioritize findings"        →  risk_scorer_agent
+"fix this" / "generate patches"             →  remediation_agent
+"explain issue #3"                          →  report_agent
+"save the report"                           →  report_agent
 ```
 
-The `analysis_coordinator` uses ADK's `transfer_to_agent` to delegate down to Layer 2, waits for each specialist to return, then aggregates and presents combined findings. The `validator_agent` acts as a peer reviewer — after `security_agent` produces findings, the coordinator can optionally route to `validator_agent` to cross-check them against the actual source code before presenting results. All transfers are visible in the ADK Dev UI Traces panel in real time.
+All `transfer_to_agent` calls are visible in the ADK Dev UI Traces panel in real time. A full deep review flows through up to 5 levels: root → planner → coordinator → specialist → sub-specialist.
 
 ---
 
@@ -297,7 +383,7 @@ python3 main.py https://github.com/owner/repo --branch main --out review_report.
 adk web
 ```
 
-Opens Google's ADK Dev UI at `http://127.0.0.1:8000`. Chat with the 3-layer agent system directly in a browser. The graph panel shows all 6 agents and their tool connections; the Traces panel shows every agent transfer and tool call in real time.
+Opens Google's ADK Dev UI at `http://127.0.0.1:8000`. Chat with the 5-layer agent system directly in a browser. The graph panel shows all 29 agents and their tool connections; the Traces panel shows every agent transfer and tool call in real time.
 
 **Example prompts to try:**
 
@@ -548,12 +634,17 @@ code_review_agent/
 │   └── report_generator.py       # Render PipelineResult → Markdown
 │
 ├── Orchestration
-│   └── agent.py                  # CodeReviewAgent + 3-layer 11-agent ADK graph
+│   └── agent.py                  # CodeReviewAgent + 5-layer 29-agent ADK graph
 │                                 #   (build_multi_agent_system → root_agent)
-│                                 #   agents: root · scout · analysis_coordinator
-│                                 #           pr_agent · report_agent · threat_model_agent
-│                                 #           dependency_agent · crypto_agent
-│                                 #           security · quality · validator
+│                                 #   L0: code_review_agent
+│                                 #   L1: planner · context · scout · pr · report
+│                                 #       dedup · risk_scorer · remediation
+│                                 #   L2: security_coordinator · quality_coordinator
+│                                 #       intel_coordinator
+│                                 #   L3: sast · injection · auth · crypto · secrets
+│                                 #       data_flow · quality · complexity · test
+│                                 #       doc · dependency · threat_model · compliance
+│                                 #   L4: validator · taint_validator · owasp · cwe
 │
 ├── Entry points
 │   ├── main.py                   # CLI: python3 main.py <url>
@@ -587,7 +678,7 @@ code_review_agent/
 
 **Spec-driven development.** Every module started as a written spec (interface, behavior, error hierarchy, test table) before any implementation code. The `*_spec.md` files are the visible record of that.
 
-**Genuine multi-agent architecture.** Eleven agents across three layers — root orchestrator, seven domain specialists (scout, coordinator, PR reviewer, reporter, threat modeler, dependency scanner, crypto auditor), and three analysis agents (security, quality, validator). Each has a narrow role, focused instructions, and only the tools it actually needs. The `validator_agent` acts as a peer reviewer, cross-checking the `security_agent`'s findings against actual source code to filter false positives before results reach the user. Agent-to-agent transfers are explicit and visible in the ADK playground. A dedicated `pr_agent` reviews only the changed files in a Pull Request and can post its findings as **inline comments directly on the GitHub PR** — the agent writes back to GitHub, not just to a local report. The `dependency_agent` queries the free [OSV](https://osv.dev) database for known CVEs in pinned dependencies; the `crypto_agent` detects weak cryptography patterns (MD5 passwords, insecure randomness, ECB mode, hardcoded keys) with attacker-effort estimates and safe alternatives.
+**Genuine multi-agent architecture.** Twenty-nine agents across five layers — root orchestrator, eight strategic agents (planner, context analyzer, scout, PR reviewer, reporter, deduplicator, risk scorer, remediation), three domain coordinators (security, quality, intel), thirteen specialists (SAST, injection, auth, crypto, secrets, data flow, quality, complexity, test coverage, documentation, dependency CVE, threat model, compliance), and four sub-specialists (findings validator, taint validator, OWASP mapper, CWE mapper). Each has a narrow role, focused instructions, and only the tools it actually needs. Agent-to-agent transfers are explicit and visible in the ADK playground. A dedicated `pr_agent` reviews only the changed files in a Pull Request and can post its findings as **inline comments directly on the GitHub PR**. The `dependency_agent` queries the free [OSV](https://osv.dev) database for known CVEs in pinned dependencies. The `data_flow_agent` traces untrusted input from entry points through to dangerous sinks, with the `taint_validator_agent` confirming path reachability. The `compliance_agent` delegates to `owasp_agent` and `cwe_agent` to map every finding to OWASP Top 10 2021 and CWE Top 25. The `risk_scorer_agent` quantifies findings with a CVSS-like composite score; the `remediation_agent` produces copy-pasteable before/after code patches.
 
 **Four access surfaces, one pipeline.** The same `CodeReviewAgent` is reachable via CLI (`main.py`), HTTP API (`server.py`/FastAPI), browser chat (`adk web`/ADK Dev UI), and a visual web UI (`streamlit_app.py`/Streamlit) — without duplicating any logic.
 
