@@ -19,6 +19,7 @@ requires no code change.
 from __future__ import annotations
 
 import os
+from datetime import datetime, timezone
 
 import requests
 import streamlit as st
@@ -207,6 +208,108 @@ _HTTP_MESSAGES: dict[int, str] = {
 # Page layout
 # ---------------------------------------------------------------------------
 
+def _render_history() -> None:
+    """Fetch and render the run history tab from GET /traces."""
+    st.subheader("Run History")
+    st.caption("All pipeline runs captured in `traces/trace.jsonl` on the server.")
+
+    try:
+        resp = requests.get(f"{BASE_URL}/traces", params={"limit": 50}, timeout=10)
+    except requests.ConnectionError:
+        st.error(
+            f"Cannot reach the review server at `{BASE_URL}`. "
+            "Start it with `uvicorn server:app --reload`."
+        )
+        return
+    except requests.Timeout:
+        st.error("Timed out fetching trace history.")
+        return
+
+    if resp.status_code != 200:
+        st.error(f"Server returned {resp.status_code} for /traces.")
+        return
+
+    data = resp.json()
+    runs = data.get("runs", [])
+    total = data.get("total", 0)
+
+    if not runs:
+        st.info("No runs recorded yet. Run a review first.")
+        return
+
+    st.caption(f"Showing {len(runs)} of {total} total run(s).")
+
+    # --- Summary metrics ---
+    col1, col2, col3, col4 = st.columns(4)
+    avg_issues = sum(r.get("review_issues") or 0 for r in runs) / len(runs)
+    avg_dur    = sum(r.get("duration_s") or 0 for r in runs) / len(runs)
+    ok_runs    = sum(1 for r in runs if r.get("status") == "ok")
+    col1.metric("Total runs shown", len(runs))
+    col2.metric("Success rate", f"{ok_runs / len(runs) * 100:.0f}%")
+    col3.metric("Avg issues / run", f"{avg_issues:.1f}")
+    col4.metric("Avg duration", f"{avg_dur:.1f} s")
+
+    st.divider()
+
+    # --- Charts ---
+    chart_col1, chart_col2 = st.columns(2)
+
+    with chart_col1:
+        st.markdown("**Issues found per run**")
+        chart_data = {
+            r.get("run_id", "?")[:8]: r.get("review_issues") or 0
+            for r in runs
+        }
+        st.bar_chart(chart_data, color="#e65100")
+
+    with chart_col2:
+        st.markdown("**Duration per run (s)**")
+        dur_data = {
+            r.get("run_id", "?")[:8]: round(r.get("duration_s") or 0, 1)
+            for r in runs
+        }
+        st.bar_chart(dur_data, color="#1565c0")
+
+    st.divider()
+
+    # --- Run table ---
+    st.markdown("**All runs**")
+    for run in reversed(runs):  # most recent first
+        run_id   = (run.get("run_id") or "?")[:8]
+        status   = run.get("status", "?")
+        repo     = run.get("repo_url") or "unknown"
+        files    = run.get("files_fetched") or 0
+        findings = run.get("semgrep_findings") or 0
+        issues   = run.get("review_issues") or 0
+        dur      = run.get("duration_s") or 0
+        errors   = run.get("stage_errors") or []
+
+        # Parse timestamp
+        ts_raw = run.get("start_ts") or ""
+        try:
+            dt = datetime.fromisoformat(ts_raw.replace("Z", "+00:00"))
+            ts = dt.strftime("%Y-%m-%d %H:%M UTC")
+        except ValueError:
+            ts = ts_raw[:19] if ts_raw else "?"
+
+        icon = "✅" if status == "ok" else "❌"
+        label = f"{icon} `{run_id}` &nbsp;·&nbsp; {ts} &nbsp;·&nbsp; {dur:.1f} s &nbsp;·&nbsp; {issues} issues"
+
+        with st.expander(label, expanded=False):
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("Files", files)
+            c2.metric("Semgrep findings", findings)
+            c3.metric("Review issues", issues)
+            c4.metric("Duration", f"{dur:.1f} s")
+            st.markdown(f"**Repo:** [{repo}]({repo})")
+            if errors:
+                st.warning(f"Stage errors: {', '.join(errors)}")
+
+
+# ---------------------------------------------------------------------------
+# Page layout
+# ---------------------------------------------------------------------------
+
 st.set_page_config(
     page_title="AI Code Review Agent",
     page_icon="🔍",
@@ -222,74 +325,84 @@ st.caption(
 
 st.divider()
 
-# --- Input form ---
-with st.form("review_form"):
-    repo_url = st.text_input(
-        "GitHub repository URL",
-        placeholder="https://github.com/owner/repo",
-        help="Must be a public (or token-accessible) github.com repository.",
-    )
-    col_branch, col_files = st.columns([1, 2])
-    branch    = col_branch.text_input("Branch", value="main")
-    max_files = col_files.slider(
-        "Max files to review",
-        min_value=1, max_value=500, value=100,
-        help="Caps how many Python files are fetched. Lower values are faster and cheaper on free-tier quotas.",
-    )
-    submitted = st.form_submit_button("Run Review ▶", type="primary", use_container_width=True)
+tab_review, tab_history = st.tabs(["▶ Review", "📊 History"])
 
-# --- Validation + request ---
-if submitted:
-    url = repo_url.strip()
+# ---------------------------------------------------------------------------
+# Tab 1 — Review
+# ---------------------------------------------------------------------------
 
-    if not url:
-        st.error("Repository URL is required.")
-    elif not url.startswith("https://github.com/"):
-        st.error(
-            "URL must start with `https://github.com/` — "
-            "for example: `https://github.com/owner/repo`"
+with tab_review:
+    with st.form("review_form"):
+        repo_url = st.text_input(
+            "GitHub repository URL",
+            placeholder="https://github.com/owner/repo",
+            help="Must be a public (or token-accessible) github.com repository.",
         )
-    else:
-        with st.spinner("Reviewing… this typically takes 10–60 s depending on repo size."):
-            try:
-                resp = requests.post(
-                    f"{BASE_URL}/analyze",
-                    json={
-                        "repo_url":  url,
-                        "branch":    branch.strip() or "main",
-                        "max_files": max_files,
-                    },
-                    timeout=REQUEST_TIMEOUT,
-                )
+        col_branch, col_files = st.columns([1, 2])
+        branch    = col_branch.text_input("Branch", value="main")
+        max_files = col_files.slider(
+            "Max files to review",
+            min_value=1, max_value=500, value=100,
+            help="Caps how many Python files are fetched. Lower = faster on free-tier quotas.",
+        )
+        submitted = st.form_submit_button("Run Review ▶", type="primary", use_container_width=True)
 
-                if resp.status_code == 200:
-                    _render_results(resp.json())
-                else:
-                    # Extract FastAPI's 'detail' field when present
-                    try:
-                        detail = resp.json().get("detail", resp.text)
-                    except Exception:
-                        detail = resp.text
+    if submitted:
+        url = repo_url.strip()
 
-                    base_msg = _HTTP_MESSAGES.get(
-                        resp.status_code,
-                        f"Server returned {resp.status_code}",
+        if not url:
+            st.error("Repository URL is required.")
+        elif not url.startswith("https://github.com/"):
+            st.error(
+                "URL must start with `https://github.com/` — "
+                "for example: `https://github.com/owner/repo`"
+            )
+        else:
+            with st.spinner("Reviewing… this typically takes 10–60 s depending on repo size."):
+                try:
+                    resp = requests.post(
+                        f"{BASE_URL}/analyze",
+                        json={
+                            "repo_url":  url,
+                            "branch":    branch.strip() or "main",
+                            "max_files": max_files,
+                        },
+                        timeout=REQUEST_TIMEOUT,
                     )
-                    # Append detail for messages that benefit from it
-                    if resp.status_code in (422,) or resp.status_code not in _HTTP_MESSAGES:
-                        st.error(f"{base_msg}: {detail}")
-                    else:
-                        st.error(base_msg)
 
-            except requests.ConnectionError:
-                st.error(
-                    f"Cannot reach the review server at `{BASE_URL}`. "
-                    f"Make sure it is running:\n\n"
-                    f"```\nuvicorn server:app --reload\n```"
-                )
-            except requests.Timeout:
-                st.error(
-                    "The request timed out on the client side. "
-                    "The pipeline may still be running on the server. "
-                    "Try reducing **max_files** or increase `AGENT_TIMEOUT_S` on the server."
-                )
+                    if resp.status_code == 200:
+                        _render_results(resp.json())
+                    else:
+                        try:
+                            detail = resp.json().get("detail", resp.text)
+                        except Exception:
+                            detail = resp.text
+
+                        base_msg = _HTTP_MESSAGES.get(
+                            resp.status_code,
+                            f"Server returned {resp.status_code}",
+                        )
+                        if resp.status_code in (422,) or resp.status_code not in _HTTP_MESSAGES:
+                            st.error(f"{base_msg}: {detail}")
+                        else:
+                            st.error(base_msg)
+
+                except requests.ConnectionError:
+                    st.error(
+                        f"Cannot reach the review server at `{BASE_URL}`. "
+                        f"Make sure it is running:\n\n"
+                        f"```\nuvicorn server:app --reload\n```"
+                    )
+                except requests.Timeout:
+                    st.error(
+                        "The request timed out on the client side. "
+                        "The pipeline may still be running on the server. "
+                        "Try reducing **max_files** or increase `AGENT_TIMEOUT_S` on the server."
+                    )
+
+# ---------------------------------------------------------------------------
+# Tab 2 — History
+# ---------------------------------------------------------------------------
+
+with tab_history:
+    _render_history()

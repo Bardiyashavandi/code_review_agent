@@ -23,14 +23,16 @@ Example curl:
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import sys
 from contextlib import asynccontextmanager
+from pathlib import Path
 from urllib.parse import urlparse
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel, Field, field_validator
 
 # ---------------------------------------------------------------------------
@@ -192,6 +194,57 @@ app = FastAPI(
 async def health() -> dict[str, str]:
     """Quick liveness check — returns 200 if the server is up."""
     return {"status": "ok"}
+
+
+@app.get("/traces", tags=["ops"])
+async def list_traces(
+    limit: int = Query(default=20, ge=1, le=100, description="Max runs to return"),
+) -> dict:
+    """
+    Return the last N pipeline runs from traces/trace.jsonl.
+
+    Each run entry includes: run_id, start_ts, duration_s, status, repo_url,
+    files_fetched, semgrep_findings, review_issues, and stage_errors.
+    Returns an empty list if no trace file exists yet.
+    """
+    trace_file = Path(os.environ.get("TRACE_FILE", "traces/trace.jsonl"))
+    if not trace_file.exists():
+        return {"runs": [], "total": 0}
+
+    spans: list[dict] = []
+    try:
+        with open(trace_file, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    try:
+                        spans.append(json.loads(line))
+                    except json.JSONDecodeError:
+                        pass
+    except OSError as exc:
+        logger.warning("Could not read trace file: %s", exc)
+        return {"runs": [], "total": 0}
+
+    run_spans = [s for s in spans if s.get("span_type") == "run"]
+    total = len(run_spans)
+    run_spans = run_spans[-limit:]
+
+    runs = []
+    for run in run_spans:
+        fields = run.get("fields", {})
+        runs.append({
+            "run_id":          run.get("span_id"),
+            "start_ts":        run.get("start_ts"),
+            "duration_s":      run.get("duration_s"),
+            "status":          run.get("status"),
+            "repo_url":        fields.get("repo_url"),
+            "files_fetched":   fields.get("files_fetched"),
+            "semgrep_findings": fields.get("semgrep_findings"),
+            "review_issues":   fields.get("review_issues"),
+            "stage_errors":    fields.get("stage_errors", []),
+        })
+
+    return {"runs": runs, "total": total}
 
 
 @app.post("/analyze", response_model=AnalyzeResponse, tags=["review"])

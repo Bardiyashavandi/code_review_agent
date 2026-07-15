@@ -241,6 +241,16 @@ class CodeReviewAgent:
         grounded by an already-computed ScanReport — no fetch, no scan."""
         return self._reviewer.review(files, scan_report)
 
+    # --- PR diff entry point -----------------------------------------------
+
+    def fetch_pr_files(self, pr_url: str, max_files: int = DEFAULT_MAX_FILES) -> tuple:
+        """Fetch Python files changed in a GitHub PR only — no scan, no review."""
+        return self._fetcher.fetch_pr_files(pr_url, max_files=max_files)
+
+    def validate_review_findings(self, issues, files) -> list[dict]:
+        """Cross-check already-produced review issues against source files for false positives."""
+        return self._reviewer.validate_findings(issues, files)
+
     # --- Additional, "interesting" tools -----------------------------------
     # Each of these is a distinct capability beyond the core fetch/scan/review
     # pipeline, intended to give the ADK agent more genuine planning choices.
@@ -695,6 +705,72 @@ def build_adk_agent(
     )
 
 
+def make_fetch_pr_files_tool(agent: CodeReviewAgent) -> Callable[..., dict]:
+    """Build a PR-diff fetch tool bound to a CodeReviewAgent instance."""
+
+    def fetch_pr_files_tool(pr_url: str, max_files: int = DEFAULT_MAX_FILES) -> dict:
+        """Fetch Python files that were added or modified in a GitHub Pull Request.
+        Accepts a PR URL (https://github.com/owner/repo/pull/123).
+        Returns the changed files with full content, the PR number, and a
+        truncated flag. Use this as the first step of a PR review instead of
+        fetch_repo_files_tool, which fetches the whole repo."""
+        if not isinstance(pr_url, str) or not pr_url.strip():
+            raise ValueError("pr_url must be a non-empty string")
+        fetch_result, pr_number = agent.fetch_pr_files(pr_url, max_files=max_files)
+        return {
+            "pr_url": pr_url,
+            "pr_number": pr_number,
+            "files": [{"path": f.path, "content": f.content} for f in fetch_result.files],
+            "files_count": len(fetch_result.files),
+            "truncated": fetch_result.truncated,
+        }
+
+    return fetch_pr_files_tool
+
+
+def make_validate_findings_tool(agent: CodeReviewAgent) -> Callable[..., dict]:
+    """Build a findings-validator tool bound to a CodeReviewAgent instance."""
+
+    def validate_findings_tool(issues: list[dict], files: list[dict]) -> dict:
+        """Cross-check a list of already-produced review issues against the actual
+        source files to identify likely false positives. Each issue must have
+        {path, line, severity, title, description}. Each file must have
+        {path, content}. Returns a list of validations, one per issue, each with
+        {index, confidence (HIGH/MEDIUM/LOW), false_positive (bool), note}.
+        Use this after generate_review_tool to filter out weak findings before
+        presenting results to the user."""
+        if not isinstance(issues, list) or not issues:
+            raise ValueError("issues must be a non-empty list")
+        if not isinstance(files, list) or not files:
+            raise ValueError("files must be a non-empty list")
+
+        issue_objs = [
+            ReviewIssue(
+                path=i["path"], line=i.get("line", 0),
+                severity=i.get("severity", "MEDIUM"),
+                title=i.get("title", ""), description=i.get("description", ""),
+                suggested_fix=i.get("suggested_fix", ""), rule_id=i.get("rule_id"),
+            )
+            for i in issues
+        ]
+        file_objs = [
+            FileResult(path=f["path"], content=f.get("content", ""),
+                       sha="", size=len(f.get("content", "")), url="")
+            for f in files
+        ]
+        validations = agent.validate_review_findings(issue_objs, file_objs)
+        confirmed = sum(1 for v in validations if not v.get("false_positive"))
+        false_positives = sum(1 for v in validations if v.get("false_positive"))
+        return {
+            "validations": validations,
+            "total": len(validations),
+            "confirmed": confirmed,
+            "false_positives": false_positives,
+        }
+
+    return validate_findings_tool
+
+
 def build_multi_agent_system(
     github_token: str,
     gemini_api_key: str,
@@ -731,6 +807,35 @@ def build_multi_agent_system(
     def _ft(factory) -> FunctionTool:
         """Create a fresh FunctionTool from a tool factory, bound to `pipeline`."""
         return FunctionTool(factory(pipeline))
+
+    # ── Layer 2c: Validator Agent ────────────────────────────────────────────
+    validator_agent = Agent(
+        name="validator_agent",
+        model=DEFAULT_MODEL,
+        description=(
+            "Findings Validator: cross-checks security review findings against "
+            "the actual source code to identify false positives before reporting."
+        ),
+        instruction=(
+            "You are the Findings Validator. You act as a peer reviewer for the "
+            "security_agent's output — your job is to catch false positives before "
+            "they reach the user.\n\n"
+            "WORKFLOW:\n"
+            "1. You receive a list of security findings and the source files they "
+            "   reference (passed from the analysis_coordinator after security_agent "
+            "   completes).\n"
+            "2. Call validate_findings_tool with those issues and files.\n"
+            "3. Report the validation results: how many findings were confirmed "
+            "   (HIGH/MEDIUM confidence) vs. flagged as probable false positives (LOW).\n"
+            "4. List any false-positive findings by index with the validator's note.\n"
+            "5. Transfer back to analysis_coordinator.\n\n"
+            "Be concise — one paragraph is enough. The goal is a quick confidence "
+            "check, not a full re-review."
+        ),
+        tools=[
+            _ft(make_validate_findings_tool),
+        ],
+    )
 
     # ── Layer 2a: Security Analyst ───────────────────────────────────────────
     security_agent = Agent(
@@ -821,7 +926,7 @@ def build_multi_agent_system(
             "  2. Quality issues (HIGH → MEDIUM → LOW)\n"
             "State how many total issues each specialist found."
         ),
-        sub_agents=[security_agent, quality_agent],
+        sub_agents=[security_agent, quality_agent, validator_agent],
     )
 
     # ── Layer 1b: Repo Scout ─────────────────────────────────────────────────
@@ -850,6 +955,37 @@ def build_multi_agent_system(
             _ft(make_get_repo_metadata_tool),
             _ft(make_fetch_repo_files_tool),
             _ft(make_search_code_tool),
+        ],
+    )
+
+    # ── Layer 1d: PR Reviewer ────────────────────────────────────────────────
+    pr_agent = Agent(
+        name="pr_agent",
+        model=DEFAULT_MODEL,
+        description=(
+            "PR Reviewer: reviews only the Python files changed in a GitHub Pull "
+            "Request — not the entire repository."
+        ),
+        instruction=(
+            "You are the PR Reviewer. You focus on changes introduced by a specific "
+            "Pull Request, not the whole repository.\n\n"
+            "WORKFLOW:\n"
+            "1. fetch_pr_files_tool — given a PR URL "
+            "(https://github.com/owner/repo/pull/123), fetch only the Python files "
+            "that were added or modified in that PR.\n"
+            "2. scan_code_tool — run Semgrep on those changed files.\n"
+            "3. generate_review_tool — LLM review of the changed files + findings.\n"
+            "4. (optional) validate_findings_tool — cross-check the findings against "
+            "the actual code if the user wants a false-positive filter pass.\n\n"
+            "Always start your response by stating: which PR you reviewed, how many "
+            "Python files changed, and the total issues found. Prioritize findings "
+            "by CRITICAL → HIGH → MEDIUM → LOW."
+        ),
+        tools=[
+            _ft(make_fetch_pr_files_tool),
+            _ft(make_scan_code_tool),
+            _ft(make_generate_review_tool),
+            _ft(make_validate_findings_tool),
         ],
     )
 
@@ -891,39 +1027,41 @@ def build_multi_agent_system(
         ),
         instruction=(
             "You are the master orchestrator of a 3-layer multi-agent code review "
-            "system.\n\n"
+            "system with 8 specialized agents.\n\n"
             "ARCHITECTURE:\n"
             "  Layer 0: you (orchestrator)\n"
-            "  Layer 1: scout_agent | analysis_coordinator | report_agent\n"
-            "  Layer 2: security_agent | quality_agent  (inside analysis_coordinator)\n\n"
+            "  Layer 1: scout_agent | analysis_coordinator | report_agent | pr_agent\n"
+            "  Layer 2: security_agent | quality_agent | validator_agent "
+            "(inside analysis_coordinator)\n\n"
             "YOUR DIRECT TOOL (fastest path):\n"
             "- review_repo_tool: one-shot full review (fetch + Semgrep + LLM in one "
-            "  call). Use when the user just wants a complete review quickly and "
-            "  hasn't asked for a specific focus.\n\n"
+            "  call). Use when the user wants a quick complete review of a whole repo.\n\n"
             "SUB-AGENTS (delegate with transfer_to_agent):\n"
-            "- scout_agent: lightweight repo inspection — metadata, file list, regex "
-            "  search. Use for 'what is this repo?', 'how big?', 'does it use X?', "
-            "  'show me the files'.\n"
-            "- analysis_coordinator: deep review — delegates to security_agent and/or "
-            "  quality_agent based on the user's focus. Use for 'security review', "
-            "  'quality review', 'full deep review', 'find vulnerabilities', "
-            "  'check code quality'.\n"
-            "- report_agent: explanations and saved output. Use for 'explain issue #N', "
-            "  'save the report', 'write it to a file'. Requires a review to already "
-            "  exist.\n\n"
+            "- scout_agent: lightweight repo inspection — metadata, file list, "
+            "  pattern search. Use for 'what is this repo?', 'how big?', "
+            "  'does it use X?'\n"
+            "- analysis_coordinator: deep repo review — delegates to security_agent, "
+            "  quality_agent, and validator_agent as needed. Use for 'security review',"
+            "  'quality review', 'full deep review', 'find vulnerabilities'.\n"
+            "- pr_agent: Pull Request review — reviews only changed files in a PR. "
+            "  Use when the user provides a PR URL "
+            "(https://github.com/owner/repo/pull/N) or asks to 'review this PR'.\n"
+            "- report_agent: output and explanations. Use for 'explain issue #N', "
+            "  'save the report', 'write it to a file'.\n\n"
             "ROUTING RULES:\n"
-            "1. 'Review this repo' / 'quick review' → review_repo_tool directly.\n"
+            "1. Repo URL + 'quick review' / no specific focus → review_repo_tool.\n"
             "2. 'What is this repo?' / 'scout' / 'list files' → scout_agent.\n"
-            "3. 'Security review' / 'quality review' / 'deep dive' / 'both' → "
-            "   analysis_coordinator (it handles the sub-delegation).\n"
-            "4. 'Explain issue' / 'save report' → report_agent.\n"
-            "5. Anything unrelated to code review → politely decline.\n\n"
+            "3. 'Security review' / 'quality review' / 'deep dive' → "
+            "   analysis_coordinator.\n"
+            "4. PR URL or 'review this PR' / 'review the diff' → pr_agent.\n"
+            "5. 'Explain issue' / 'save report' → report_agent.\n"
+            "6. Off-topic requests → politely decline.\n\n"
             "Always tell the user which agent you are delegating to and why."
         ),
         tools=[
             FunctionTool(make_review_repo_tool(pipeline)),
         ],
-        sub_agents=[scout_agent, analysis_coordinator, report_agent],
+        sub_agents=[scout_agent, analysis_coordinator, report_agent, pr_agent],
     )
 
     return root

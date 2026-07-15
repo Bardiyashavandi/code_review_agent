@@ -10,7 +10,8 @@
 [![FastAPI](https://img.shields.io/badge/FastAPI-0.115-009688?logo=fastapi&logoColor=white)](https://fastapi.tiangolo.com)
 [![Streamlit](https://img.shields.io/badge/Streamlit-1.45-FF4B4B?logo=streamlit&logoColor=white)](https://streamlit.io)
 [![Tests](https://img.shields.io/badge/tests-107%20passing-22c55e?logo=pytest&logoColor=white)](./tests)
-[![Agents](https://img.shields.io/badge/agents-6-blueviolet)](#multi-agent-architecture)
+[![CI](https://github.com/Bardiyashavandi/code_review_agent/actions/workflows/ci.yml/badge.svg)](https://github.com/Bardiyashavandi/code_review_agent/actions/workflows/ci.yml)
+[![Agents](https://img.shields.io/badge/agents-8-blueviolet)](#multi-agent-architecture)
 [![Layers](https://img.shields.io/badge/layers-3-orange)](#multi-agent-architecture)
 [![Cost](https://img.shields.io/badge/cost-%240-success)](https://ai.google.dev/pricing)
 
@@ -51,48 +52,69 @@ The pipeline is orchestrated by a **3-layer multi-agent system** built on Google
 
 ## Multi-Agent Architecture
 
-The system is a directed graph of six agents across three layers. The root orchestrator routes every user request to the right specialist; the analysis coordinator decides whether to delegate to security, quality, or both.
+The system is a directed graph of **8 agents** across three layers. The root orchestrator routes every user request to the right specialist; the analysis coordinator decides whether to delegate to security, quality, validation, or all three.
+
+```mermaid
+graph TD
+    Root(["⭐ code_review_agent<br/><b>Orchestrator · Layer 0</b>"])
+
+    Root --> Scout["🔍 scout_agent<br/>Layer 1"]
+    Root --> Coord["🎯 analysis_coordinator<br/>Layer 1"]
+    Root --> Report["📄 report_agent<br/>Layer 1"]
+    Root --> PR["🔀 pr_agent<br/>Layer 1"]
+
+    Coord --> Sec["🔒 security_agent<br/>Layer 2"]
+    Coord --> Qual["✨ quality_agent<br/>Layer 2"]
+    Coord --> Val["✅ validator_agent<br/>Layer 2"]
+
+    classDef root fill:#1a7340,color:#fff,stroke:none,rx:8
+    classDef l1   fill:#1d3557,color:#fff,stroke:none,rx:6
+    classDef l2   fill:#5c2a2a,color:#fff,stroke:none,rx:6
+
+    class Root root
+    class Scout,Coord,Report,PR l1
+    class Sec,Qual,Val l2
+```
 
 ```
-┌─────────────────────────────────────────────────────────────────────┐
-│  LAYER 0 — Orchestrator                                             │
-│                                                                     │
-│              ┌──────────────────────────┐                          │
-│              │    code_review_agent     │                          │
-│              │   (root orchestrator)    │                          │
-│              │                          │                          │
-│              │  tool: review_repo_tool  │  ← one-shot fast path   │
-│              └────────────┬─────────────┘                          │
-└───────────────────────────┼─────────────────────────────────────────┘
-                            │  sub_agents
-          ┌─────────────────┼──────────────────┐
-          │                 │                  │
-┌─────────▼──────────────────────────────────────────────────────────┐
-│  LAYER 1 — Domain Specialists                                       │
-│                                                                     │
-│  ┌──────────────┐   ┌──────────────────────┐   ┌────────────────┐  │
-│  │  scout_agent │   │ analysis_coordinator │   │  report_agent  │  │
-│  │              │   │                      │   │                │  │
-│  │ · metadata   │   │  decides: security   │   │ · explain      │  │
-│  │ · file list  │   │  vs quality vs both  │   │   finding      │  │
-│  │ · code search│   │                      │   │ · save report  │  │
-│  └──────────────┘   └──────────┬───────────┘   └────────────────┘  │
-└──────────────────────────────── │ ──────────────────────────────────┘
-                                  │  sub_agents
-                     ┌────────────┴───────────┐
-                     │                        │
-┌────────────────────────────────────────────────────────────────────┐
-│  LAYER 2 — Analysis Specialists                                     │
-│                                                                     │
-│  ┌──────────────────────────┐   ┌──────────────────────────────┐   │
-│  │     security_agent       │   │       quality_agent          │   │
-│  │                          │   │                              │   │
-│  │ · fetch_repo_files_tool  │   │ · fetch_repo_files_tool      │   │
-│  │ · scan_code_tool         │   │ · generate_review_tool       │   │
-│  │ · generate_review_tool   │   │ · search_code_in_files_tool  │   │
-│  │ · explain_finding_tool   │   │                              │   │
-│  └──────────────────────────┘   └──────────────────────────────┘   │
-└────────────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────────────────┐
+│  LAYER 0 — Orchestrator                                                     │
+│                                                                             │
+│                    ┌──────────────────────────┐                            │
+│                    │    code_review_agent      │  tool: review_repo_tool   │
+│                    │    (root orchestrator)    │  ← one-shot fast path     │
+│                    └──────────┬───────────────┘                            │
+└───────────────────────────────┼─────────────────────────────────────────────┘
+                                │  sub_agents
+          ┌─────────────────────┼──────────────┬──────────────┐
+          │                     │              │              │
+┌─────────▼─────────────────────▼──────────────▼──────────────▼──────────────┐
+│  LAYER 1 — Domain Specialists                                               │
+│                                                                             │
+│  ┌─────────────┐  ┌──────────────────────┐  ┌─────────────┐  ┌──────────┐ │
+│  │ scout_agent │  │ analysis_coordinator │  │report_agent │  │ pr_agent │ │
+│  │             │  │                      │  │             │  │          │ │
+│  │ · metadata  │  │ routes to security / │  │ · explain   │  │ · PR     │ │
+│  │ · file list │  │ quality / validator  │  │   findings  │  │   diff   │ │
+│  │ · search    │  │                      │  │ · save file │  │ · review │ │
+│  └─────────────┘  └──────────┬───────────┘  └─────────────┘  └──────────┘ │
+└─────────────────────────────── │ ───────────────────────────────────────────┘
+                                 │  sub_agents
+              ┌──────────────────┼──────────────────┐
+              │                  │                  │
+┌─────────────▼──────────────────▼──────────────────▼──────────────────────┐
+│  LAYER 2 — Analysis Specialists                                           │
+│                                                                           │
+│  ┌──────────────────────┐  ┌──────────────────────┐  ┌─────────────────┐ │
+│  │   security_agent     │  │    quality_agent      │  │ validator_agent │ │
+│  │                      │  │                       │  │                 │ │
+│  │ · fetch files        │  │ · fetch files         │  │ · cross-check   │ │
+│  │ · Semgrep scan       │  │ · LLM quality review  │  │   findings vs   │ │
+│  │ · LLM sec review     │  │ · pattern search      │  │   source code   │ │
+│  │ · explain finding    │  │                       │  │ · flag false    │ │
+│  │                      │  │                       │  │   positives     │ │
+│  └──────────────────────┘  └──────────────────────┘  └─────────────────┘ │
+└───────────────────────────────────────────────────────────────────────────┘
 ```
 
 ### Agent roles
@@ -101,26 +123,31 @@ The system is a directed graph of six agents across three layers. The root orche
 |---|---|---|---|
 | `code_review_agent` | 0 | Root orchestrator — routes requests, handles quick one-shot reviews directly | `review_repo_tool` |
 | `scout_agent` | 1 | Lightweight repo inspection — metadata, file listing, pattern search. No LLM review. | `get_repo_metadata_tool`, `fetch_repo_files_tool`, `search_code_in_files_tool` |
-| `analysis_coordinator` | 1 | Decides security vs quality vs both. Delegates to Layer 2 and aggregates results. | *(sub-agents only)* |
+| `analysis_coordinator` | 1 | Decides security vs quality vs validation. Delegates to Layer 2 and aggregates results. | *(sub-agents only)* |
 | `report_agent` | 1 | Deep-dive explanations of individual findings + saves Markdown reports to disk. | `explain_finding_tool`, `generate_report_file_tool` |
+| `pr_agent` | 1 | Pull Request reviewer — fetches only changed files from a PR URL, not the whole repo. | `fetch_pr_files_tool`, `scan_code_tool`, `generate_review_tool`, `validate_findings_tool` |
 | `security_agent` | 2 | Semgrep static analysis + LLM security-focused review. | `fetch_repo_files_tool`, `scan_code_tool`, `generate_review_tool`, `explain_finding_tool` |
 | `quality_agent` | 2 | LLM quality/readability review — no Semgrep, no security angle. | `fetch_repo_files_tool`, `generate_review_tool`, `search_code_in_files_tool` |
+| `validator_agent` | 2 | Cross-checks security findings against source code to flag false positives. | `validate_findings_tool` |
 
 ### How routing works
 
 The root agent reads the user's intent and picks a path:
 
 ```
-"quick review <url>"              →  review_repo_tool  (handled directly, one call)
-"what is this repo?"              →  scout_agent
-"security review <url>"           →  analysis_coordinator → security_agent
-"quality review <url>"            →  analysis_coordinator → quality_agent
-"full deep review <url>"          →  analysis_coordinator → security_agent → quality_agent
-"explain issue #3"                →  report_agent
-"save the report"                 →  report_agent
+"quick review <url>"                       →  review_repo_tool (one call, done)
+"what is this repo?"                       →  scout_agent
+"security review <url>"                    →  analysis_coordinator → security_agent
+"quality review <url>"                     →  analysis_coordinator → quality_agent
+"full deep review <url>"                   →  analysis_coordinator → security_agent
+                                                                   → validator_agent
+                                                                   → quality_agent
+"review this PR: github.com/.../pull/42"   →  pr_agent
+"explain issue #3"                         →  report_agent
+"save the report"                          →  report_agent
 ```
 
-The `analysis_coordinator` uses ADK's `transfer_to_agent` to delegate down to Layer 2, waits for each specialist to return, then aggregates and presents combined findings. All transfers are visible in the ADK Dev UI Traces panel in real time.
+The `analysis_coordinator` uses ADK's `transfer_to_agent` to delegate down to Layer 2, waits for each specialist to return, then aggregates and presents combined findings. The `validator_agent` acts as a peer reviewer — after `security_agent` produces findings, the coordinator can optionally route to `validator_agent` to cross-check them against the actual source code before presenting results. All transfers are visible in the ADK Dev UI Traces panel in real time.
 
 ---
 
@@ -261,6 +288,7 @@ security review https://github.com/Bardiyashavandi/code_review_agent
 quality review https://github.com/Bardiyashavandi/code_review_agent
 full deep review https://github.com/Bardiyashavandi/code_review_agent
 quick review https://github.com/Bardiyashavandi/code_review_agent
+review this PR: https://github.com/owner/repo/pull/42
 ```
 
 ---
@@ -428,6 +456,9 @@ python3 view_trace.py --run a3f1   # specific run by id prefix
 
 **What you get:**
 
+Two tabs:
+
+**▶ Review tab**
 - Repo URL input with client-side validation
 - Branch and max-files controls
 - Color-coded severity badges: `CRITICAL` `HIGH` `MEDIUM` `LOW`
@@ -435,6 +466,11 @@ python3 view_trace.py --run a3f1   # specific run by id prefix
 - Semgrep findings with actual code snippets (`st.code`)
 - Metrics row: files fetched, issues found, duration, model used
 - Specific readable error messages for every failure mode — never a raw traceback
+
+**📊 History tab**
+- Summary metrics: total runs, success rate, average issues, average duration
+- Bar charts: issues-per-run and duration-per-run (reads from `/traces` on the server)
+- Expandable run cards with per-run metrics and stage-error warnings
 
 Point at a remote server: `REVIEW_API_URL=https://your-server.example.com streamlit run streamlit_app.py`
 
@@ -493,8 +529,11 @@ code_review_agent/
 │   └── report_generator.py       # Render PipelineResult → Markdown
 │
 ├── Orchestration
-│   └── agent.py                  # CodeReviewAgent + 3-layer ADK multi-agent graph
+│   └── agent.py                  # CodeReviewAgent + 3-layer 8-agent ADK graph
 │                                 #   (build_multi_agent_system → root_agent)
+│                                 #   agents: root · scout · analysis_coordinator
+│                                 #           pr_agent · report_agent
+│                                 #           security · quality · validator
 │
 ├── Entry points
 │   ├── main.py                   # CLI: python3 main.py <url>
@@ -528,7 +567,7 @@ code_review_agent/
 
 **Spec-driven development.** Every module started as a written spec (interface, behavior, error hierarchy, test table) before any implementation code. The `*_spec.md` files are the visible record of that.
 
-**Genuine multi-agent architecture.** Six agents across three layers — root orchestrator, three domain specialists (scout, coordinator, reporter), and two analysis agents (security, quality). Each has a narrow role, focused instructions, and only the tools it actually needs. Agent-to-agent transfers are explicit and visible in the ADK playground.
+**Genuine multi-agent architecture.** Eight agents across three layers — root orchestrator, four domain specialists (scout, coordinator, PR reviewer, reporter), and three analysis agents (security, quality, validator). Each has a narrow role, focused instructions, and only the tools it actually needs. The `validator_agent` acts as a peer reviewer, cross-checking the `security_agent`'s findings against actual source code to filter false positives before results reach the user. Agent-to-agent transfers are explicit and visible in the ADK playground. A dedicated `pr_agent` reviews only the changed files in a Pull Request — not the whole repo.
 
 **Four access surfaces, one pipeline.** The same `CodeReviewAgent` is reachable via CLI (`main.py`), HTTP API (`server.py`/FastAPI), browser chat (`adk web`/ADK Dev UI), and a visual web UI (`streamlit_app.py`/Streamlit) — without duplicating any logic.
 

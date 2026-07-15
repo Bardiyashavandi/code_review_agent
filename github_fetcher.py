@@ -178,6 +178,107 @@ class GitHubFetcher:
 
         return owner, repo
 
+    def parse_pr_url(self, url: str) -> tuple[str, str, int]:
+        """
+        Parse a GitHub PR URL into (owner, repo, pr_number).
+
+        Accepts:  https://github.com/owner/repo/pull/123
+        Rejects:  anything that isn't that exact shape.
+        """
+        parsed = urlparse(url.strip())
+        if parsed.netloc not in ("github.com", "www.github.com"):
+            raise ValueError(f"Invalid host: {parsed.netloc!r}. Only github.com is supported.")
+        parts = [p for p in parsed.path.strip("/").split("/") if p]
+        if len(parts) != 4 or parts[2] != "pull":
+            raise ValueError(
+                "PR URL must be https://github.com/owner/repo/pull/123 "
+                f"— got path {parsed.path!r}"
+            )
+        owner, repo, _, pr_number_str = parts
+        try:
+            pr_number = int(pr_number_str)
+        except ValueError:
+            raise ValueError(f"PR number must be an integer, got: {pr_number_str!r}")
+        return owner, repo, pr_number
+
+    def fetch_pr_files(
+        self,
+        pr_url: str,
+        max_files: int = DEFAULT_MAX_FILES,
+        max_bytes: int = DEFAULT_MAX_BYTES,
+    ) -> tuple["FetchResult", int]:
+        """
+        Fetch Python files changed in a GitHub Pull Request.
+
+        Only files that were *added* or *modified* (not deleted) are fetched;
+        test files and excluded directories are skipped as usual.
+
+        Returns
+        -------
+        (FetchResult, pr_number)
+            FetchResult contains the changed Python files with full content.
+            pr_number is the integer PR number parsed from the URL.
+        """
+        owner, repo, pr_number = self.parse_pr_url(pr_url)
+
+        # GitHub returns up to 300 files per PR; pagination not needed here.
+        files_url = f"{self._base_url}/repos/{owner}/{repo}/pulls/{pr_number}/files"
+        pr_files_data = self._get(files_url)
+
+        files: list[FileResult] = []
+        truncated = False
+
+        for file_data in pr_files_data:
+            filename = file_data.get("filename", "")
+            status = file_data.get("status", "")
+
+            # Python only, and skip deletions (nothing left to review)
+            if not filename.endswith(".py") or status == "removed":
+                continue
+
+            # Respect same exclusion list as fetch_python_files
+            top_dir = filename.split("/")[0].lower()
+            if top_dir in EXCLUDE_DIRS:
+                logger.debug("Skipping excluded directory in PR: %s", filename)
+                continue
+
+            if len(files) >= max_files:
+                truncated = True
+                logger.warning(
+                    "PR has more than %d changed Python files; "
+                    "only the first %d will be reviewed.",
+                    max_files, max_files,
+                )
+                break
+
+            content_url = f"{self._base_url}/repos/{owner}/{repo}/contents/{filename}"
+            try:
+                content_data = self._get(content_url)
+            except GitHubFetcherError as exc:
+                logger.warning("Could not fetch PR file %s: %s", filename, exc.message)
+                continue
+
+            raw_content = content_data.get("content", "")
+            try:
+                decoded = base64.b64decode(raw_content).decode("utf-8")
+            except Exception:
+                logger.warning("Could not decode content of %s — skipping.", filename)
+                continue
+
+            if len(decoded.encode("utf-8")) > max_bytes:
+                logger.warning("Skipping %s — exceeds byte limit of %d.", filename, max_bytes)
+                continue
+
+            files.append(FileResult(
+                path=filename,
+                content=decoded,
+                sha=content_data.get("sha", ""),
+                size=len(decoded),
+                url=content_url,
+            ))
+
+        return FetchResult(files=files, truncated=truncated), pr_number
+
     def get_repo_metadata(self, url: str) -> dict:
         """
         Fetch basic repo metadata (language, size, stars, last push, default
