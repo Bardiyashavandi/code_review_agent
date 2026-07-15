@@ -6,7 +6,7 @@
 
 [![Python](https://img.shields.io/badge/python-3.11%2B-3776ab?logo=python&logoColor=white)](https://python.org)
 [![Google ADK](https://img.shields.io/badge/Google%20ADK-2.3-4285F4?logo=google&logoColor=white)](https://google.github.io/adk-docs/)
-[![Gemini](https://img.shields.io/badge/Gemini-Flash%20Lite-8E24AA?logo=google&logoColor=white)](https://ai.google.dev)
+[![Gemini](https://img.shields.io/badge/Gemini-2.0%20Flash-8E24AA?logo=google&logoColor=white)](https://ai.google.dev)
 [![FastAPI](https://img.shields.io/badge/FastAPI-0.115-009688?logo=fastapi&logoColor=white)](https://fastapi.tiangolo.com)
 [![Streamlit](https://img.shields.io/badge/Streamlit-1.45-FF4B4B?logo=streamlit&logoColor=white)](https://streamlit.io)
 [![Tests](https://img.shields.io/badge/tests-110%20passing-22c55e?logo=pytest&logoColor=white)](./tests)
@@ -50,7 +50,7 @@ Static analyzers find patterns but can't explain why they matter. LLMs can expla
 
 The pipeline is orchestrated by a **5-layer multi-agent system** built on Google ADK 2.3. Twenty-nine specialized agents handle routing, analysis, reporting, PR review, threat modeling, dependency CVE scanning, cryptography auditing, injection detection, auth auditing, secrets scanning, taint analysis, complexity measurement, test coverage, documentation quality, OWASP/CWE compliance mapping, risk scoring, and automated remediation — each with its own narrowly scoped tool set and instructions, rather than one monolithic agent doing everything.
 
-> **No paid services.** Semgrep `--config auto`, Gemini Flash Lite, and the GitHub API are all free-tier. Hard constraint from day one.
+> **No paid services.** Semgrep `--config auto`, Gemini 2.0 Flash, and the GitHub API are all free-tier. Hard constraint from day one.
 
 ---
 
@@ -288,7 +288,7 @@ Under every agent's tool calls, the same three-stage pipeline runs:
 └────────┬─────────┘
          │  files + findings
          ▼
-┌──────────────────┐      Gemini Flash Lite
+┌──────────────────┐      Gemini 2.0 Flash
 │ gemini_reviewer  │ ──── (google-genai SDK)
 │                  │
 │  · batches code  │
@@ -457,7 +457,7 @@ Opens at `http://localhost:8501`.
   "truncated":     false,
   "review": {
     "summary":        "2 issues found...",
-    "model":          "gemini-3.1-flash-lite",
+    "model":          "gemini-2.0-flash",
     "files_reviewed": 5,
     "duration_s":     1.8,
     "issues": [
@@ -542,7 +542,7 @@ python3 view_trace.py --run a3f1   # specific run by id prefix
   │    scanned=23 · findings=2 · skipped=0
 
   ├─ STAGE  review  ✓  5.87s
-  │    files_reviewed=23 · issues=5 · model=gemini-3.1-flash-lite
+  │    files_reviewed=23 · issues=5 · model=gemini-2.0-flash
   │    └─ LLM  gemini_call  batch=0  ✓  1.92s
   │         prompt_chars=18234 · tokens=1205→312 (1517 total) · retries=0
   │    └─ LLM  gemini_call  batch=1  ✓  1.85s
@@ -630,7 +630,7 @@ code_review_agent/
 ├── Core pipeline
 │   ├── github_fetcher.py         # Stage 1: fetch Python files via GitHub API
 │   ├── semgrep_runner.py         # Stage 2: run Semgrep, parse findings
-│   ├── gemini_reviewer.py        # Stage 3: LLM review via Gemini Flash Lite
+│   ├── gemini_reviewer.py        # Stage 3: LLM review via Gemini 2.0 Flash
 │   └── report_generator.py       # Render PipelineResult → Markdown
 │
 ├── Orchestration
@@ -684,7 +684,7 @@ code_review_agent/
 
 **Full observability.** `tracing.py` emits structured JSON spans (run → stage → LLM call) to `traces/trace.jsonl`. `view_trace.py` renders them as an annotated tree with token counts, retries, and a live Gemini RPD counter.
 
-**Security first, zero cost.** Semgrep `--config auto`, Gemini Flash Lite, and the GitHub API are all free-tier. No paid services, by hard constraint from day one.
+**Security first, zero cost.** Semgrep `--config auto`, Gemini 2.0 Flash, and the GitHub API are all free-tier. No paid services, by hard constraint from day one.
 
 Full writeup: [`KAGGLE_WRITEUP.md`](./KAGGLE_WRITEUP.md)
 
