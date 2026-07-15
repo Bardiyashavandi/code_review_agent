@@ -11,7 +11,7 @@
 [![Streamlit](https://img.shields.io/badge/Streamlit-1.45-FF4B4B?logo=streamlit&logoColor=white)](https://streamlit.io)
 [![Tests](https://img.shields.io/badge/tests-107%20passing-22c55e?logo=pytest&logoColor=white)](./tests)
 [![CI](https://github.com/Bardiyashavandi/code_review_agent/actions/workflows/ci.yml/badge.svg)](https://github.com/Bardiyashavandi/code_review_agent/actions/workflows/ci.yml)
-[![Agents](https://img.shields.io/badge/agents-8-blueviolet)](#multi-agent-architecture)
+[![Agents](https://img.shields.io/badge/agents-9-blueviolet)](#multi-agent-architecture)
 [![Layers](https://img.shields.io/badge/layers-3-orange)](#multi-agent-architecture)
 [![Cost](https://img.shields.io/badge/cost-%240-success)](https://ai.google.dev/pricing)
 
@@ -48,7 +48,7 @@
 
 Static analyzers find patterns but can't explain why they matter. LLMs can explain things but hallucinate when given no real grounding. This agent closes that gap: it fetches your actual repository, runs real Semgrep static analysis on it, and hands both the code and the findings to Gemini — so every issue in the final report is backed by a deterministic rule or a model that's actually reading your code, never a guess.
 
-The pipeline is orchestrated by a **3-layer multi-agent system** built on Google ADK 2.3. Six specialized agents handle routing, analysis, and reporting — each with its own narrowly scoped tool set and instructions, rather than one monolithic agent doing everything.
+The pipeline is orchestrated by a **3-layer multi-agent system** built on Google ADK 2.3. Nine specialized agents handle routing, analysis, reporting, PR review, and threat modeling — each with its own narrowly scoped tool set and instructions, rather than one monolithic agent doing everything.
 
 > **No paid services.** Semgrep `--config auto`, Gemini Flash Lite, and the GitHub API are all free-tier. Hard constraint from day one.
 
@@ -69,6 +69,7 @@ flowchart TD
         Coord["🎯 analysis_coordinator\nroutes to Layer 2 specialists"]
         Report["📄 report_agent\nexplain findings · save file"]
         PR["🔀 pr_agent\nPR diff · review · post inline comments"]
+        TM["🗺️ threat_model_agent\nSTRIDE · attack scenarios · entry points"]
     end
 
     subgraph L2["LAYER 2 — Analysis Specialists"]
@@ -77,7 +78,7 @@ flowchart TD
         Val["✅ validator_agent\ncross-check findings\nflag false positives"]
     end
 
-    Root --> Scout & Coord & Report & PR
+    Root --> Scout & Coord & Report & PR & TM
     Coord --> Sec & Qual & Val
 
     classDef root fill:#1a7340,color:#fff,stroke:#0d5c2e
@@ -94,22 +95,23 @@ LAYER 0 - Orchestrator
 +-----------------------------------------------------------------------+
 |  code_review_agent (root)          tool: review_repo_tool (one-shot)  |
 +-----------------------------------------------------------------------+
-       |                    |                   |                |
-       v                    v                   v                v
+    |           |              |              |               |
+    v           v              v              v               v
 LAYER 1 - Domain Specialists
-+-------------+  +---------------------+  +-------------+  +----------+
-| scout_agent |  | analysis_coordinator|  | report_agent|  | pr_agent |
-|             |  |                     |  |             |  |          |
-| - metadata  |  | routes to Layer 2:  |  | - explain   |  | - PR     |
-| - file list |  |   security_agent    |  |   findings  |  |   diff   |
-| - search    |  |   quality_agent     |  | - save file |  | - review |
-|             |  |   validator_agent   |  |             |  |          |
-+-------------+  +----------+----------+  +-------------+  +----------+
-                            |
-                            | sub_agents (analysis_coordinator only)
-                   +--------+--------+
-                   |        |        |
-                   v        v        v
++----------+ +---------------------+ +----------+ +--------+ +-------------------+
+|scout_agent| |analysis_coordinator | |pr_agent  | |report  | |threat_model_agent |
+|          | |                     | |          | |_agent  | |                   |
+|- metadata| | routes to Layer 2:  | |- PR diff | |- expl. | |- STRIDE threats   |
+|- file    | |   security_agent    | |- review  | |  issue | |- attack scenarios |
+|  list    | |   quality_agent     | |- post    | |- save  | |- entry points     |
+|- search  | |   validator_agent   | |  inline  | |  file  | |- missing defenses |
+|          | |                     | |  comments| |        | |                   |
++----------+ +----------+----------+ +----------+ +--------+ +-------------------+
+                        |
+                        | sub_agents (analysis_coordinator only)
+               +--------+--------+
+               |        |        |
+               v        v        v
 LAYER 2 - Analysis Specialists
 +------------------+  +------------------+  +-----------------+
 | security_agent   |  | quality_agent    |  | validator_agent |
@@ -131,6 +133,7 @@ LAYER 2 - Analysis Specialists
 | `analysis_coordinator` | 1 | Decides security vs quality vs validation. Delegates to Layer 2 and aggregates results. | *(sub-agents only)* |
 | `report_agent` | 1 | Deep-dive explanations of individual findings + saves Markdown reports to disk. | `explain_finding_tool`, `generate_report_file_tool` |
 | `pr_agent` | 1 | Pull Request reviewer — fetches only changed files from a PR URL, runs Semgrep + LLM review, and can post findings as **inline GitHub PR comments** on the exact lines. | `fetch_pr_files_tool`, `scan_code_tool`, `generate_review_tool`, `validate_findings_tool`, `post_pr_review_tool` |
+| `threat_model_agent` | 1 | STRIDE threat modeler — identifies assets, entry points, trust boundaries, and generates concrete attack scenarios with step-by-step attacker actions and missing defenses. | `fetch_repo_files_tool`, `threat_model_tool` |
 | `security_agent` | 2 | Semgrep static analysis + LLM security-focused review. | `fetch_repo_files_tool`, `scan_code_tool`, `generate_review_tool`, `explain_finding_tool` |
 | `quality_agent` | 2 | LLM quality/readability review — no Semgrep, no security angle. | `fetch_repo_files_tool`, `generate_review_tool`, `search_code_in_files_tool` |
 | `validator_agent` | 2 | Cross-checks security findings against source code to flag false positives. | `validate_findings_tool` |
@@ -149,6 +152,8 @@ The root agent reads the user's intent and picks a path:
                                                                    → quality_agent
 "review this PR: github.com/.../pull/42"   →  pr_agent
 "review PR #42 and post to GitHub"         →  pr_agent → post_pr_review_tool
+"threat model this repo"                   →  threat_model_agent
+"how would an attacker exploit this?"      →  threat_model_agent
 "explain issue #3"                         →  report_agent
 "save the report"                          →  report_agent
 ```

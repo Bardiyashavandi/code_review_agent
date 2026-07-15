@@ -251,6 +251,10 @@ class CodeReviewAgent:
         """Cross-check already-produced review issues against source files for false positives."""
         return self._reviewer.validate_findings(issues, files)
 
+    def generate_threat_model(self, files: list[FileResult]) -> dict:
+        """Produce a STRIDE threat model from a list of source files."""
+        return self._reviewer.generate_threat_model(files)
+
     # --- Additional, "interesting" tools -----------------------------------
     # Each of these is a distinct capability beyond the core fetch/scan/review
     # pipeline, intended to give the ADK agent more genuine planning choices.
@@ -771,6 +775,42 @@ def make_validate_findings_tool(agent: CodeReviewAgent) -> Callable[..., dict]:
     return validate_findings_tool
 
 
+def make_threat_model_tool(agent: CodeReviewAgent) -> Callable[..., dict]:
+    """Build a STRIDE threat model tool bound to a CodeReviewAgent instance."""
+
+    def threat_model_tool(files: list[dict]) -> dict:
+        """Generate a full STRIDE threat model from source files.
+
+        files: list of {path, content} dicts — the output of fetch_repo_files_tool.
+
+        Returns a structured threat model with:
+        - assets: what is worth protecting in this system
+        - entry_points: where attackers can send untrusted input
+        - trust_boundaries: what is trusted vs untrusted
+        - stride_threats: Spoofing, Tampering, Repudiation, Information
+          Disclosure, Denial of Service, Elevation of Privilege — each
+          mapped to a specific component and severity
+        - attack_scenarios: top attack paths with step-by-step attacker
+          actions, tools used, impact, and what defenses are missing
+        - missing_defenses: list of controls the codebase lacks
+        - risk_summary: overall risk assessment in 2-3 sentences
+
+        Use fetch_repo_files_tool first, then pass the files here."""
+        if not isinstance(files, list) or not files:
+            raise ValueError("files must be a non-empty list")
+        file_objs = [
+            FileResult(
+                path=f["path"],
+                content=f.get("content", ""),
+                sha="", size=len(f.get("content", "")), url="",
+            )
+            for f in files
+        ]
+        return agent.generate_threat_model(file_objs)
+
+    return threat_model_tool
+
+
 def make_post_pr_review_tool(agent: CodeReviewAgent) -> Callable[..., dict]:
     """Build a tool that posts review findings as inline comments on a GitHub PR."""
 
@@ -1052,6 +1092,40 @@ def build_multi_agent_system(
         ],
     )
 
+    # ── Layer 1d: Threat Model Agent ─────────────────────────────────────────
+    threat_model_agent = Agent(
+        name="threat_model_agent",
+        model=DEFAULT_MODEL,
+        description=(
+            "Threat Modeler: produces a full STRIDE threat model for a repository — "
+            "assets, entry points, trust boundaries, attack scenarios with step-by-step "
+            "attacker actions, and missing defenses. Educational and concrete."
+        ),
+        instruction=(
+            "You are the Threat Modeler. Your job is to help developers understand "
+            "how attackers think about their codebase — not just what is vulnerable, "
+            "but WHY, HOW an attacker would exploit it, and WHAT is missing.\n\n"
+            "WORKFLOW:\n"
+            "1. fetch_repo_files_tool — fetch the source files from the repo URL.\n"
+            "2. threat_model_tool — pass the files to generate a full STRIDE threat "
+            "   model with: assets, entry points, trust boundaries, STRIDE threats "
+            "   (Spoofing/Tampering/Repudiation/Info Disclosure/DoS/Privilege "
+            "   Escalation), top attack scenarios with step-by-step attacker actions "
+            "   and tools used, and missing defenses.\n\n"
+            "PRESENTING RESULTS:\n"
+            "Present the threat model clearly and educationally. For each attack "
+            "scenario explain: what the attacker's goal is, the exact steps they would "
+            "take, what real tools they would use (sqlmap, burp suite, curl, etc.), "
+            "the impact if successful, and what the code is currently missing.\n\n"
+            "Use trigger phrases: 'threat model', 'threat analysis', 'attack surface', "
+            "'how would an attacker', 'security architecture', 'what can go wrong'."
+        ),
+        tools=[
+            _ft(make_fetch_repo_files_tool),
+            _ft(make_threat_model_tool),
+        ],
+    )
+
     # ── Layer 0: Root Orchestrator ───────────────────────────────────────────
     root = Agent(
         name="code_review_agent",
@@ -1062,10 +1136,11 @@ def build_multi_agent_system(
         ),
         instruction=(
             "You are the master orchestrator of a 3-layer multi-agent code review "
-            "system with 8 specialized agents.\n\n"
+            "system with 9 specialized agents.\n\n"
             "ARCHITECTURE:\n"
             "  Layer 0: you (orchestrator)\n"
-            "  Layer 1: scout_agent | analysis_coordinator | report_agent | pr_agent\n"
+            "  Layer 1: scout_agent | analysis_coordinator | report_agent | "
+            "pr_agent | threat_model_agent\n"
             "  Layer 2: security_agent | quality_agent | validator_agent "
             "(inside analysis_coordinator)\n\n"
             "YOUR DIRECT TOOL (fastest path):\n"
@@ -1082,7 +1157,11 @@ def build_multi_agent_system(
             "  Use when the user provides a PR URL "
             "(https://github.com/owner/repo/pull/N) or asks to 'review this PR'.\n"
             "- report_agent: output and explanations. Use for 'explain issue #N', "
-            "  'save the report', 'write it to a file'.\n\n"
+            "  'save the report', 'write it to a file'.\n"
+            "- threat_model_agent: STRIDE threat model — assets, entry points, trust "
+            "  boundaries, attack scenarios, missing defenses. Use for 'threat model', "
+            "  'threat analysis', 'attack surface', 'how would an attacker', "
+            "  'what can go wrong'.\n\n"
             "ROUTING RULES:\n"
             "1. Repo URL + 'quick review' / no specific focus → review_repo_tool.\n"
             "2. 'What is this repo?' / 'scout' / 'list files' → scout_agent.\n"
@@ -1090,13 +1169,16 @@ def build_multi_agent_system(
             "   analysis_coordinator.\n"
             "4. PR URL or 'review this PR' / 'review the diff' → pr_agent.\n"
             "5. 'Explain issue' / 'save report' → report_agent.\n"
-            "6. Off-topic requests → politely decline.\n\n"
+            "6. 'Threat model' / 'attack surface' / 'how would an attacker' → "
+            "   threat_model_agent.\n"
+            "7. Off-topic requests → politely decline.\n\n"
             "Always tell the user which agent you are delegating to and why."
         ),
         tools=[
             FunctionTool(make_review_repo_tool(pipeline)),
         ],
-        sub_agents=[scout_agent, analysis_coordinator, report_agent, pr_agent],
+        sub_agents=[scout_agent, analysis_coordinator, report_agent, pr_agent,
+                    threat_model_agent],
     )
 
     return root
