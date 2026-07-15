@@ -14,7 +14,7 @@
 [![Layers](https://img.shields.io/badge/layers-3-orange)](#multi-agent-architecture)
 [![Cost](https://img.shields.io/badge/cost-%240-success)](https://ai.google.dev/pricing)
 
-*Kaggle 5-Day AI Agents Capstone — track: **Agents for Business***
+**Kaggle 5-Day AI Agents Intensive Capstone — track: Agents for Business**
 
 </div>
 
@@ -535,6 +535,8 @@ code_review_agent/
 **Full observability.** `tracing.py` emits structured JSON spans (run → stage → LLM call) to `traces/trace.jsonl`. `view_trace.py` renders them as an annotated tree with token counts, retries, and a live Gemini RPD counter.
 
 **Security first, zero cost.** Semgrep `--config auto`, Gemini Flash Lite, and the GitHub API are all free-tier. No paid services, by hard constraint from day one.
+
+Full writeup: [`KAGGLE_WRITEUP.md`](./KAGGLE_WRITEUP.md) · Demo video script: [`VIDEO_SCRIPT.md`](./VIDEO_SCRIPT.md)
 
 ---
 
