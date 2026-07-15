@@ -1084,7 +1084,19 @@ gemini_api_key = os.environ.get("GEMINI_API_KEY", "")
 if gemini_api_key and not os.environ.get("GOOGLE_API_KEY"):
     os.environ["GOOGLE_API_KEY"] = gemini_api_key
 
-root_agent = build_multi_agent_system(
-    github_token=github_token,
-    gemini_api_key=gemini_api_key,
-)
+# Guard construction so that importing agent.py in tests (where
+# GITHUB_TOKEN / GEMINI_API_KEY may be dummy CI values that fail
+# genai.Client's key-format check) doesn't kill the whole test collection.
+# adk web only needs root_agent when real credentials are present.
+try:
+    root_agent = build_multi_agent_system(
+        github_token=github_token,
+        gemini_api_key=gemini_api_key,
+    )
+except Exception as _build_exc:  # noqa: BLE001
+    logger.warning(
+        "ADK agent graph could not be built — running without root_agent "
+        "(expected in CI or when credentials are absent): %s",
+        _build_exc,
+    )
+    root_agent = None  # type: ignore[assignment]
