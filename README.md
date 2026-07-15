@@ -86,44 +86,36 @@ flowchart TD
 ```
 
 ```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│  LAYER 0 — Orchestrator                                                     │
-│                                                                             │
-│                    ┌──────────────────────────┐                             │
-│                    │    code_review_agent      │  tool: review_repo_tool    │
-│                    │    (root orchestrator)    │  ← one-shot fast path      │
-│                    └──────────┬───────────────┘                             │
-└───────────────────────────────┼─────────────────────────────────────────────┘
-                                │  sub_agents
-          ┌─────────────────────┼──────────────┬──────────────┐
-          │                     │              │              │
-┌─────────▼─────────────────────▼──────────────▼──────────────▼────────────── ┐
-│  LAYER 1 — Domain Specialists                                               │
-│                                                                             │
-│  ┌─────────────┐  ┌──────────────────────┐  ┌─────────────┐  ┌──────────┐   │
-│  │ scout_agent │  │ analysis_coordinator │  │report_agent │  │ pr_agent │   │
-│  │             │  │                      │  │             │  │          │   │
-│  │ · metadata  │  │ routes to security / │  │ · explain   │  │ · PR     │   │
-│  │ · file list │  │ quality / validator  │  │   findings  │  │   diff   │   │
-│  │ · search    │  │                      │  │ · save file │  │ · review │   │
-│  └─────────────┘  └──────────┬───────────┘  └─────────────┘  └──────────┘   │
-└─────────────────────────────────────────────────────────────────────────────┘
-                               │  sub_agents (analysis_coordinator → Layer 2 only)
-              ┌────────────────┼───────────────┐
-              │                  │                  │
-┌─────────────▼──────────────────▼──────────────────▼──────────────────────┐
-│  LAYER 2 — Analysis Specialists                                           │
-│                                                                           │
-│  ┌──────────────────────┐  ┌──────────────────────┐  ┌─────────────────┐ │
-│  │   security_agent     │  │    quality_agent      │  │ validator_agent │ │
-│  │                      │  │                       │  │                 │ │
-│  │ · fetch files        │  │ · fetch files         │  │ · cross-check   │ │
-│  │ · Semgrep scan       │  │ · LLM quality review  │  │   findings vs   │ │
-│  │ · LLM sec review     │  │ · pattern search      │  │   source code   │ │
-│  │ · explain finding    │  │                       │  │ · flag false    │ │
-│  │                      │  │                       │  │   positives     │ │
-│  └──────────────────────┘  └──────────────────────┘  └─────────────────┘ │
-└───────────────────────────────────────────────────────────────────────────┘
+LAYER 0 - Orchestrator
++-----------------------------------------------------------------------+
+|  code_review_agent (root)          tool: review_repo_tool (one-shot)  |
++-----------------------------------------------------------------------+
+       |                    |                   |                |
+       v                    v                   v                v
+LAYER 1 - Domain Specialists
++-------------+  +---------------------+  +-------------+  +----------+
+| scout_agent |  | analysis_coordinator|  | report_agent|  | pr_agent |
+|             |  |                     |  |             |  |          |
+| - metadata  |  | routes to Layer 2:  |  | - explain   |  | - PR     |
+| - file list |  |   security_agent    |  |   findings  |  |   diff   |
+| - search    |  |   quality_agent     |  | - save file |  | - review |
+|             |  |   validator_agent   |  |             |  |          |
++-------------+  +----------+----------+  +-------------+  +----------+
+                            |
+                            | sub_agents (analysis_coordinator only)
+                   +--------+--------+
+                   |        |        |
+                   v        v        v
+LAYER 2 - Analysis Specialists
++------------------+  +------------------+  +-----------------+
+| security_agent   |  | quality_agent    |  | validator_agent |
+|                  |  |                  |  |                 |
+| - fetch files    |  | - fetch files    |  | - cross-check   |
+| - Semgrep scan   |  | - LLM quality    |  |   findings vs   |
+| - LLM sec review |  |   review         |  |   source code   |
+| - explain finding|  | - pattern search |  | - flag false    |
+|                  |  |                  |  |   positives     |
++------------------+  +------------------+  +-----------------+
 ```
 
 ### Agent roles
