@@ -771,6 +771,36 @@ def make_validate_findings_tool(agent: CodeReviewAgent) -> Callable[..., dict]:
     return validate_findings_tool
 
 
+def make_post_pr_review_tool(agent: CodeReviewAgent) -> Callable[..., dict]:
+    """Build a tool that posts review findings as inline comments on a GitHub PR."""
+
+    def post_pr_review_tool(
+        pr_url: str,
+        issues: list[dict],
+        summary: str = "",
+        event: str = "COMMENT",
+    ) -> dict:
+        """Post review findings as inline comments on a GitHub Pull Request.
+
+        pr_url: the PR URL (https://github.com/owner/repo/pull/123).
+        issues: list of findings from generate_review_tool, each with
+                {path, line, severity, title, description, suggested_fix}.
+        summary: overall review summary posted as the PR review body text.
+        event: "COMMENT" (default, non-blocking) | "REQUEST_CHANGES" | "APPROVE".
+
+        Returns {review_id, html_url, state, comments_posted, fallback}.
+        If inline comments fail because the lines are not in the diff, the tool
+        automatically falls back to posting a single general PR comment instead.
+        Always call this as the last step of a PR review workflow."""
+        if not isinstance(pr_url, str) or not pr_url.strip():
+            raise ValueError("pr_url must be a non-empty string")
+        if not isinstance(issues, list):
+            raise ValueError("issues must be a list of dicts")
+        return agent._fetcher.post_pr_review(pr_url, issues, summary, event)
+
+    return post_pr_review_tool
+
+
 def build_multi_agent_system(
     github_token: str,
     gemini_api_key: str,
@@ -976,7 +1006,11 @@ def build_multi_agent_system(
             "2. scan_code_tool — run Semgrep on those changed files.\n"
             "3. generate_review_tool — LLM review of the changed files + findings.\n"
             "4. (optional) validate_findings_tool — cross-check the findings against "
-            "the actual code if the user wants a false-positive filter pass.\n\n"
+            "the actual code if the user wants a false-positive filter pass.\n"
+            "5. (optional) post_pr_review_tool — post the findings as inline comments "
+            "directly on the GitHub PR. Use when the user says 'post', 'comment', "
+            "'post to GitHub', or 'post the review'. Pass the issues list from "
+            "generate_review_tool and a brief summary.\n\n"
             "Always start your response by stating: which PR you reviewed, how many "
             "Python files changed, and the total issues found. Prioritize findings "
             "by CRITICAL → HIGH → MEDIUM → LOW."
@@ -986,6 +1020,7 @@ def build_multi_agent_system(
             _ft(make_scan_code_tool),
             _ft(make_generate_review_tool),
             _ft(make_validate_findings_tool),
+            _ft(make_post_pr_review_tool),
         ],
     )
 

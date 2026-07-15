@@ -300,6 +300,115 @@ class GitHubFetcher:
             "archived": bool(data.get("archived", False)),
         }
 
+    def post_pr_review(
+        self,
+        pr_url: str,
+        issues: list,
+        summary: str = "",
+        event: str = "COMMENT",
+    ) -> dict:
+        """Post a code review to a GitHub PR as inline comments.
+
+        Tries to post each issue as an inline comment on the specific line.
+        If GitHub rejects (e.g. the line is not in the diff), falls back to
+        a single general PR comment containing all findings.
+
+        event: "COMMENT" | "REQUEST_CHANGES" | "APPROVE"
+        Returns {review_id, html_url, state, comments_posted, fallback?}.
+        """
+        import re as _re
+        m = _re.match(
+            r"https://github\.com/([^/]+)/([^/]+)/pull/(\d+)",
+            pr_url.strip(),
+        )
+        if not m:
+            raise ValueError(f"Invalid PR URL: {pr_url!r}")
+        owner, repo, pr_number = m.group(1), m.group(2), int(m.group(3))
+
+        # Fetch head commit SHA
+        pr_data = self._get(f"{self._base_url}/repos/{owner}/{repo}/pulls/{pr_number}")
+        head_sha = pr_data["head"]["sha"]
+
+        # Build inline comment objects
+        comments = []
+        for issue in issues:
+            path = (issue.get("path") or "").strip()
+            line = int(issue.get("line") or 0)
+            if not path or line < 1:
+                continue
+            body_parts = [
+                f"**{issue.get('severity', 'MEDIUM')}**: {issue.get('title', '')}",
+                "",
+                issue.get("description", ""),
+            ]
+            if issue.get("suggested_fix"):
+                body_parts += ["", f"*Suggested fix:* {issue['suggested_fix']}"]
+            if issue.get("rule_id"):
+                body_parts += [f"*Rule:* `{issue['rule_id']}`"]
+            comments.append({
+                "path": path,
+                "line": line,
+                "side": "RIGHT",
+                "body": "\n".join(body_parts),
+            })
+
+        review_body = summary or "AI Code Review Agent — automated findings below."
+        payload: dict = {
+            "commit_id": head_sha,
+            "body": review_body,
+            "event": event,
+            "comments": comments,
+        }
+
+        resp = self._client.post(
+            f"{self._base_url}/repos/{owner}/{repo}/pulls/{pr_number}/reviews",
+            json=payload,
+        )
+
+        if resp.status_code in (200, 201):
+            data = resp.json()
+            return {
+                "review_id": data.get("id"),
+                "html_url": data.get("html_url"),
+                "state": data.get("state"),
+                "comments_posted": len(comments),
+                "fallback": False,
+            }
+
+        # 422 = one or more lines not in the diff; fall back to a single comment
+        if resp.status_code == 422 or comments:
+            lines = [review_body, "", "---", ""]
+            for iss in issues:
+                lines.append(
+                    f"**{iss.get('severity','MEDIUM')}** "
+                    f"`{iss.get('path','')}:{iss.get('line',0)}` — "
+                    f"{iss.get('title','')}"
+                )
+                lines.append("")
+                lines.append(iss.get("description", ""))
+                if iss.get("suggested_fix"):
+                    lines.append(f"*Suggested fix:* {iss['suggested_fix']}")
+                lines.append("")
+            fallback_body = "\n".join(lines)
+            fb_resp = self._client.post(
+                f"{self._base_url}/repos/{owner}/{repo}/issues/{pr_number}/comments",
+                json={"body": fallback_body},
+            )
+            if fb_resp.status_code in (200, 201):
+                data = fb_resp.json()
+                return {
+                    "review_id": data.get("id"),
+                    "html_url": data.get("html_url"),
+                    "state": "COMMENTED",
+                    "comments_posted": 0,
+                    "fallback": True,
+                    "note": "Inline comments skipped (lines not in diff); posted as general comment.",
+                }
+
+        raise RuntimeError(
+            f"GitHub API error {resp.status_code}: {resp.text[:300]}"
+        )
+
     def fetch_python_files(
         self,
         url: str,
