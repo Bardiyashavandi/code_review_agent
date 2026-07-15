@@ -17,6 +17,10 @@
 
 **Kaggle 5-Day AI Agents Intensive Capstone — track: Agents for Business**
 
+<br>
+
+![Demo](demo.gif)
+
 </div>
 
 ---
