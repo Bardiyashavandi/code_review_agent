@@ -536,7 +536,7 @@ code_review_agent/
 
 **Security first, zero cost.** Semgrep `--config auto`, Gemini Flash Lite, and the GitHub API are all free-tier. No paid services, by hard constraint from day one.
 
-Full writeup: [`KAGGLE_WRITEUP.md`](./KAGGLE_WRITEUP.md) · Demo video script: [`VIDEO_SCRIPT.md`](./VIDEO_SCRIPT.md)
+Full writeup: [`KAGGLE_WRITEUP.md`](./KAGGLE_WRITEUP.md)
 
 ---
 
