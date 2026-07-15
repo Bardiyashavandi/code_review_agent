@@ -695,6 +695,240 @@ def build_adk_agent(
     )
 
 
+def build_multi_agent_system(
+    github_token: str,
+    gemini_api_key: str,
+    semgrep_config: str = DEFAULT_SEMGREP_CONFIG,
+) -> Agent:
+    """Build a 3-layer multi-agent graph for the ADK playground.
+
+    Architecture
+    ------------
+    Layer 0 — root_agent (Orchestrator)
+        Has one direct tool (review_repo_tool) for quick one-shot reviews,
+        plus three Layer-1 sub-agents for deeper, specialized work.
+
+    Layer 1 — three domain specialists:
+        - scout_agent          : lightweight repo inspection (no LLM review)
+        - analysis_coordinator : decides security vs quality vs both, delegates
+        - report_agent         : explanations + saved Markdown files
+
+    Layer 2 — two analysis specialists (children of analysis_coordinator):
+        - security_agent : Semgrep + LLM security review + issue deep-dive
+        - quality_agent  : LLM quality/style review (no Semgrep)
+
+    All six agents share a single CodeReviewAgent instance underneath — each
+    just gets a different subset of the eight available tool functions.
+    """
+
+    # ── One shared pipeline instance for all agents ─────────────────────────
+    pipeline = CodeReviewAgent(
+        github_token=github_token,
+        gemini_api_key=gemini_api_key,
+        semgrep_config=semgrep_config,
+    )
+
+    def _ft(factory) -> FunctionTool:
+        """Create a fresh FunctionTool from a tool factory, bound to `pipeline`."""
+        return FunctionTool(factory(pipeline))
+
+    # ── Layer 2a: Security Analyst ───────────────────────────────────────────
+    security_agent = Agent(
+        name="security_agent",
+        model=DEFAULT_MODEL,
+        description=(
+            "Security Analyst: runs Semgrep static analysis and an LLM "
+            "security-focused review; can explain individual findings in depth."
+        ),
+        instruction=(
+            "You are the Security Analyst. Your job: find and explain security "
+            "vulnerabilities in Python repositories.\n\n"
+            "WORKFLOW:\n"
+            "1. fetch_repo_files_tool — pull Python files from the repo.\n"
+            "2. scan_code_tool — run Semgrep on those files.\n"
+            "3. generate_review_tool — pass files + Semgrep findings to Gemini "
+            "   for a security-focused structured review.\n"
+            "4. explain_finding_tool — if asked to elaborate on a specific issue, "
+            "   use this instead of re-running the full review.\n\n"
+            "Always rank issues CRITICAL → HIGH → MEDIUM → LOW. Include file:line "
+            "and rule_id for every finding. If Semgrep returns nothing, still run "
+            "generate_review_tool — the LLM catches semantic issues Semgrep misses.\n\n"
+            "Stay purely security-focused. When done, transfer back to your parent "
+            "(analysis_coordinator) so it can decide whether quality review is also "
+            "needed."
+        ),
+        tools=[
+            _ft(make_fetch_repo_files_tool),
+            _ft(make_scan_code_tool),
+            _ft(make_generate_review_tool),
+            _ft(make_explain_finding_tool),
+        ],
+    )
+
+    # ── Layer 2b: Quality Reviewer ───────────────────────────────────────────
+    quality_agent = Agent(
+        name="quality_agent",
+        model=DEFAULT_MODEL,
+        description=(
+            "Quality Reviewer: LLM-based code quality, readability, and best-practice "
+            "assessment — no security angle, no Semgrep."
+        ),
+        instruction=(
+            "You are the Quality Reviewer. You assess code quality, readability, and "
+            "Python best practices — NOT security vulnerabilities.\n\n"
+            "WORKFLOW:\n"
+            "1. fetch_repo_files_tool — pull the Python files.\n"
+            "2. (optional) search_code_in_files_tool — quickly spot anti-patterns "
+            "   like bare 'except:', 'global', magic numbers, or deep nesting before "
+            "   the LLM pass, so you can call them out specifically.\n"
+            "3. generate_review_tool — LLM review covering: naming conventions, "
+            "   function complexity, docstring coverage, DRY, error handling, PEP 8.\n\n"
+            "Severity guide: LOW/MEDIUM for style; HIGH only when a quality flaw is "
+            "likely to cause a runtime bug. Do NOT call scan_code_tool.\n\n"
+            "When done, transfer back to your parent (analysis_coordinator)."
+        ),
+        tools=[
+            _ft(make_fetch_repo_files_tool),
+            _ft(make_generate_review_tool),
+            _ft(make_search_code_tool),
+        ],
+    )
+
+    # ── Layer 1a: Analysis Coordinator ──────────────────────────────────────
+    analysis_coordinator = Agent(
+        name="analysis_coordinator",
+        model=DEFAULT_MODEL,
+        description=(
+            "Analysis Coordinator: decides whether to run a security review, a quality "
+            "review, or both, then delegates to the right specialist and aggregates "
+            "the combined results."
+        ),
+        instruction=(
+            "You are the Analysis Coordinator. You manage two specialist agents:\n"
+            "  • security_agent — Semgrep + LLM security review\n"
+            "  • quality_agent  — LLM quality/readability review\n\n"
+            "ROUTING:\n"
+            "- 'Security review' / 'vulnerabilities' / 'CVE' / 'exploit' "
+            "  → transfer to security_agent only.\n"
+            "- 'Quality review' / 'style' / 'readability' / 'best practices' "
+            "  → transfer to quality_agent only.\n"
+            "- 'Full review' / 'both' / 'deep dive' / no clear preference "
+            "  → transfer to security_agent first; after it returns, transfer to "
+            "  quality_agent; then aggregate.\n\n"
+            "AGGREGATION (after specialists return):\n"
+            "Summarize the combined findings for the user:\n"
+            "  1. Security issues (CRITICAL → HIGH → MEDIUM → LOW)\n"
+            "  2. Quality issues (HIGH → MEDIUM → LOW)\n"
+            "State how many total issues each specialist found."
+        ),
+        sub_agents=[security_agent, quality_agent],
+    )
+
+    # ── Layer 1b: Repo Scout ─────────────────────────────────────────────────
+    scout_agent = Agent(
+        name="scout_agent",
+        model=DEFAULT_MODEL,
+        description=(
+            "Repo Scout: lightweight repository inspection — metadata, file listing, "
+            "and pattern search — without running any LLM review."
+        ),
+        instruction=(
+            "You are the Repo Scout. You inspect a GitHub repository at surface level "
+            "so the user can decide whether and how to proceed — without a full review.\n\n"
+            "TOOLS:\n"
+            "- get_repo_metadata_tool: language, stars, size, open issues, default "
+            "  branch. Always start here — it's fast and costs no LLM tokens.\n"
+            "- fetch_repo_files_tool: retrieve actual Python file paths + contents.\n"
+            "- search_code_in_files_tool: grep across fetched files for a regex "
+            "  pattern (e.g. 'eval(', 'TODO', 'password').\n\n"
+            "Suggested flow: metadata first, fetch if the user wants files, then "
+            "search if they ask 'does it use X?'. Keep responses concise. You are "
+            "NOT doing security or quality analysis — transfer back to the "
+            "orchestrator if the user asks for that."
+        ),
+        tools=[
+            _ft(make_get_repo_metadata_tool),
+            _ft(make_fetch_repo_files_tool),
+            _ft(make_search_code_tool),
+        ],
+    )
+
+    # ── Layer 1c: Report Writer ──────────────────────────────────────────────
+    report_agent = Agent(
+        name="report_agent",
+        model=DEFAULT_MODEL,
+        description=(
+            "Report Writer: produces deep-dive explanations of specific findings "
+            "and saves full Markdown review reports to disk."
+        ),
+        instruction=(
+            "You are the Report Writer. You work with already-produced review results. "
+            "You do NOT fetch files, run Semgrep, or generate new reviews.\n\n"
+            "TOOLS:\n"
+            "- explain_finding_tool: given one known finding (path, title, description, "
+            "  severity, optional code snippet), ask Gemini for a focused 3-6 sentence "
+            "  explanation — why it matters in practice, exact fix. Use for "
+            "  'explain issue #N' or 'go deeper on that finding'.\n"
+            "- generate_report_file_tool: render files + issues + summary as a "
+            "  Markdown file and save to disk. Returns the output_path. Use when the "
+            "  user says 'save the report' or 'write it to a file'.\n\n"
+            "If no review has been done yet, tell the user to ask for a security or "
+            "quality review first."
+        ),
+        tools=[
+            _ft(make_explain_finding_tool),
+            _ft(make_generate_report_file_tool),
+        ],
+    )
+
+    # ── Layer 0: Root Orchestrator ───────────────────────────────────────────
+    root = Agent(
+        name="code_review_agent",
+        model=DEFAULT_MODEL,
+        description=(
+            "Master orchestrator of a 3-layer multi-agent code review system. "
+            "Routes user requests to specialist agents or runs a one-shot quick review."
+        ),
+        instruction=(
+            "You are the master orchestrator of a 3-layer multi-agent code review "
+            "system.\n\n"
+            "ARCHITECTURE:\n"
+            "  Layer 0: you (orchestrator)\n"
+            "  Layer 1: scout_agent | analysis_coordinator | report_agent\n"
+            "  Layer 2: security_agent | quality_agent  (inside analysis_coordinator)\n\n"
+            "YOUR DIRECT TOOL (fastest path):\n"
+            "- review_repo_tool: one-shot full review (fetch + Semgrep + LLM in one "
+            "  call). Use when the user just wants a complete review quickly and "
+            "  hasn't asked for a specific focus.\n\n"
+            "SUB-AGENTS (delegate with transfer_to_agent):\n"
+            "- scout_agent: lightweight repo inspection — metadata, file list, regex "
+            "  search. Use for 'what is this repo?', 'how big?', 'does it use X?', "
+            "  'show me the files'.\n"
+            "- analysis_coordinator: deep review — delegates to security_agent and/or "
+            "  quality_agent based on the user's focus. Use for 'security review', "
+            "  'quality review', 'full deep review', 'find vulnerabilities', "
+            "  'check code quality'.\n"
+            "- report_agent: explanations and saved output. Use for 'explain issue #N', "
+            "  'save the report', 'write it to a file'. Requires a review to already "
+            "  exist.\n\n"
+            "ROUTING RULES:\n"
+            "1. 'Review this repo' / 'quick review' → review_repo_tool directly.\n"
+            "2. 'What is this repo?' / 'scout' / 'list files' → scout_agent.\n"
+            "3. 'Security review' / 'quality review' / 'deep dive' / 'both' → "
+            "   analysis_coordinator (it handles the sub-delegation).\n"
+            "4. 'Explain issue' / 'save report' → report_agent.\n"
+            "5. Anything unrelated to code review → politely decline.\n\n"
+            "Always tell the user which agent you are delegating to and why."
+        ),
+        tools=[
+            FunctionTool(make_review_repo_tool(pipeline)),
+        ],
+        sub_agents=[scout_agent, analysis_coordinator, report_agent],
+    )
+
+    return root
+
+
 # --- Expose root_agent for the loader ---------------------------------------
 import os
 from dotenv import load_dotenv
@@ -712,7 +946,7 @@ gemini_api_key = os.environ.get("GEMINI_API_KEY", "")
 if gemini_api_key and not os.environ.get("GOOGLE_API_KEY"):
     os.environ["GOOGLE_API_KEY"] = gemini_api_key
 
-root_agent = build_adk_agent(
+root_agent = build_multi_agent_system(
     github_token=github_token,
     gemini_api_key=gemini_api_key,
 )
