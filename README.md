@@ -27,6 +27,7 @@ Kaggle 5-Day AI Agents Capstone — track: **Agents for Business**
 - [Quick start](#quick-start)
 - [How it works](#how-it-works)
 - [HTTP API](#http-api)
+- [Observability](#observability)
 - [Streamlit UI](#streamlit-ui)
 - [Security, by design](#security-by-design)
 - [Testing](#testing)
@@ -416,6 +417,8 @@ code_review_agent/
 ├── main.py                   # CLI entry point
 ├── server.py                 # FastAPI HTTP wrapper (POST /analyze)
 ├── streamlit_app.py          # Streamlit UI (calls server.py)
+├── tracing.py                # structured span tracing (writes traces/trace.jsonl)
+├── view_trace.py             # CLI trace viewer (tree + flat + RPD counter)
 ├── adk_demo.py               # standalone ADK tool-calling demo
 ├── *_spec.md                 # spec written before each module's code
 ├── tests/                    # 107 tests, one file per module
@@ -431,7 +434,7 @@ The HTTP server (`server.py`) runs locally and is not deployed to any cloud serv
 
 ## What this demonstrates
 
-Every module started as a written spec (interface, behavior, error hierarchy, test table) before any implementation code — the `*_spec.md` files in this repo are the visible record of that. The orchestrator is a genuine Google ADK 2.3 tool, with the agent runtime itself deciding when to invoke the pipeline and which of the eight tools to chain. The same pipeline is reachable four ways: CLI (`main.py`), HTTP API (`server.py`/FastAPI), browser chat (`adk web`/ADK Dev UI), and a visual web UI (`streamlit_app.py`/Streamlit) — all calling the same underlying `CodeReviewAgent` without duplicating any logic. No paid services are used anywhere — Semgrep's `--config auto`, Gemini, and the GitHub API are all free-tier, by hard constraint from day one.
+Every module started as a written spec (interface, behavior, error hierarchy, test table) before any implementation code — the `*_spec.md` files in this repo are the visible record of that. The orchestrator is a genuine Google ADK 2.3 tool, with the agent runtime itself deciding when to invoke the pipeline and which of the eight tools to chain. The same pipeline is reachable four ways: CLI (`main.py`), HTTP API (`server.py`/FastAPI), browser chat (`adk web`/ADK Dev UI), and a visual web UI (`streamlit_app.py`/Streamlit) — all calling the same underlying `CodeReviewAgent` without duplicating any logic. Every run is fully observable: `tracing.py` emits structured JSON spans (run → stage → LLM call) to `traces/trace.jsonl`, and `view_trace.py` renders them as an annotated tree with token counts and a live Gemini RPD counter. No paid services are used anywhere — Semgrep's `--config auto`, Gemini, and the GitHub API are all free-tier, by hard constraint from day one.
 
 Full writeup: [`KAGGLE_WRITEUP.md`](./KAGGLE_WRITEUP.md). Demo video script: [`VIDEO_SCRIPT.md`](./VIDEO_SCRIPT.md).
 
