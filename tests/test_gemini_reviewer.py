@@ -19,7 +19,11 @@ import pytest
 from google.genai import errors as genai_errors
 
 from gemini_reviewer import (
+    DEFAULT_MODEL,
+    FALLBACK_MODEL,
+    MAX_RETRIES,
     SYSTEM_INSTRUCTION,
+    GeminiAPIError,
     GeminiAuthenticationError,
     GeminiRateLimitError,
     GeminiReviewer,
@@ -281,7 +285,146 @@ class TestErrorHandling:
 
 
 # ---------------------------------------------------------------------------
-# 5. Prompt safety
+# 5. Caching, fallback, and model routing
+# ---------------------------------------------------------------------------
+#
+# These exercise _call_model()/_attempt_with_retries() directly rather than
+# going through review()/explain_issue(), since the behavior under test
+# lives entirely in that layer and calling it directly keeps the tests
+# focused and independent of batching/parsing logic covered elsewhere.
+
+class TestCachingFallbackRouting:
+
+    def test_cache_hit_skips_second_network_call(self):
+        reviewer, mock_client = make_reviewer()
+        mock_client.models.generate_content.return_value = response_text(summary="first")
+
+        text1 = reviewer._call_model("same prompt", system_instruction="sys")
+        text2 = reviewer._call_model("same prompt", system_instruction="sys")
+
+        assert mock_client.models.generate_content.call_count == 1
+        assert text1 == text2
+
+    def test_cache_populated_after_fallback_served_response(self):
+        reviewer, mock_client = make_reviewer()
+        rate_limit_error = genai_errors.APIError(code=429, response_json={"message": "quota exceeded"})
+
+        def fake_generate_content(model, contents, config):
+            if model == DEFAULT_MODEL:
+                raise rate_limit_error
+            return response_text(summary="fallback served")
+
+        mock_client.models.generate_content.side_effect = fake_generate_content
+
+        with patch("gemini_reviewer.time.sleep"):
+            text1 = reviewer._call_model("same prompt", system_instruction="sys")
+
+        calls_after_first = mock_client.models.generate_content.call_count
+        assert calls_after_first == (MAX_RETRIES + 1) + 1  # primary exhausted + 1 fallback call
+
+        text2 = reviewer._call_model("same prompt", system_instruction="sys")
+
+        # Second call is a pure cache hit -- neither model is touched again.
+        assert mock_client.models.generate_content.call_count == calls_after_first
+        assert text1 == text2
+
+    def test_fallback_succeeds_after_primary_exhausts_retries(self):
+        reviewer, mock_client = make_reviewer()
+        rate_limit_error = genai_errors.APIError(code=429, response_json={"message": "quota exceeded"})
+
+        def fake_generate_content(model, contents, config):
+            if model == DEFAULT_MODEL:
+                raise rate_limit_error
+            return response_text(summary="fallback ok")
+
+        mock_client.models.generate_content.side_effect = fake_generate_content
+
+        with patch("gemini_reviewer.time.sleep"):
+            text = reviewer._call_model("prompt X", system_instruction="sys")
+
+        assert json.loads(text)["summary"] == "fallback ok"
+
+        calls = mock_client.models.generate_content.call_args_list
+        primary_calls = [c for c in calls if c.kwargs["model"] == DEFAULT_MODEL]
+        fallback_calls = [c for c in calls if c.kwargs["model"] == FALLBACK_MODEL]
+
+        assert len(primary_calls) == MAX_RETRIES + 1  # exhausted all retries
+        assert len(fallback_calls) == 1                # fallback attempted exactly once
+
+    def test_fallback_also_fails_raises_original_exception_type(self):
+        reviewer, mock_client = make_reviewer()
+        rate_limit_error = genai_errors.APIError(code=429, response_json={"message": "quota exceeded"})
+        # Both models fail identically -- side_effect as a bare exception
+        # instance means every call (regardless of model) raises it.
+        mock_client.models.generate_content.side_effect = rate_limit_error
+
+        with patch("gemini_reviewer.time.sleep"):
+            with pytest.raises(GeminiRateLimitError) as exc_info:
+                reviewer._call_model("prompt Y", system_instruction="sys")
+
+        # Original exception TYPE is preserved (not e.g. a generic GeminiAPIError
+        # from the fallback attempt), with a note that fallback was also tried.
+        assert isinstance(exc_info.value, GeminiRateLimitError)
+        assert "also failed" in exc_info.value.message
+        assert FALLBACK_MODEL in exc_info.value.message
+
+        calls = mock_client.models.generate_content.call_args_list
+        primary_calls = [c for c in calls if c.kwargs["model"] == DEFAULT_MODEL]
+        fallback_calls = [c for c in calls if c.kwargs["model"] == FALLBACK_MODEL]
+        assert len(primary_calls) == MAX_RETRIES + 1
+        assert len(fallback_calls) == 1
+
+    def test_auth_error_never_triggers_fallback(self):
+        reviewer, mock_client = make_reviewer()
+        auth_error = genai_errors.APIError(code=401, response_json={"message": "bad key"})
+        mock_client.models.generate_content.side_effect = auth_error
+
+        with pytest.raises(GeminiAuthenticationError):
+            reviewer._call_model("prompt Z", system_instruction="sys")
+
+        calls = mock_client.models.generate_content.call_args_list
+        fallback_calls = [c for c in calls if c.kwargs["model"] == FALLBACK_MODEL]
+
+        assert len(fallback_calls) == 0
+        assert mock_client.models.generate_content.call_count == 1  # no retries, no fallback
+
+    def test_fallback_of_fallback_guard(self):
+        # If _call_model is invoked with model=FALLBACK_MODEL directly (as
+        # explain_issue() does) and IT exhausts retries, there is nowhere
+        # further to fall back to -- it should raise directly.
+        reviewer, mock_client = make_reviewer()
+        rate_limit_error = genai_errors.APIError(code=429, response_json={"message": "quota exceeded"})
+        mock_client.models.generate_content.side_effect = rate_limit_error
+
+        with patch("gemini_reviewer.time.sleep"):
+            with pytest.raises(GeminiRateLimitError) as exc_info:
+                reviewer._call_model("prompt W", system_instruction="sys", model=FALLBACK_MODEL)
+
+        # No further fallback was attempted, so no "also failed" note.
+        assert "also failed" not in exc_info.value.message
+
+        calls = mock_client.models.generate_content.call_args_list
+        assert len(calls) == MAX_RETRIES + 1
+        assert all(c.kwargs["model"] == FALLBACK_MODEL for c in calls)
+
+    def test_explain_issue_routes_to_fallback_model(self):
+        reviewer, mock_client = make_reviewer()
+        mock_client.models.generate_content.return_value = SimpleNamespace(
+            text="This matters because... Fix: do X."
+        )
+
+        result = reviewer.explain_issue(
+            path="a.py", title="SQL injection", description="unsanitized input",
+        )
+
+        assert result == "This matters because... Fix: do X."
+        call = mock_client.models.generate_content.call_args
+        assert call.kwargs["model"] == FALLBACK_MODEL
+        assert call.kwargs["model"] != DEFAULT_MODEL
+
+
+# ---------------------------------------------------------------------------
+# 6. Prompt safety
 # ---------------------------------------------------------------------------
 
 class TestPromptSafety:
