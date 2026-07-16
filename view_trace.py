@@ -181,8 +181,23 @@ def _print_llm(span: dict) -> None:
     batch = f.get("batch_index", "?")
     name  = span.get("name", "gemini_call")
 
+    cache_hit = f.get("cache_hit") is True
+    tag = ""
+    if cache_hit:
+        tag = "  " + _c("[CACHE HIT]", _BOLD + _CYAN)
+    elif f.get("fallback_used"):
+        fb_model = f.get("fallback_model", "?")
+        tag = "  " + _c(f"[FALLBACK → {fb_model}]", _BOLD + _YELLOW)
+
     print(_c(f"  │    └─ LLM  {name}", _TYPE_COLOR["llm_call"])
-          + f"  batch={batch}  {_status_icon(span)}  {dur}")
+          + f"  batch={batch}  {_status_icon(span)}  {dur}" + tag)
+
+    if cache_hit:
+        # Cache hits skip the network call entirely — nothing else to show.
+        print(f"  │         served from in-memory cache, no Gemini call made")
+        if span.get("error"):
+            print(_c(f"  │         error: {span['error']}", _RED))
+        return
 
     parts = []
     if "prompt_chars" in f:
@@ -198,6 +213,20 @@ def _print_llm(span: dict) -> None:
         parts.append(f"retries={f['retry_count']}")
     if parts:
         print(f"  │         {' · '.join(parts)}")
+
+    if f.get("fallback_used"):
+        fb_parts = []
+        if "fallback_retry_count" in f:
+            fb_parts.append(f"fallback_retries={f['fallback_retry_count']}")
+        if f.get("fallback_failed"):
+            fb_parts.append(_c("fallback also failed", _RED))
+        elif "model_used" in f:
+            fb_parts.append(f"served_by={f['model_used']}")
+        if fb_parts:
+            print(f"  │         {' · '.join(fb_parts)}")
+    elif "model_used" in f and f["model_used"] != f.get("model"):
+        print(f"  │         served_by={f['model_used']}")
+
     if span.get("error"):
         print(_c(f"  │         error: {span['error']}", _RED))
 
@@ -239,16 +268,25 @@ def _print_flat(spans: list[dict]) -> None:
 
 def _print_rpd(spans: list[dict]) -> None:
     today = _today_prefix()
-    count = sum(
-        1 for s in spans
+    todays_llm_spans = [
+        s for s in spans
         if s.get("span_type") == "llm_call"
         and (s.get("start_ts") or "").startswith(today)
-    )
+    ]
+    # Cache hits never touch the Gemini API, so they don't count against the
+    # daily request quota — only spans that actually reached generate_content
+    # (cache_hit is False or absent, for spans written before this field
+    # existed) count here.
+    cache_hits = sum(1 for s in todays_llm_spans if s.get("fields", {}).get("cache_hit") is True)
+    count = len(todays_llm_spans) - cache_hits
+
     pct = count / _RPD_CAP * 100
     bar_filled = int(pct / 5)  # 20-char bar
     bar = "█" * bar_filled + "░" * (20 - bar_filled)
     color = _RED if pct >= 90 else _YELLOW if pct >= 70 else _GREEN
     print(_c(f"  Gemini calls today: {count} / {_RPD_CAP}  [{bar}]  {pct:.0f}%", color))
+    if cache_hits:
+        print(_c(f"  ({cache_hits} additional call(s) served from cache, not counted)", _DIM))
     print()
 
 

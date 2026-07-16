@@ -16,6 +16,7 @@ Usage:
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -90,6 +91,16 @@ class ReviewReport:
 # ---------------------------------------------------------------------------
 
 DEFAULT_MODEL = "gemini-3.1-flash-lite"
+
+# Lighter model used two ways: (1) as the fallback when DEFAULT_MODEL's
+# retries are exhausted — it sits in a separate free-tier quota bucket, so
+# it typically still has headroom when the primary is rate-limited; and
+# (2) as the default routing target for simpler, single-item tasks like
+# explain_issue(). These are two independent decisions (see _call_model's
+# fallback block vs. explain_issue's `model=` argument) that happen to
+# reuse the same constant for simplicity.
+FALLBACK_MODEL = "gemini-2.5-flash-lite"
+
 DEFAULT_MAX_FILES_PER_BATCH = 10
 DEFAULT_MAX_CHARS_PER_BATCH = 60_000
 MAX_RETRIES = 3
@@ -925,6 +936,12 @@ class GeminiReviewer:
         self._max_chars_per_batch = max_chars_per_batch
         self._client = genai.Client(api_key=api_key)
 
+        # Process-lifetime, in-memory, exact-match cache. Keyed on a hash of
+        # (system_instruction, prompt) -> the raw response text that content
+        # produced. Deliberately simple: no persistence, no semantic/fuzzy
+        # matching, no eviction policy. Cleared when the process exits.
+        self._cache: dict[str, str] = {}
+
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
@@ -1061,6 +1078,10 @@ class GeminiReviewer:
             system_instruction=EXPLAIN_SYSTEM_INSTRUCTION,
             json_mode=False,
             span_name="gemini_explain",
+            # Routing decision (not fallback): a single-finding plain-text
+            # explanation is simpler than the batch review, so it defaults
+            # to the lighter model rather than self._model.
+            model=FALLBACK_MODEL,
         )
 
     def generate_threat_model(self, files: list) -> dict:
@@ -1442,100 +1463,190 @@ class GeminiReviewer:
         json_mode: bool = True,
         batch_index: int = 0,
         span_name: str = "gemini_call",
+        model: str | None = None,
     ) -> str:
-        """Call Gemini with retry/backoff on rate limiting and transient
-        server overload. Returns raw response text.
+        """Call Gemini with caching, retry/backoff, and single-shot fallback.
+        Returns raw response text.
 
-        Emits one llm_call tracing span per invocation, capturing prompt
-        size, token usage (if the SDK returns usage_metadata), and retry
-        count. The span records status=error on any un-retried exception.
+        Flow:
+          1. Exact-match cache lookup on hash(system_instruction + prompt).
+             On hit, no network call is made at all.
+          2. On miss, call `model` (or self._model if not given) with
+             retry/backoff on 429/500/503, up to MAX_RETRIES.
+          3. If retries are exhausted (GeminiRateLimitError / GeminiAPIError
+             — NOT GeminiAuthenticationError, which never benefits from
+             switching models), make exactly one attempt against
+             FALLBACK_MODEL with no further retries. On success, that
+             response is cached and returned. On failure, the *original*
+             exception is re-raised with a note that fallback also failed.
+
+        Emits one llm_call tracing span per invocation with: cache_hit,
+        model (requested), model_used (whichever model actually produced
+        the response), fallback_used, retry_count, token usage (if the SDK
+        returns usage_metadata). status=error is recorded on any exception
+        that ultimately propagates.
         """
+        effective_model = model or self._model
+        cache_key = hashlib.sha256(
+            f"{system_instruction}\x00{prompt}".encode("utf-8")
+        ).hexdigest()
+
         config_kwargs = {"system_instruction": system_instruction}
         if json_mode:
             config_kwargs["response_mime_type"] = "application/json"
 
         with tracing.span(
             "llm_call", span_name,
-            model=self._model,
+            model=effective_model,
             batch_index=batch_index,
             prompt_chars=len(prompt),
         ) as llm_span:
-            retry_count = 0
+            cached = self._cache.get(cache_key)
+            if cached is not None:
+                llm_span.set(cache_hit=True, retry_count=0, fallback_used=False)
+                return cached
+            llm_span.set(cache_hit=False)
 
-            for attempt in range(MAX_RETRIES + 1):
+            try:
+                text = self._attempt_with_retries(
+                    effective_model, prompt, config_kwargs, llm_span,
+                    max_retries=MAX_RETRIES, retry_field="retry_count",
+                )
+                llm_span.set(model_used=effective_model, fallback_used=False)
+                self._cache[cache_key] = text
+                return text
+
+            except GeminiAuthenticationError:
+                # Bad/expired key — a different model won't fix this.
+                raise
+
+            except (GeminiRateLimitError, GeminiAPIError) as primary_exc:
+                if effective_model == FALLBACK_MODEL:
+                    # Already on the lighter model; nowhere else to fall back to.
+                    raise
+
+                logger.warning(
+                    "Primary model %s exhausted retries; trying fallback %s once.",
+                    effective_model, FALLBACK_MODEL,
+                )
+                llm_span.set(fallback_used=True, fallback_model=FALLBACK_MODEL)
+
                 try:
-                    response = self._client.models.generate_content(
-                        model=self._model,
-                        contents=prompt,
-                        config=genai_types.GenerateContentConfig(**config_kwargs),
+                    text = self._attempt_with_retries(
+                        FALLBACK_MODEL, prompt, config_kwargs, llm_span,
+                        max_retries=0, retry_field="fallback_retry_count",
+                    )
+                    llm_span.set(model_used=FALLBACK_MODEL)
+                    self._cache[cache_key] = text
+                    return text
+
+                except (GeminiRateLimitError, GeminiAPIError, GeminiAuthenticationError):
+                    llm_span.set(fallback_failed=True)
+                    # Re-raise the *original* (primary) exception, with a note
+                    # that the fallback attempt also failed, per spec — the
+                    # caller cares that the whole thing failed, and the
+                    # primary's error is the more informative one.
+                    raise type(primary_exc)(
+                        f"{primary_exc.message} "
+                        f"Fallback to {FALLBACK_MODEL} also failed.",
+                        http_status=primary_exc.http_status,
+                    ) from primary_exc
+
+    def _attempt_with_retries(
+        self,
+        model: str,
+        prompt: str,
+        config_kwargs: dict,
+        llm_span,
+        max_retries: int,
+        retry_field: str,
+    ) -> str:
+        """Call `model` with up to `max_retries` retries on 429/500/503.
+        Raises GeminiAuthenticationError / GeminiRateLimitError / GeminiAPIError.
+        Records token usage and `retry_field` (a span field name, so the
+        primary and fallback attempts don't clobber each other's counts) on
+        `llm_span` as it goes.
+        """
+        retry_count = 0
+
+        for attempt in range(max_retries + 1):
+            try:
+                response = self._client.models.generate_content(
+                    model=model,
+                    contents=prompt,
+                    config=genai_types.GenerateContentConfig(**config_kwargs),
+                )
+
+                # Capture token usage if the SDK exposes it — never crash
+                # if the field is absent or None.
+                usage = getattr(response, "usage_metadata", None)
+                if usage is not None:
+                    llm_span.set(
+                        prompt_tokens=getattr(usage, "prompt_token_count", None),
+                        candidates_tokens=getattr(usage, "candidates_token_count", None),
+                        total_tokens=getattr(usage, "total_token_count", None),
+                        tokens_available=True,
+                    )
+                else:
+                    llm_span.set(tokens_available=False)
+
+                llm_span.set(**{retry_field: retry_count})
+                return response.text
+
+            except genai_errors.APIError as exc:
+                code = getattr(exc, "code", None)
+
+                if code in (401, 403):
+                    llm_span.set(**{retry_field: retry_count})
+                    raise GeminiAuthenticationError(
+                        "Invalid or expired Gemini API key.", http_status=code
                     )
 
-                    # Capture token usage if the SDK exposes it — never crash
-                    # if the field is absent or None.
-                    usage = getattr(response, "usage_metadata", None)
-                    if usage is not None:
-                        llm_span.set(
-                            prompt_tokens=getattr(usage, "prompt_token_count", None),
-                            candidates_tokens=getattr(usage, "candidates_token_count", None),
-                            total_tokens=getattr(usage, "total_token_count", None),
-                            tokens_available=True,
+                if code == 429:
+                    if attempt < max_retries:
+                        sleep_time = 2 ** attempt
+                        logger.warning(
+                            "Gemini rate limited (HTTP %s, model=%s). Sleeping %ss "
+                            "before retry %d/%d.",
+                            code, model, sleep_time, attempt + 1, max_retries,
                         )
-                    else:
-                        llm_span.set(tokens_available=False)
-
-                    llm_span.set(retry_count=retry_count)
-                    return response.text
-
-                except genai_errors.APIError as exc:
-                    code = getattr(exc, "code", None)
-
-                    if code in (401, 403):
-                        llm_span.set(retry_count=retry_count)
-                        raise GeminiAuthenticationError(
-                            "Invalid or expired Gemini API key.", http_status=code
-                        )
-
-                    if code == 429:
-                        if attempt < MAX_RETRIES:
-                            sleep_time = 2 ** attempt
-                            logger.warning(
-                                "Gemini rate limited (HTTP %s). Sleeping %ss before retry %d/%d.",
-                                code, sleep_time, attempt + 1, MAX_RETRIES,
-                            )
-                            time.sleep(sleep_time)
-                            retry_count += 1
-                            continue
-                        llm_span.set(retry_count=retry_count)
-                        raise GeminiRateLimitError(
-                            f"Rate limit retries exhausted after {MAX_RETRIES} attempts.",
-                            http_status=code,
-                        )
-
-                    if code in (500, 503):
-                        if attempt < MAX_RETRIES:
-                            sleep_time = 2 ** attempt
-                            logger.warning(
-                                "Gemini server error (HTTP %s). Sleeping %ss before retry %d/%d.",
-                                code, sleep_time, attempt + 1, MAX_RETRIES,
-                            )
-                            time.sleep(sleep_time)
-                            retry_count += 1
-                            continue
-                        llm_span.set(retry_count=retry_count)
-                        raise GeminiAPIError(
-                            f"Gemini API error {code} persisted after {MAX_RETRIES} retries: "
-                            f"{getattr(exc, 'message', str(exc))}",
-                            http_status=code,
-                        )
-
-                    llm_span.set(retry_count=retry_count)
-                    raise GeminiAPIError(
-                        f"Gemini API error {code}: {getattr(exc, 'message', str(exc))}",
+                        time.sleep(sleep_time)
+                        retry_count += 1
+                        continue
+                    llm_span.set(**{retry_field: retry_count})
+                    raise GeminiRateLimitError(
+                        f"Rate limit retries exhausted after {max_retries} "
+                        f"attempts (model={model}).",
                         http_status=code,
                     )
 
-            llm_span.set(retry_count=retry_count)
-            raise GeminiAPIError("Exceeded maximum retries.")  # should be unreachable
+                if code in (500, 503):
+                    if attempt < max_retries:
+                        sleep_time = 2 ** attempt
+                        logger.warning(
+                            "Gemini server error (HTTP %s, model=%s). Sleeping %ss "
+                            "before retry %d/%d.",
+                            code, model, sleep_time, attempt + 1, max_retries,
+                        )
+                        time.sleep(sleep_time)
+                        retry_count += 1
+                        continue
+                    llm_span.set(**{retry_field: retry_count})
+                    raise GeminiAPIError(
+                        f"Gemini API error {code} persisted after {max_retries} "
+                        f"retries (model={model}): {getattr(exc, 'message', str(exc))}",
+                        http_status=code,
+                    )
+
+                llm_span.set(**{retry_field: retry_count})
+                raise GeminiAPIError(
+                    f"Gemini API error {code} (model={model}): "
+                    f"{getattr(exc, 'message', str(exc))}",
+                    http_status=code,
+                )
+
+        llm_span.set(**{retry_field: retry_count})
+        raise GeminiAPIError("Exceeded maximum retries.")  # should be unreachable
 
     def _parse_response(self, raw_text: str) -> tuple[list[ReviewIssue], str]:
         """Parse a batch's JSON response into ReviewIssue objects + summary text."""

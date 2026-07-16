@@ -83,7 +83,7 @@ Every module started as a written specification (interface, expected behavior, e
 
 ## Tech stack
 
-Python, Google ADK 2.3 (`google-adk`), Gemini 2.0 Flash via `google-genai`, FastAPI + Uvicorn, Streamlit, the GitHub REST API, and Semgrep for static analysis. No paid services are used anywhere in the pipeline — all APIs are free-tier.
+Python, Google ADK 2.3 (`google-adk`), Gemini 3.1 Flash Lite via `google-genai` (with a `gemini-2.5-flash-lite` fallback for rate-limit resilience and lighter-task routing, plus an in-memory exact-match response cache), FastAPI + Uvicorn, Streamlit, the GitHub REST API, and Semgrep for static analysis. No paid services are used anywhere in the pipeline — all APIs are free-tier.
 
 ## Setup
 
