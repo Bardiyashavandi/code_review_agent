@@ -28,6 +28,7 @@ import logging
 import os
 import sys
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -64,6 +65,11 @@ load_dotenv(override=True)
 _GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "")
 _GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 _AGENT_TIMEOUT_S = float(os.environ.get("AGENT_TIMEOUT_S", "180"))
+
+# Free-tier Gemini requests-per-day cap, mirrored from view_trace.py so the
+# /traces endpoint's RPD summary matches the CLI tool's number exactly for
+# the same trace file.
+_RPD_CAP = 500
 
 # ---------------------------------------------------------------------------
 # Pydantic models — request
@@ -196,20 +202,119 @@ async def health() -> dict[str, str]:
     return {"status": "ok"}
 
 
+def _today_prefix() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+
+def _build_llm_spans_by_run(all_spans: list[dict]) -> dict[str, list[dict]]:
+    """
+    Group llm_call spans by run_id.
+
+    llm_call spans are tagged with the run_id of whichever "run" span was
+    active when they were opened (see tracing.py), regardless of how many
+    stage spans sit between them — so grouping by run_id, not parent_id,
+    correctly picks up every LLM call made during a run.
+    """
+    by_run: dict[str, list[dict]] = {}
+    for s in all_spans:
+        if s.get("span_type") == "llm_call" and s.get("run_id"):
+            by_run.setdefault(s["run_id"], []).append(s)
+    return by_run
+
+
+def _build_run_entry(run: dict, llm_spans_by_run: dict[str, list[dict]]) -> dict:
+    """
+    Build one /traces run entry: the run span's own fields, plus reliability
+    stats aggregated from that run's llm_call spans (cache hits, fallback
+    usage, token totals). Pure function of (run span, llm-spans-by-run map)
+    so it's unit-testable without touching the filesystem or FastAPI.
+    """
+    fields = run.get("fields", {})
+    run_id = run.get("span_id")
+    run_llm_spans = llm_spans_by_run.get(run_id, [])
+
+    llm_calls = len(run_llm_spans)
+    cache_hits = sum(
+        1 for s in run_llm_spans if s.get("fields", {}).get("cache_hit") is True
+    )
+    fallback_used_count = sum(
+        1 for s in run_llm_spans if s.get("fields", {}).get("fallback_used") is True
+    )
+    total_tokens = sum(
+        s.get("fields", {}).get("total_tokens") or 0
+        for s in run_llm_spans
+        if s.get("fields", {}).get("tokens_available")
+    )
+
+    return {
+        "run_id":              run_id,
+        "start_ts":            run.get("start_ts"),
+        "duration_s":          run.get("duration_s"),
+        "status":              run.get("status"),
+        "repo_url":            fields.get("repo_url"),
+        "files_fetched":       fields.get("files_fetched"),
+        "semgrep_findings":    fields.get("semgrep_findings"),
+        "review_issues":       fields.get("review_issues"),
+        "stage_errors":        fields.get("stage_errors", []),
+        "llm_calls":           llm_calls,
+        "cache_hits":          cache_hits,
+        "fallback_used_count": fallback_used_count,
+        "total_tokens":        total_tokens,
+    }
+
+
+def _compute_rpd_summary(all_spans: list[dict]) -> dict:
+    """
+    Mirrors view_trace.py's _print_rpd(): count today's llm_call spans that
+    actually reached the Gemini API (cache_hit is not True), against the
+    free-tier daily cap. Computed from the FULL span list (not the
+    limit-sliced run list) so the number matches `view_trace.py --list` for
+    the same trace file regardless of the `limit` query param.
+    """
+    today = _today_prefix()
+    todays_llm_spans = [
+        s for s in all_spans
+        if s.get("span_type") == "llm_call"
+        and (s.get("start_ts") or "").startswith(today)
+    ]
+    cache_hits_today = sum(
+        1 for s in todays_llm_spans
+        if s.get("fields", {}).get("cache_hit") is True
+    )
+    calls_today = len(todays_llm_spans) - cache_hits_today
+    pct = (calls_today / _RPD_CAP * 100) if _RPD_CAP else 0.0
+
+    return {
+        "calls_today":      calls_today,
+        "cache_hits_today": cache_hits_today,
+        "cap":              _RPD_CAP,
+        "pct":              round(pct, 1),
+    }
+
+
 @app.get("/traces", tags=["ops"])
 async def list_traces(
     limit: int = Query(default=20, ge=1, le=100, description="Max runs to return"),
 ) -> dict:
     """
-    Return the last N pipeline runs from traces/trace.jsonl.
+    Return the last N pipeline runs from traces/trace.jsonl, each annotated
+    with its LLM-call reliability stats, plus a top-level RPD summary.
 
     Each run entry includes: run_id, start_ts, duration_s, status, repo_url,
-    files_fetched, semgrep_findings, review_issues, and stage_errors.
-    Returns an empty list if no trace file exists yet.
+    files_fetched, semgrep_findings, review_issues, stage_errors, and —
+    aggregated from that run's llm_call spans — llm_calls, cache_hits,
+    fallback_used_count, and total_tokens.
+
+    The top-level "rpd" block mirrors view_trace.py's RPD counter: today's
+    real (non-cached) Gemini call count against the free-tier daily cap,
+    computed across the whole trace file regardless of `limit`.
+
+    Returns an empty list (and a zeroed rpd block) if no trace file exists yet.
     """
     trace_file = Path(os.environ.get("TRACE_FILE", "traces/trace.jsonl"))
+    empty_rpd = {"calls_today": 0, "cache_hits_today": 0, "cap": _RPD_CAP, "pct": 0.0}
     if not trace_file.exists():
-        return {"runs": [], "total": 0}
+        return {"runs": [], "total": 0, "rpd": empty_rpd}
 
     spans: list[dict] = []
     try:
@@ -223,28 +328,18 @@ async def list_traces(
                         pass
     except OSError as exc:
         logger.warning("Could not read trace file: %s", exc)
-        return {"runs": [], "total": 0}
+        return {"runs": [], "total": 0, "rpd": empty_rpd}
+
+    rpd_summary = _compute_rpd_summary(spans)
 
     run_spans = [s for s in spans if s.get("span_type") == "run"]
     total = len(run_spans)
     run_spans = run_spans[-limit:]
 
-    runs = []
-    for run in run_spans:
-        fields = run.get("fields", {})
-        runs.append({
-            "run_id":          run.get("span_id"),
-            "start_ts":        run.get("start_ts"),
-            "duration_s":      run.get("duration_s"),
-            "status":          run.get("status"),
-            "repo_url":        fields.get("repo_url"),
-            "files_fetched":   fields.get("files_fetched"),
-            "semgrep_findings": fields.get("semgrep_findings"),
-            "review_issues":   fields.get("review_issues"),
-            "stage_errors":    fields.get("stage_errors", []),
-        })
+    llm_spans_by_run = _build_llm_spans_by_run(spans)
+    runs = [_build_run_entry(run, llm_spans_by_run) for run in run_spans]
 
-    return {"runs": runs, "total": total}
+    return {"runs": runs, "total": total, "rpd": rpd_summary}
 
 
 @app.post("/analyze", response_model=AnalyzeResponse, tags=["review"])

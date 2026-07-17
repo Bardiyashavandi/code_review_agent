@@ -577,8 +577,9 @@ Two tabs:
 
 **📊 History tab**
 - Summary metrics: total runs, success rate, average issues, average duration
+- Reliability metrics: cache hit rate %, fallback rate %, and a live Gemini quota bar (today's real, non-cached calls vs. the 500/day free-tier cap) — the same numbers `view_trace.py --list` prints to the terminal, now visible without opening one
 - Bar charts: issues-per-run and duration-per-run (reads from `/traces` on the server)
-- Expandable run cards with per-run metrics and stage-error warnings
+- Expandable run cards with per-run metrics, stage-error warnings, and a reliability line (e.g. "3 LLM calls · 1 cache hit · 1 fallback · 1,240 tokens")
 
 Point at a remote server: `REVIEW_API_URL=https://your-server.example.com streamlit run streamlit_app.py`
 

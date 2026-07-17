@@ -53,6 +53,15 @@ _SEVERITY_STYLE: dict[str, tuple[str, str]] = {
 
 _SEVERITY_ORDER = ["CRITICAL", "HIGH", "MEDIUM", "LOW", "INFO"]
 
+# RPD progress bar color thresholds, mirroring view_trace.py's CLI coloring
+# (green under 70%, yellow 70-89%, red 90%+).
+def _rpd_color(pct: float) -> str:
+    if pct >= 90:
+        return "#c62828"
+    if pct >= 70:
+        return "#f9a825"
+    return "#2e7d32"
+
 
 def _badge(severity: str) -> str:
     """Return a small inline HTML badge for a severity level.
@@ -208,6 +217,32 @@ _HTTP_MESSAGES: dict[int, str] = {
 # Page layout
 # ---------------------------------------------------------------------------
 
+def _render_rpd_bar(rpd: dict) -> None:
+    """Render the same 'Gemini calls today / cap' summary view_trace.py --list
+    prints to the terminal, so the reliability story is visible without a
+    terminal mid-demo."""
+    calls = rpd.get("calls_today", 0)
+    cache_hits = rpd.get("cache_hits_today", 0)
+    cap = rpd.get("cap", 500) or 1  # guard div-by-zero if cap is ever 0
+    pct = rpd.get("pct", 0.0)
+    color = _rpd_color(pct)
+
+    # Only fixed-shape, server-computed numeric values are interpolated here
+    # (never repo/agent-generated text) — same scoping rule as the severity
+    # badges above.
+    st.markdown(
+        f'**Gemini calls today:** {calls} / {cap} '
+        f'&nbsp; <span style="color:{color}; font-weight:700;">{pct:.0f}%</span>',
+        unsafe_allow_html=True,
+    )
+    st.progress(min(pct / 100, 1.0))
+    if cache_hits:
+        st.caption(
+            f"{cache_hits} additional call(s) served from the in-memory cache "
+            f"today, not counted against the quota."
+        )
+
+
 def _render_history() -> None:
     """Fetch and render the run history tab from GET /traces."""
     st.subheader("Run History")
@@ -232,6 +267,7 @@ def _render_history() -> None:
     data = resp.json()
     runs = data.get("runs", [])
     total = data.get("total", 0)
+    rpd = data.get("rpd", {})
 
     if not runs:
         st.info("No runs recorded yet. Run a review first.")
@@ -248,6 +284,21 @@ def _render_history() -> None:
     col2.metric("Success rate", f"{ok_runs / len(runs) * 100:.0f}%")
     col3.metric("Avg issues / run", f"{avg_issues:.1f}")
     col4.metric("Avg duration", f"{avg_dur:.1f} s")
+
+    # --- Reliability metrics (cache / fallback / quota) ---
+    total_llm_calls = sum(r.get("llm_calls") or 0 for r in runs)
+    total_cache_hits = sum(r.get("cache_hits") or 0 for r in runs)
+    total_fallbacks = sum(r.get("fallback_used_count") or 0 for r in runs)
+    cache_hit_rate = (total_cache_hits / total_llm_calls * 100) if total_llm_calls else 0.0
+    fallback_rate  = (total_fallbacks / total_llm_calls * 100) if total_llm_calls else 0.0
+
+    col5, col6, col7 = st.columns(3)
+    col5.metric("LLM calls shown", total_llm_calls)
+    col6.metric("Cache hit rate", f"{cache_hit_rate:.0f}%")
+    col7.metric("Fallback rate", f"{fallback_rate:.0f}%")
+
+    st.markdown("**Gemini quota**")
+    _render_rpd_bar(rpd)
 
     st.divider()
 
@@ -302,6 +353,20 @@ def _render_history() -> None:
             c3.metric("Review issues", issues)
             c4.metric("Duration", f"{dur:.1f} s")
             st.markdown(f"**Repo:** [{repo}]({repo})")
+
+            llm_calls = run.get("llm_calls") or 0
+            cache_hits = run.get("cache_hits") or 0
+            fallback_used = run.get("fallback_used_count") or 0
+            tokens = run.get("total_tokens") or 0
+
+            call_word     = "call" if llm_calls == 1 else "calls"
+            hit_word      = "hit" if cache_hits == 1 else "hits"
+            fallback_word = "fallback" if fallback_used == 1 else "fallbacks"
+            reliability_line = f"{llm_calls} LLM {call_word} · {cache_hits} cache {hit_word} · {fallback_used} {fallback_word}"
+            if tokens:
+                reliability_line += f" · {tokens:,} tokens"
+            st.caption(reliability_line)
+
             if errors:
                 st.warning(f"Stage errors: {', '.join(errors)}")
 
