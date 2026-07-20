@@ -9,7 +9,8 @@
 [![Gemini](https://img.shields.io/badge/Gemini-3.1%20Flash%20Lite-8E24AA?logo=google&logoColor=white)](https://ai.google.dev)
 [![FastAPI](https://img.shields.io/badge/FastAPI-0.115-009688?logo=fastapi&logoColor=white)](https://fastapi.tiangolo.com)
 [![Streamlit](https://img.shields.io/badge/Streamlit-1.45-FF4B4B?logo=streamlit&logoColor=white)](https://streamlit.io)
-[![Tests](https://img.shields.io/badge/tests-110%20passing-22c55e?logo=pytest&logoColor=white)](./tests)
+[![Tests](https://img.shields.io/badge/tests-124%20passing-22c55e?logo=pytest&logoColor=white)](./tests)
+[![Evals](https://img.shields.io/badge/evals-20%20scenarios-8E24AA?logo=checkmarx&logoColor=white)](./evals)
 [![CI](https://github.com/Bardiyashavandi/code_review_agent/actions/workflows/ci.yml/badge.svg)](https://github.com/Bardiyashavandi/code_review_agent/actions/workflows/ci.yml)
 [![Agents](https://img.shields.io/badge/agents-29-blueviolet)](#multi-agent-architecture)
 [![Layers](https://img.shields.io/badge/layers-5-orange)](#multi-agent-architecture)
@@ -37,6 +38,7 @@
 - [Streamlit UI](#streamlit-ui)
 - [Security, by design](#security-by-design)
 - [Testing](#testing)
+- [Eval suite](#eval-suite)
 - [Real-world verification](#real-world-verification)
 - [Project structure](#project-structure)
 - [Known limitations](#known-limitations)
@@ -606,7 +608,28 @@ Every layer of the stack has explicit security decisions:
 pytest -v
 ```
 
-107 tests across all five modules. Every external dependency — GitHub API, Semgrep subprocess, Gemini SDK — is mocked, so the full suite runs in under a second with no network access or credentials required.
+124 tests across all modules. Every external dependency — GitHub API, Semgrep subprocess, Gemini SDK — is mocked, so the full suite runs in a few seconds with no network access or credentials required. These tests check plumbing: batching, JSON parsing, retries, caching, error handling. They do not check whether the pipeline's judgment is actually good — that's what the eval suite below is for.
+
+---
+
+## Eval suite
+
+```bash
+cd evals
+python3 runner.py --mode live   # needs GEMINI_API_KEY; ~18 real Gemini calls
+```
+
+20 scenario-based cases exercising the full pipeline end to end, not individual functions — do the specialist agents actually catch known-bad patterns, does the validator actually reject fabricated findings against clean code, does deduplication actually merge true duplicates without over-merging distinct ones, does risk scoring actually rank an obvious CRITICAL above an obvious LOW. `deduplicate_findings`, `generate_risk_scores`, `validate_review_findings`, and every specialist audit method are pure LLM judgment calls with no deterministic fallback, so these cases call real `CodeReviewAgent` methods against realistic fixture files rather than mocking Gemini — a mocked response would only re-test JSON parsing, which the 124 unit tests above already cover.
+
+| Category | Cases | Checks |
+|---|---|---|
+| Detection | 9 | SQLi, command injection, hardcoded secrets, weak crypto, IDOR, SSRF, path traversal, multi-hop taint flow, XXE |
+| False positive | 4 | Fabricated findings against genuinely safe code are correctly rejected |
+| Dedup | 3 | True duplicates merge, genuinely distinct findings don't |
+| Risk scoring | 2 | An obvious CRITICAL outranks an obvious LOW in both score and priority |
+| Cost estimate | 2 | `server.py`'s token/RPD math matches `view_trace.py`'s on an identical trace file (no LLM needed — these 2 run in any environment) |
+
+Full rationale, fixture design, and scoring philosophy: [`evals/README.md`](./evals/README.md).
 
 ---
 
@@ -663,8 +686,13 @@ code_review_agent/
 ├── Specs (written before code)
 │   └── *_spec.md                 # Interface, behavior, error hierarchy, test table
 │
-└── Tests
-    └── tests/                    # 110 tests, one file per module, all mocked
+├── Tests
+│   └── tests/                    # 124 tests, one file per module, all mocked
+│
+└── Evals
+    └── evals/                    # 20 scenario cases: detection, false-positive,
+                                   #   dedup, risk scoring, cost estimate — scores
+                                   #   real pipeline judgment, not mocked plumbing
 ```
 
 ---
