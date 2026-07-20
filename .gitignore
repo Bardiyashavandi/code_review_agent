@@ -210,6 +210,11 @@ test_report.md
 # Observability: runtime trace logs (generated data, not source)
 traces/
 
+# Eval suite: JSON result snapshots from `runner.py --json-out` (generated
+# data, not source; committing an eval run's own fixtures/harness is
+# useful, committing every run's numbers is not)
+evals/results/*.json
+
 # Local-only debug scaffolding from ADK Dev UI troubleshooting - not part of the
 # published project, kept locally for reference only
 code_review_agent/
