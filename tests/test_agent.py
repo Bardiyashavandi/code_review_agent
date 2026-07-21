@@ -59,7 +59,7 @@ def make_review_report(issue_count=0) -> SimpleNamespace:
         for i in range(issue_count)
     ]
     return SimpleNamespace(issues=issues, summary="ok", model="gemini-2.5-flash",
-                            files_reviewed=2, duration_s=0.1)
+                            files_reviewed=2, duration_s=0.1, schema_errors=[])
 
 
 def make_agent(fetch_result=None, scan_result=None, review_result=None,
@@ -222,8 +222,8 @@ class TestAdkToolWrapper:
 
         expected_keys = {
             "repo_url", "files_fetched", "truncated", "findings_count",
-            "scan_skipped", "issues", "summary", "model", "stage_errors",
-            "duration_s",
+            "scan_skipped", "issues", "summary", "model", "schema_errors",
+            "stage_errors", "duration_s",
         }
         assert set(output.keys()) == expected_keys
 
@@ -313,7 +313,7 @@ class TestGranularAdkTools:
         )
 
         json.dumps(output)
-        assert set(output.keys()) == {"issues", "summary", "model"}
+        assert set(output.keys()) == {"issues", "summary", "model", "schema_errors"}
         assert len(output["issues"]) == 1
 
     def test_generate_review_tool_works_without_findings(self):

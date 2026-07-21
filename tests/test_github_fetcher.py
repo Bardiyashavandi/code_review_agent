@@ -21,6 +21,7 @@ from github_fetcher import (
     AuthenticationError,
     GitHubAPIError,
     GitHubFetcher,
+    PayloadTooLargeError,
     RateLimitError,
     RepoNotFoundError,
 )
@@ -384,7 +385,75 @@ class TestContentDecoding:
 
 
 # ---------------------------------------------------------------------------
-# 7. Context Manager
+# 7. Aggregate size cap (PayloadTooLargeError)
+# ---------------------------------------------------------------------------
+
+class TestAggregateSizeCap:
+    """
+    Distinct from the per-file DEFAULT_MAX_BYTES cap (TestFiltering,
+    test_fetch_skips_oversized_file): this covers the total-across-all-files
+    cap, which is the one that catches "many files each individually small"
+    rather than "one huge file".
+    """
+
+    def test_fetch_rejects_when_total_size_exceeds_cap(self):
+        # 5 files x 1000 bytes each = 5000 bytes total, well under the
+        # per-file DEFAULT_MAX_BYTES cap individually, but over a small
+        # max_total_bytes passed here.
+        content = "x = 1\n" * 200  # ~1200 bytes
+        many_files = [{"path": f"src/mod_{i}.py", "content": content} for i in range(5)]
+        tree = tree_response(many_files)
+        contents = {f["path"]: content for f in many_files}
+        routes = {"/git/trees/": (200, tree)}
+        for path, body in contents.items():
+            routes[f"/contents/{path}"] = (200, contents_response(path, body))
+        fetcher = make_fetcher()
+        fetcher._client = httpx.Client(
+            transport=mock_transport(routes),
+            headers={"Authorization": "Bearer ghp_faketoken123"},
+        )
+        with pytest.raises(PayloadTooLargeError) as exc_info:
+            fetcher.fetch_python_files("https://github.com/owner/repo", max_total_bytes=2000)
+        assert "2,000" in exc_info.value.message or "2000" in exc_info.value.message
+
+    def test_fetch_allows_when_total_size_under_cap(self):
+        content = "x = 1\n"
+        files = [{"path": f"src/mod_{i}.py", "content": content} for i in range(3)]
+        tree = tree_response(files)
+        contents = {f["path"]: content for f in files}
+        routes = {"/git/trees/": (200, tree)}
+        for path, body in contents.items():
+            routes[f"/contents/{path}"] = (200, contents_response(path, body))
+        fetcher = make_fetcher()
+        fetcher._client = httpx.Client(
+            transport=mock_transport(routes),
+            headers={"Authorization": "Bearer ghp_faketoken123"},
+        )
+        result = fetcher.fetch_python_files("https://github.com/owner/repo", max_total_bytes=2_000_000)
+        assert len(result.files) == 3
+
+    def test_default_cap_does_not_reject_normal_sized_review(self):
+        # Sanity check: DEFAULT_MAX_TOTAL_BYTES (2MB) shouldn't trip on a
+        # perfectly ordinary small review — this test would fail loudly if
+        # the default were accidentally set too low.
+        content = "x = 1\n" * 100
+        files = [{"path": f"src/mod_{i}.py", "content": content} for i in range(10)]
+        tree = tree_response(files)
+        contents = {f["path"]: content for f in files}
+        routes = {"/git/trees/": (200, tree)}
+        for path, body in contents.items():
+            routes[f"/contents/{path}"] = (200, contents_response(path, body))
+        fetcher = make_fetcher()
+        fetcher._client = httpx.Client(
+            transport=mock_transport(routes),
+            headers={"Authorization": "Bearer ghp_faketoken123"},
+        )
+        result = fetcher.fetch_python_files("https://github.com/owner/repo")  # default cap
+        assert len(result.files) == 10
+
+
+# ---------------------------------------------------------------------------
+# 8. Context Manager
 # ---------------------------------------------------------------------------
 
 class TestContextManager:

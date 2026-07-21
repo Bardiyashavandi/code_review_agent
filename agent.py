@@ -425,6 +425,7 @@ def _pipeline_result_to_dict(result: PipelineResult) -> dict:
         ],
         "summary": result.review_report.summary,
         "model": result.review_report.model,
+        "schema_errors": list(result.review_report.schema_errors),
         "stage_errors": [
             {"stage": e.stage, "message": e.message} for e in result.stage_errors
         ],
@@ -557,6 +558,7 @@ def make_generate_review_tool(agent: CodeReviewAgent) -> Callable[..., dict]:
             ],
             "summary": review_report.summary,
             "model": review_report.model,
+            "schema_errors": review_report.schema_errors,
         }
 
     return generate_review_tool

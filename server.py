@@ -50,6 +50,7 @@ from github_fetcher import (
     AuthenticationError,
     GitHubAPIError,
     GitHubFetcherError,
+    PayloadTooLargeError,
     RateLimitError,
     RepoNotFoundError,
 )
@@ -131,6 +132,7 @@ class ReviewOut(BaseModel):
     files_reviewed: int
     duration_s: float
     issues: list[IssueOut]
+    schema_errors: list[str] = []
 
 
 class ScanOut(BaseModel):
@@ -380,6 +382,8 @@ async def analyze(req: AnalyzeRequest) -> AnalyzeResponse:
         raise HTTPException(status_code=401, detail=exc.message)
     except RateLimitError as exc:
         raise HTTPException(status_code=429, detail=exc.message)
+    except PayloadTooLargeError as exc:
+        raise HTTPException(status_code=413, detail=exc.message)
     except GitHubAPIError as exc:
         raise HTTPException(status_code=502, detail=f"GitHub API error: {exc.message}")
     except GitHubFetcherError as exc:
@@ -413,6 +417,7 @@ async def analyze(req: AnalyzeRequest) -> AnalyzeResponse:
                 )
                 for i in result.review_report.issues
             ],
+            schema_errors=result.review_report.schema_errors,
         ),
         scan=ScanOut(
             scanned=result.scan_report.scanned,

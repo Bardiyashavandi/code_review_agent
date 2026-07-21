@@ -53,6 +53,20 @@ class GitHubAPIError(GitHubFetcherError):
     """Raised for unexpected 4xx/5xx responses."""
 
 
+class PayloadTooLargeError(GitHubFetcherError):
+    """
+    Raised when the total content of a fetch (all files combined, after
+    per-file filtering) exceeds max_total_bytes.
+
+    This is a hard rejection of the whole request — distinct from the
+    existing per-file DEFAULT_MAX_BYTES cap, which silently skips
+    individual oversized files and lets the rest of the fetch continue.
+    A repo/PR with many files each just under the per-file cap would sail
+    through that check; this one catches the aggregate case instead of
+    letting it flow into Gemini as an ever-growing batch sequence.
+    """
+
+
 # ---------------------------------------------------------------------------
 # Data models
 # ---------------------------------------------------------------------------
@@ -93,6 +107,17 @@ DEFAULT_BASE_URL = "https://api.github.com"
 DEFAULT_BRANCH = "main"
 DEFAULT_MAX_FILES = 100
 DEFAULT_MAX_BYTES = 500_000
+
+# Aggregate cap across all files returned by a single fetch_python_files() /
+# fetch_pr_files() call, checked after per-file filtering. Distinct from
+# DEFAULT_MAX_BYTES (per-file) and from max_files (file count) — this is the
+# one that actually bounds how much untrusted content a single review can
+# push at Gemini, regardless of how many individually-small files it's
+# split across. 2MB is generously above what DEFAULT_MAX_FILES (100) *
+# DEFAULT_MAX_CHARS_PER_BATCH (60_000 chars, gemini_reviewer.py) implies is
+# a reasonable single-review workload, while still catching pathological
+# inputs (e.g. a PR that touches hundreds of near-max-size files).
+DEFAULT_MAX_TOTAL_BYTES = 2_000_000
 DEFAULT_TIMEOUT = 10
 MAX_RETRIES = 3
 
@@ -206,6 +231,7 @@ class GitHubFetcher:
         pr_url: str,
         max_files: int = DEFAULT_MAX_FILES,
         max_bytes: int = DEFAULT_MAX_BYTES,
+        max_total_bytes: int = DEFAULT_MAX_TOTAL_BYTES,
     ) -> tuple["FetchResult", int]:
         """
         Fetch Python files changed in a GitHub Pull Request.
@@ -283,6 +309,8 @@ class GitHubFetcher:
                 size=len(decoded),
                 url=content_url,
             ))
+
+        self._enforce_total_size_cap(files, max_total_bytes)
 
         return FetchResult(files=files, truncated=truncated), pr_number
 
@@ -422,16 +450,21 @@ class GitHubFetcher:
         branch: str = DEFAULT_BRANCH,
         max_files: int = DEFAULT_MAX_FILES,
         max_bytes: int = DEFAULT_MAX_BYTES,
+        max_total_bytes: int = DEFAULT_MAX_TOTAL_BYTES,
     ) -> FetchResult:
         """
         Main entry point. Returns a FetchResult containing matched FileResult objects.
 
         Parameters
         ----------
-        url       : GitHub repository URL.
-        branch    : Branch or tag ref. Defaults to "main".
-        max_files : Maximum number of .py files to return.
-        max_bytes : Per-file byte size cap; larger files are skipped.
+        url             : GitHub repository URL.
+        branch          : Branch or tag ref. Defaults to "main".
+        max_files       : Maximum number of .py files to return.
+        max_bytes       : Per-file byte size cap; larger files are skipped.
+        max_total_bytes : Aggregate byte cap across every returned file.
+                           Raises PayloadTooLargeError (hard rejection of the
+                           whole fetch) if exceeded — distinct from max_bytes,
+                           which just drops individual oversized files.
         """
         owner, repo = self.parse_repo_url(url)
         tree_nodes = self._fetch_tree(owner, repo, branch)
@@ -454,11 +487,30 @@ class GitHubFetcher:
             if result is not None:
                 files.append(result)
 
+        self._enforce_total_size_cap(files, max_total_bytes)
+
         return FetchResult(files=files, truncated=truncated)
 
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
+
+    def _enforce_total_size_cap(self, files: list[FileResult], max_total_bytes: int) -> None:
+        """
+        Reject the whole fetch (raise PayloadTooLargeError) if the combined
+        content of all files exceeds max_total_bytes. Runs after per-file
+        filtering, so it catches "many files each individually under the
+        per-file cap" the same way it catches "one huge file" — the case
+        the per-file cap alone cannot.
+        """
+        total_bytes = sum(len(f.content.encode("utf-8")) for f in files)
+        if total_bytes > max_total_bytes:
+            raise PayloadTooLargeError(
+                f"Total content size ({total_bytes:,} bytes across {len(files)} files) "
+                f"exceeds the {max_total_bytes:,} byte cap for a single review. "
+                "Reduce max_files or review a smaller scope (e.g. a specific PR "
+                "instead of the whole repo)."
+            )
 
     def _fetch_tree(self, owner: str, repo: str, branch: str) -> list[TreeNode]:
         """Fetch the full recursive file tree for the given branch."""

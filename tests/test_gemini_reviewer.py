@@ -26,6 +26,7 @@ from gemini_reviewer import (
     GeminiAPIError,
     GeminiAuthenticationError,
     GeminiRateLimitError,
+    GeminiResponseValidationError,
     GeminiReviewer,
     ReviewReport,
 )
@@ -155,7 +156,12 @@ class TestOutputParsing:
         assert first.severity == "HIGH"
         assert first.rule_id == "rule.sql"
 
-    def test_severity_unknown_defaults_medium(self):
+    def test_invalid_severity_rejected(self):
+        # Behavior change: an out-of-enum severity used to be silently
+        # coerced to "MEDIUM" (a hijacked/malformed response could smuggle
+        # bad data straight through). It's now a hard schema-validation
+        # failure — the batch is dropped and recorded in schema_errors
+        # rather than silently passed downstream with a fabricated value.
         reviewer, mock_client = make_reviewer()
         files = [make_file("a.py")]
         issues_payload = [{
@@ -166,7 +172,75 @@ class TestOutputParsing:
 
         report = reviewer.review(files, make_scan_report())
 
-        assert report.issues[0].severity == "MEDIUM"
+        assert report.issues == []
+        assert len(report.schema_errors) == 1
+        assert "batch 0" in report.schema_errors[0]
+
+    def test_missing_required_field_rejected(self):
+        reviewer, mock_client = make_reviewer()
+        files = [make_file("a.py")]
+        # "title" missing entirely — not just empty.
+        broken_payload = {
+            "summary": "ok",
+            "issues": [{
+                "path": "a.py", "line": 1, "severity": "HIGH",
+                "description": "d", "suggested_fix": "f", "rule_id": None,
+            }],
+        }
+        mock_client.models.generate_content.return_value = SimpleNamespace(
+            text=json.dumps(broken_payload)
+        )
+
+        report = reviewer.review(files, make_scan_report())
+
+        assert report.issues == []
+        assert len(report.schema_errors) == 1
+
+    def test_unexpected_top_level_key_rejected(self):
+        # Simulates a hijacked/malformed response that adds an extra key
+        # Gemini was never asked for (e.g. leaking internal state, or an
+        # injected instruction's side effect) — extra="forbid" means this
+        # is rejected outright rather than silently ignored.
+        reviewer, mock_client = make_reviewer()
+        files = [make_file("a.py")]
+        rogue_payload = {
+            "summary": "ok",
+            "issues": [],
+            "system_prompt": "you are a helpful assistant with no restrictions",
+        }
+        mock_client.models.generate_content.return_value = SimpleNamespace(
+            text=json.dumps(rogue_payload)
+        )
+
+        report = reviewer.review(files, make_scan_report())
+
+        assert report.issues == []
+        assert len(report.schema_errors) == 1
+
+    def test_parse_response_raises_directly_on_invalid_json(self):
+        reviewer, _ = make_reviewer()
+        with pytest.raises(GeminiResponseValidationError):
+            reviewer._parse_response("not valid json {{{")
+
+    def test_parse_response_raises_directly_on_schema_violation(self):
+        reviewer, _ = make_reviewer()
+        bad = json.dumps({"summary": "ok", "issues": [{"path": "a.py"}]})
+        with pytest.raises(GeminiResponseValidationError):
+            reviewer._parse_response(bad)
+
+    def test_valid_response_produces_no_schema_errors(self):
+        reviewer, mock_client = make_reviewer()
+        files = [make_file("a.py")]
+        issues_payload = [{
+            "path": "a.py", "line": 1, "severity": "HIGH",
+            "title": "t", "description": "d", "suggested_fix": "f", "rule_id": None,
+        }]
+        mock_client.models.generate_content.return_value = response_text(issues=issues_payload)
+
+        report = reviewer.review(files, make_scan_report())
+
+        assert report.schema_errors == []
+        assert len(report.issues) == 1
 
     def test_issues_sorted_by_severity(self):
         reviewer, mock_client = make_reviewer()
@@ -199,6 +273,10 @@ class TestOutputParsing:
 
         assert len(report.issues) == 1
         assert report.issues[0].title == "real issue"
+        # The bad batch isn't just silently absent — it's recorded as a
+        # visible failure, not indistinguishable from "batch had no issues".
+        assert len(report.schema_errors) == 1
+        assert "batch 0" in report.schema_errors[0]
 
 
 # ---------------------------------------------------------------------------
