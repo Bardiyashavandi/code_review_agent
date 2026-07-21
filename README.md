@@ -71,7 +71,7 @@ flowchart TD
         Context["🔭 context_agent\nframework · entry points · attack surface"]
         Scout["🔍 scout_agent\nmetadata · file list · search"]
         PR["🔀 pr_agent\nPR diff · Semgrep · post inline comments"]
-        Report["📄 report_agent\nexplain findings · save Markdown"]
+        Report["📄 report_agent\nexplain findings · save Markdown · open issue (opt-in)"]
         Dedup["🔁 dedup_agent\nmerge cross-agent duplicates"]
         Risk["📊 risk_scorer_agent\nCVSS-like composite scoring"]
         Remed["🔧 remediation_agent\nbefore/after code patches"]
@@ -138,7 +138,7 @@ LAYER 0 ─ Root Orchestrator
   ├─ context_agent      ──── framework/stack/entry-point detection
   ├─ scout_agent        ──── metadata · file list · search (no LLM)
   ├─ pr_agent           ──── PR diff review · post inline GitHub comments
-  ├─ report_agent       ──── explain findings · save Markdown report
+  ├─ report_agent       ──── explain findings · save Markdown report · open GitHub issue (opt-in)
   ├─ dedup_agent        ──── merge cross-agent duplicate findings
   ├─ risk_scorer_agent  ──── CVSS-like Impact×0.4 + Exploit×0.3 + ... scoring
   └─ remediation_agent  ──── before/after code patch generation
