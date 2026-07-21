@@ -11,6 +11,7 @@ Run with:
 from __future__ import annotations
 
 import base64
+import json
 import time
 from unittest.mock import patch
 
@@ -385,7 +386,140 @@ class TestContentDecoding:
 
 
 # ---------------------------------------------------------------------------
-# 7. Aggregate size cap (PayloadTooLargeError)
+# 7. create_review_issue
+# ---------------------------------------------------------------------------
+#
+# No pre-existing tests to model these on -- post_pr_review (the method
+# this feature was explicitly asked to mirror) turns out to have zero test
+# coverage of its own anywhere in tests/, same as fetch_pr_files. These
+# follow this file's general conventions (mock_transport / MockTransport,
+# TestXxx class-per-feature) instead.
+
+class TestCreateReviewIssue:
+
+    def _fetcher_with_issue_response(self, status: int, body: dict) -> GitHubFetcher:
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(status_code=status, json=body)
+        fetcher = make_fetcher()
+        fetcher._client = httpx.Client(
+            transport=httpx.MockTransport(handler),
+            headers={"Authorization": "Bearer ghp_faketoken123"},
+        )
+        return fetcher
+
+    def _fetcher_capturing_request(self, captured: dict) -> GitHubFetcher:
+        def handler(request: httpx.Request) -> httpx.Response:
+            captured["body"] = json.loads(request.content)
+            captured["url"] = str(request.url)
+            return httpx.Response(201, json={"number": 42, "html_url": "https://github.com/owner/repo/issues/42"})
+        fetcher = make_fetcher()
+        fetcher._client = httpx.Client(
+            transport=httpx.MockTransport(handler),
+            headers={"Authorization": "Bearer ghp_faketoken123"},
+        )
+        return fetcher
+
+    def test_returns_none_when_no_issues(self):
+        fetcher = make_fetcher()
+        result = fetcher.create_review_issue("https://github.com/owner/repo", issues=[])
+        assert result is None
+
+    def test_returns_none_when_below_default_threshold(self):
+        # Default min_severity is HIGH -- MEDIUM/LOW-only shouldn't open an issue.
+        fetcher = make_fetcher()
+        issues = [
+            {"path": "a.py", "line": 1, "severity": "MEDIUM", "title": "t", "description": "d"},
+            {"path": "b.py", "line": 2, "severity": "LOW", "title": "t2", "description": "d2"},
+        ]
+        result = fetcher.create_review_issue("https://github.com/owner/repo", issues=issues)
+        assert result is None
+
+    def test_creates_issue_when_high_present(self):
+        fetcher = self._fetcher_with_issue_response(
+            201, {"number": 42, "html_url": "https://github.com/owner/repo/issues/42"}
+        )
+        issues = [{
+            "path": "a.py", "line": 10, "severity": "HIGH", "title": "SQL Injection",
+            "description": "d", "suggested_fix": "use params", "rule_id": "r1",
+        }]
+        result = fetcher.create_review_issue("https://github.com/owner/repo", issues=issues, summary="1 issue found")
+        assert result == {"issue_number": 42, "html_url": "https://github.com/owner/repo/issues/42"}
+
+    def test_creates_issue_when_critical_present_among_lows(self):
+        fetcher = self._fetcher_with_issue_response(
+            201, {"number": 7, "html_url": "https://github.com/owner/repo/issues/7"}
+        )
+        issues = [
+            {"path": "a.py", "line": 1, "severity": "LOW", "title": "l", "description": "d"},
+            {"path": "b.py", "line": 2, "severity": "CRITICAL", "title": "c", "description": "d2"},
+        ]
+        result = fetcher.create_review_issue("https://github.com/owner/repo", issues=issues)
+        assert result["issue_number"] == 7
+
+    def test_custom_min_severity_threshold_allows_medium(self):
+        fetcher = self._fetcher_with_issue_response(201, {"number": 1, "html_url": "url"})
+        issues = [{"path": "a.py", "line": 1, "severity": "MEDIUM", "title": "t", "description": "d"}]
+        result = fetcher.create_review_issue(
+            "https://github.com/owner/repo", issues=issues, min_severity="MEDIUM"
+        )
+        assert result is not None
+
+    def test_posts_to_repo_issues_endpoint(self):
+        captured: dict = {}
+        fetcher = self._fetcher_capturing_request(captured)
+        issues = [{"path": "a.py", "line": 1, "severity": "CRITICAL", "title": "t", "description": "d"}]
+        fetcher.create_review_issue("https://github.com/owner/repo", issues=issues)
+        assert "/repos/owner/repo/issues" in captured["url"]
+
+    def test_title_includes_total_and_severity_counts(self):
+        captured: dict = {}
+        fetcher = self._fetcher_capturing_request(captured)
+        issues = [
+            {"path": "a.py", "line": 1, "severity": "CRITICAL", "title": "t", "description": "d"},
+            {"path": "b.py", "line": 2, "severity": "HIGH", "title": "t2", "description": "d2"},
+        ]
+        fetcher.create_review_issue("https://github.com/owner/repo", issues=issues)
+        title = captured["body"]["title"]
+        assert "2 issue(s)" in title
+        assert "1 CRITICAL" in title
+        assert "1 HIGH" in title
+
+    def test_body_groups_findings_by_severity_critical_first(self):
+        captured: dict = {}
+        fetcher = self._fetcher_capturing_request(captured)
+        issues = [
+            {"path": "a.py", "line": 1, "severity": "HIGH", "title": "h", "description": "d"},
+            {"path": "b.py", "line": 2, "severity": "CRITICAL", "title": "c", "description": "d2"},
+        ]
+        fetcher.create_review_issue("https://github.com/owner/repo", issues=issues, summary="s")
+        body = captured["body"]["body"]
+        assert "s" in body
+        assert body.index("## CRITICAL") < body.index("## HIGH")
+
+    def test_body_escapes_html_in_model_output(self):
+        # Same untrusted-output concern as report_generator.py's _escape():
+        # a finding's title/description come from Gemini and must not be
+        # able to inject raw HTML/markup into the rendered GitHub issue.
+        captured: dict = {}
+        fetcher = self._fetcher_capturing_request(captured)
+        issues = [{
+            "path": "a.py", "line": 1, "severity": "CRITICAL",
+            "title": "<script>alert(1)</script>", "description": "d",
+        }]
+        fetcher.create_review_issue("https://github.com/owner/repo", issues=issues)
+        body = captured["body"]["body"]
+        assert "&lt;script&gt;" in body
+        assert "<script>" not in body
+
+    def test_api_error_raises_runtime_error(self):
+        fetcher = self._fetcher_with_issue_response(403, {"message": "Forbidden"})
+        issues = [{"path": "a.py", "line": 1, "severity": "CRITICAL", "title": "t", "description": "d"}]
+        with pytest.raises(RuntimeError):
+            fetcher.create_review_issue("https://github.com/owner/repo", issues=issues)
+
+
+# ---------------------------------------------------------------------------
+# 8. Aggregate size cap (PayloadTooLargeError)
 # ---------------------------------------------------------------------------
 
 class TestAggregateSizeCap:
@@ -453,7 +587,7 @@ class TestAggregateSizeCap:
 
 
 # ---------------------------------------------------------------------------
-# 8. Context Manager
+# 9. Context Manager
 # ---------------------------------------------------------------------------
 
 class TestContextManager:

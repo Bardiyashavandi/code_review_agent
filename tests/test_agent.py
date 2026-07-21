@@ -22,6 +22,7 @@ import pytest
 from agent import (
     CodeReviewAgent,
     PipelineResult,
+    make_create_issue_tool,
     make_explain_finding_tool,
     make_fetch_repo_files_tool,
     make_generate_report_file_tool,
@@ -494,6 +495,75 @@ class TestSaveReport:
 
         with pytest.raises(ValueError, match="files"):
             tool(repo_url="https://github.com/o/r", files=[], issues=[])
+
+
+# ---------------------------------------------------------------------------
+# 4b. create_issue_tool
+# ---------------------------------------------------------------------------
+#
+# This tool is a thin pass-through to agent._fetcher.create_review_issue()
+# (mirroring how make_post_pr_review_tool wraps agent._fetcher.post_pr_review()
+# with no intermediate CodeReviewAgent method) -- so these tests verify the
+# ADK-tool-shape contract (argument validation, dict-in/dict-out, the None ->
+# {"created": False, "reason": ...} translation) against a mocked fetcher,
+# not the real severity-threshold/formatting logic, which is covered in
+# tests/test_github_fetcher.py's TestCreateReviewIssue.
+
+class TestCreateIssueTool:
+
+    def test_rejects_empty_repo_url(self):
+        agent, *_ = make_agent()
+        tool = make_create_issue_tool(agent)
+
+        with pytest.raises(ValueError, match="repo_url"):
+            tool(repo_url="", issues=[])
+
+    def test_rejects_non_list_issues(self):
+        agent, *_ = make_agent()
+        tool = make_create_issue_tool(agent)
+
+        with pytest.raises(ValueError, match="issues"):
+            tool(repo_url="https://github.com/o/r", issues="not-a-list")
+
+    def test_returns_created_false_when_fetcher_declines(self):
+        agent, mock_fetcher, *_ = make_agent()
+        mock_fetcher.create_review_issue.return_value = None
+        tool = make_create_issue_tool(agent)
+
+        output = tool(
+            repo_url="https://github.com/o/r",
+            issues=[{"path": "a.py", "line": 1, "severity": "LOW", "title": "t", "description": "d"}],
+        )
+
+        json.dumps(output)
+        assert output["created"] is False
+        assert "reason" in output
+
+    def test_returns_created_true_with_issue_details(self):
+        agent, mock_fetcher, *_ = make_agent()
+        mock_fetcher.create_review_issue.return_value = {
+            "issue_number": 42, "html_url": "https://github.com/o/r/issues/42",
+        }
+        tool = make_create_issue_tool(agent)
+
+        output = tool(
+            repo_url="https://github.com/o/r",
+            issues=[{"path": "a.py", "line": 1, "severity": "CRITICAL", "title": "t", "description": "d"}],
+        )
+
+        json.dumps(output)
+        assert output == {"created": True, "issue_number": 42, "html_url": "https://github.com/o/r/issues/42"}
+
+    def test_passes_min_severity_through_to_fetcher(self):
+        agent, mock_fetcher, *_ = make_agent()
+        mock_fetcher.create_review_issue.return_value = None
+        tool = make_create_issue_tool(agent)
+
+        tool(repo_url="https://github.com/o/r", issues=[], summary="s", min_severity="MEDIUM")
+
+        mock_fetcher.create_review_issue.assert_called_once_with(
+            "https://github.com/o/r", [], "s", "MEDIUM"
+        )
 
 
 # ---------------------------------------------------------------------------

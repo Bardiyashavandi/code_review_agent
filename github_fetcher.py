@@ -18,6 +18,7 @@ from __future__ import annotations
 import base64
 import logging
 import time
+from collections import Counter
 from dataclasses import dataclass, field
 from urllib.parse import urlparse
 
@@ -102,6 +103,10 @@ EXCLUDE_DIRS = {
     "test", "tests", ".github", "venv", ".venv",
     "node_modules", "migrations", "__pycache__",
 }
+
+# Same order/name as report_generator.py's SEVERITY_ORDER, for consistency
+# across every place findings get grouped by severity.
+SEVERITY_ORDER = ("CRITICAL", "HIGH", "MEDIUM", "LOW")
 
 DEFAULT_BASE_URL = "https://api.github.com"
 DEFAULT_BRANCH = "main"
@@ -443,6 +448,119 @@ class GitHubFetcher:
         raise RuntimeError(
             f"GitHub API error {resp.status_code}: {resp.text[:300]}"
         )
+
+    def create_review_issue(
+        self,
+        repo_url: str,
+        issues: list,
+        summary: str = "",
+        min_severity: str = "HIGH",
+    ) -> dict | None:
+        """Open a GitHub issue summarizing review findings, if there's
+        something worth flagging.
+
+        Only creates an issue if at least one finding is at or above
+        `min_severity` (default "HIGH") on the CRITICAL > HIGH > MEDIUM > LOW
+        scale. Returns None (no API call made at all) if that bar isn't
+        met — deliberately more conservative than post_pr_review, which
+        always posts regardless of severity. A repo-level issue is more
+        visible and persistent than a PR comment (it shows up in the
+        issue tracker, can trigger notifications/webhooks), so the bar for
+        creating one should be higher than "there's anything at all to say".
+
+        repo_url     : GitHub repository URL (https://github.com/owner/repo).
+        issues       : list of dicts, each {path, line, severity, title,
+                       description, suggested_fix, rule_id}.
+        summary      : overall review summary, included at the top of the
+                       issue body.
+        min_severity : "CRITICAL" | "HIGH" | "MEDIUM" | "LOW" — the minimum
+                       severity that must be present for an issue to open.
+
+        Returns {issue_number, html_url} on success, or None if the
+        threshold wasn't met. Raises RuntimeError on a GitHub API failure
+        (same convention as post_pr_review).
+        """
+        owner, repo = self.parse_repo_url(repo_url)
+
+        rank = {level: i for i, level in enumerate(SEVERITY_ORDER)}
+        threshold = rank.get(min_severity.upper(), rank["HIGH"])
+
+        if not issues:
+            return None
+
+        worth_flagging = any(
+            rank.get(str(i.get("severity", "")).upper(), len(SEVERITY_ORDER)) <= threshold
+            for i in issues
+        )
+        if not worth_flagging:
+            return None
+
+        title = self._build_issue_title(issues)
+        body = self._build_issue_body(issues, summary)
+
+        resp = self._client.post(
+            f"{self._base_url}/repos/{owner}/{repo}/issues",
+            json={"title": title, "body": body},
+        )
+
+        if resp.status_code in (200, 201):
+            data = resp.json()
+            return {
+                "issue_number": data.get("number"),
+                "html_url": data.get("html_url"),
+            }
+
+        raise RuntimeError(
+            f"GitHub API error {resp.status_code}: {resp.text[:300]}"
+        )
+
+    @staticmethod
+    def _build_issue_title(issues: list) -> str:
+        """'AI Code Review: 5 issue(s) found (2 CRITICAL, 1 HIGH, 2 MEDIUM)'"""
+        counts = Counter(str(i.get("severity", "MEDIUM")).upper() for i in issues)
+        parts = [f"{counts[level]} {level}" for level in SEVERITY_ORDER if counts.get(level)]
+        return f"AI Code Review: {len(issues)} issue(s) found ({', '.join(parts)})"
+
+    @staticmethod
+    def _escape_markup(text) -> str:
+        """Escape angle brackets so model output can't inject raw HTML/markup
+        into the rendered GitHub issue body — same untrusted-output concern
+        as report_generator.py's _escape() for the Markdown report."""
+        if text is None:
+            return ""
+        return str(text).replace("<", "&lt;").replace(">", "&gt;")
+
+    def _build_issue_body(self, issues: list, summary: str) -> str:
+        """Build the issue body: summary at the top, then findings grouped
+        by severity (CRITICAL first), mirroring post_pr_review's per-finding
+        formatting (severity + path:line + title, then description and
+        suggested fix)."""
+        esc = self._escape_markup
+        lines = [esc(summary) or "AI Code Review Agent — automated findings below.", ""]
+
+        by_severity: dict[str, list] = {level: [] for level in SEVERITY_ORDER}
+        for issue in issues:
+            by_severity.setdefault(str(issue.get("severity", "MEDIUM")).upper(), []).append(issue)
+
+        ordered_keys = list(SEVERITY_ORDER) + [k for k in by_severity if k not in SEVERITY_ORDER]
+
+        for severity in ordered_keys:
+            group = by_severity.get(severity, [])
+            if not group:
+                continue
+            lines.append(f"## {severity} ({len(group)})")
+            lines.append("")
+            for iss in group:
+                lines.append(f"**`{esc(iss.get('path',''))}:{iss.get('line',0)}`** — {esc(iss.get('title',''))}")
+                lines.append("")
+                lines.append(esc(iss.get("description", "")))
+                if iss.get("suggested_fix"):
+                    lines.append(f"*Suggested fix:* {esc(iss['suggested_fix'])}")
+                if iss.get("rule_id"):
+                    lines.append(f"*Rule:* `{esc(iss['rule_id'])}`")
+                lines.append("")
+
+        return "\n".join(lines)
 
     def fetch_python_files(
         self,

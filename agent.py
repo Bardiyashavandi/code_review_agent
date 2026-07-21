@@ -679,6 +679,58 @@ def make_generate_report_file_tool(agent: CodeReviewAgent) -> Callable[..., dict
     return generate_report_file_tool
 
 
+def make_create_issue_tool(agent: CodeReviewAgent) -> Callable[..., dict]:
+    """Build a tool that opens a GitHub issue summarizing already-produced
+    review findings. Opt-in only — see create_issue_tool's docstring."""
+
+    def create_issue_tool(
+        repo_url: str,
+        issues: list[dict],
+        summary: str = "",
+        min_severity: str = "HIGH",
+    ) -> dict:
+        """Open a GitHub issue on the reviewed repository summarizing the
+        findings, IF there's something worth flagging.
+
+        Opt-in only: call this when the user explicitly asks to file the
+        results as a GitHub issue (e.g. "open an issue for this", "file
+        this on GitHub", "create an issue with these findings"). Do NOT
+        call this automatically at the end of a review — a GitHub issue is
+        more visible and persistent than a PR comment (it shows up in the
+        repo's issue tracker and can trigger notifications/automations),
+        so it should only ever be created on explicit request.
+
+        repo_url: the repository URL (https://github.com/owner/repo) —
+                  NOT a PR URL; use post_pr_review_tool for PR-scoped findings.
+        issues: list of findings from generate_review_tool, each with
+                {path, line, severity, title, description, suggested_fix}.
+        summary: overall review summary, included at the top of the issue body.
+        min_severity: "CRITICAL" | "HIGH" (default) | "MEDIUM" | "LOW" — the
+                minimum severity that must be present among `issues` for an
+                issue to actually be opened. Below that bar, no GitHub call
+                is made at all (nothing worth flagging).
+
+        Returns {"created": false, "reason": ...} if the threshold wasn't
+        met, or {"created": true, "issue_number", "html_url"} on success."""
+        if not isinstance(repo_url, str) or not repo_url.strip():
+            raise ValueError("repo_url must be a non-empty string")
+        if not isinstance(issues, list):
+            raise ValueError("issues must be a list of dicts")
+
+        result = agent._fetcher.create_review_issue(repo_url, issues, summary, min_severity)
+        if result is None:
+            return {
+                "created": False,
+                "reason": (
+                    f"No finding at or above {min_severity} severity — "
+                    "nothing worth flagging as a GitHub issue."
+                ),
+            }
+        return {"created": True, **result}
+
+    return create_issue_tool
+
+
 def build_adk_agent(
     github_token: str,
     gemini_api_key: str,
@@ -1865,17 +1917,28 @@ def build_multi_agent_system(
     report_agent = Agent(
         name="report_agent",
         model=DEFAULT_MODEL,
-        description="Report Writer: deep-dive explanations of findings and saves Markdown reports to disk.",
+        description=(
+            "Report Writer: deep-dive explanations of findings, saves Markdown reports "
+            "to disk, and (on explicit request only) opens a GitHub issue summarizing findings."
+        ),
         instruction=(
             "You are the Report Writer. You work with already-produced findings.\n\n"
             "TOOLS:\n"
             "- explain_finding_tool: focused 3-6 sentence explanation of one issue.\n"
-            "- generate_report_file_tool: render findings as Markdown and save.\n\n"
+            "- generate_report_file_tool: render findings as Markdown and save.\n"
+            "- create_issue_tool: open a GitHub issue summarizing findings. OPT-IN "
+            "ONLY — call this ONLY when the user explicitly asks to file the results "
+            "as a GitHub issue (e.g. 'open an issue for this', 'file this on GitHub'). "
+            "NEVER call it automatically just because a review finished. It also only "
+            "actually opens an issue if at least one finding is HIGH/CRITICAL severity "
+            "(configurable via min_severity) — tell the user if it declined to fire "
+            "for that reason.\n\n"
             "If no review has been done yet, tell the user to run a review first."
         ),
         tools=[
             _ft(make_explain_finding_tool),
             _ft(make_generate_report_file_tool),
+            _ft(make_create_issue_tool),
         ],
     )
 
@@ -1989,7 +2052,7 @@ def build_multi_agent_system(
             "4. 'Security review' / 'quality review' / 'full review' / 'everything'\n"
             "   → planner_agent (it decides which coordinators to invoke)\n"
             "5. PR URL or 'review this PR' → pr_agent\n"
-            "6. 'Explain issue #N' / 'save the report' → report_agent\n"
+            "6. 'Explain issue #N' / 'save the report' / 'open an issue for this' → report_agent\n"
             "7. 'Deduplicate findings' / 'merge results' → dedup_agent\n"
             "8. 'Risk score' / 'prioritize' / 'CVSS' → risk_scorer_agent\n"
             "9. 'Fix this' / 'generate patches' / 'remediation' → remediation_agent\n"
