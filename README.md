@@ -9,7 +9,7 @@
 [![Gemini](https://img.shields.io/badge/Gemini-3.1%20Flash%20Lite-8E24AA?logo=google&logoColor=white)](https://ai.google.dev)
 [![FastAPI](https://img.shields.io/badge/FastAPI-0.115-009688?logo=fastapi&logoColor=white)](https://fastapi.tiangolo.com)
 [![Streamlit](https://img.shields.io/badge/Streamlit-1.45-FF4B4B?logo=streamlit&logoColor=white)](https://streamlit.io)
-[![Tests](https://img.shields.io/badge/tests-147%20passing-22c55e?logo=pytest&logoColor=white)](./tests)
+[![Tests](https://img.shields.io/badge/tests-166%20passing-22c55e?logo=pytest&logoColor=white)](./tests)
 [![Evals](https://img.shields.io/badge/evals-21%20scenarios-8E24AA?logo=checkmarx&logoColor=white)](./evals)
 [![CI](https://github.com/Bardiyashavandi/code_review_agent/actions/workflows/ci.yml/badge.svg)](https://github.com/Bardiyashavandi/code_review_agent/actions/workflows/ci.yml)
 [![Agents](https://img.shields.io/badge/agents-29-blueviolet)](#multi-agent-architecture)
@@ -296,8 +296,9 @@ Under every agent's tool calls, the same three-stage pipeline runs:
 │                  │      + gemini-2.5-flash-lite (fallback / light routing)
 │  · batches code  │
 │    + findings    │
-│  · in-memory     │
-│    exact cache   │
+│  · exact cache,  │
+│    then semantic │
+│    (embeddings)  │
 │  · structured    │
 │    JSON response │
 │  · retry on 429  │
@@ -315,7 +316,7 @@ Under every agent's tool calls, the same three-stage pipeline runs:
 |---|---|---|
 | **Fetch** | `github_fetcher.py` | Walks the repo tree via the GitHub REST API, pulls every `.py` file, strips venv/build noise |
 | **Scan** | `semgrep_runner.py` | Writes files into an isolated sandbox, runs Semgrep, parses findings into typed `Finding` objects |
-| **Review** | `gemini_reviewer.py` | Batches code + findings into prompts, checks an in-memory exact-match cache, calls Gemini (`gemini-3.1-flash-lite`, falling back once to `gemini-2.5-flash-lite` if retries are exhausted) for a structured, severity-ranked `ReviewReport` |
+| **Review** | `gemini_reviewer.py` | Batches code + findings into prompts, checks an in-memory exact-match cache then a semantic (embedding-similarity) cache, calls Gemini (`gemini-3.1-flash-lite`, falling back once to `gemini-2.5-flash-lite` if retries are exhausted) for a structured, severity-ranked `ReviewReport` |
 
 Only a fetch failure is fatal — there's nothing to review without files. Semgrep or Gemini failures are captured as non-fatal `StageError` entries so the pipeline always returns a usable, possibly degraded, result.
 
@@ -583,8 +584,9 @@ Two tabs:
 **📊 History tab**
 - Summary metrics: total runs, success rate, average issues, average duration
 - Reliability metrics: cache hit rate %, fallback rate %, and a live Gemini quota bar (today's real, non-cached calls vs. the 500/day free-tier cap) — the same numbers `view_trace.py --list` prints to the terminal, now visible without opening one
+- Cache savings section: overall hit rate, exact-match hits vs. semantic hits broken out separately, estimated tokens saved, and the embedding-call overhead netted against those hits — so it's clear how much the semantic layer is actually contributing on top of the original exact-match cache, not just a combined number
 - Bar charts: issues-per-run and duration-per-run (reads from `/traces` on the server)
-- Expandable run cards with per-run metrics, stage-error warnings, and a reliability line (e.g. "3 LLM calls · 1 cache hit · 1 fallback · 1,240 tokens")
+- Expandable run cards with per-run metrics, stage-error warnings, and a reliability line (e.g. "3 LLM calls · 1 cache hit (1 exact, 0 semantic) · 1 fallback · 1,240 tokens · 1 embed call")
 
 Point at a remote server: `REVIEW_API_URL=https://your-server.example.com streamlit run streamlit_app.py`
 
@@ -614,7 +616,7 @@ Every layer of the stack has explicit security decisions:
 pytest -v
 ```
 
-147 tests across all modules. Every external dependency — GitHub API, Semgrep subprocess, Gemini SDK — is mocked, so the full suite runs in a few seconds with no network access or credentials required. These tests check plumbing: batching, JSON parsing, retries, caching, error handling, size caps, schema validation. They do not check whether the pipeline's judgment is actually good — that's what the eval suite below is for.
+166 tests across all modules. Every external dependency — GitHub API, Semgrep subprocess, Gemini SDK (including `embed_content`) — is mocked, so the full suite runs in a few seconds with no network access or credentials required. These tests check plumbing: batching, JSON parsing, retries, exact-match and semantic caching (hits, misses, per-system-instruction scoping, threshold behavior, embedding-failure fallback), error handling, size caps, schema validation. They do not check whether the pipeline's judgment is actually good — that's what the eval suite below is for.
 
 ---
 
@@ -625,7 +627,7 @@ cd evals
 python3 runner.py --mode live   # needs GEMINI_API_KEY; ~19 real Gemini calls
 ```
 
-21 scenario-based cases exercising the full pipeline end to end, not individual functions — do the specialist agents actually catch known-bad patterns, does the validator actually reject fabricated findings against clean code, does deduplication actually merge true duplicates without over-merging distinct ones, does risk scoring actually rank an obvious CRITICAL above an obvious LOW, does the main review pipeline resist an actual embedded prompt-injection attack. `deduplicate_findings`, `generate_risk_scores`, `validate_review_findings`, and every specialist audit method are pure LLM judgment calls with no deterministic fallback, so these cases call real `CodeReviewAgent` methods against realistic fixture files rather than mocking Gemini — a mocked response would only re-test JSON parsing, which the 147 unit tests above already cover.
+21 scenario-based cases exercising the full pipeline end to end, not individual functions — do the specialist agents actually catch known-bad patterns, does the validator actually reject fabricated findings against clean code, does deduplication actually merge true duplicates without over-merging distinct ones, does risk scoring actually rank an obvious CRITICAL above an obvious LOW, does the main review pipeline resist an actual embedded prompt-injection attack. `deduplicate_findings`, `generate_risk_scores`, `validate_review_findings`, and every specialist audit method are pure LLM judgment calls with no deterministic fallback, so these cases call real `CodeReviewAgent` methods against realistic fixture files rather than mocking Gemini — a mocked response would only re-test JSON parsing, which the 166 unit tests above already cover.
 
 | Category | Cases | Checks |
 |---|---|---|
@@ -694,7 +696,7 @@ code_review_agent/
 │   └── *_spec.md                 # Interface, behavior, error hierarchy, test table
 │
 ├── Tests
-│   └── tests/                    # 147 tests, one file per module, all mocked
+│   └── tests/                    # 166 tests, one file per module, all mocked
 │
 └── Evals
     └── evals/                    # 21 scenario cases: detection, false-positive,
@@ -709,7 +711,7 @@ code_review_agent/
 
 - `--config auto` requires reaching `semgrep.dev`'s rule registry over the network; air-gapped or egress-restricted environments need a local ruleset.
 - **Handled:** Gemini occasionally returns transient `429`/`500`/`503` errors under high demand. `gemini_reviewer.py`'s `_call_model()` retries with exponential backoff (`MAX_RETRIES=3`), and if retries are still exhausted it falls back once to a second, lighter model (`gemini-2.5-flash-lite`) before giving up — the fallback sits in a separate free-tier quota bucket, so it often still has headroom when the primary model is rate-limited. Only a sustained failure of *both* models surfaces as a non-fatal `StageError`.
-- **Handled:** `gemini_reviewer.py` caches responses in memory for the lifetime of the process, keyed on an exact hash of (system instruction + prompt). Re-running the same batch of files (e.g. testing, or a re-run after a crash mid-pipeline) skips the Gemini call entirely on a cache hit — visible as `cache_hit=True` in `traces/trace.jsonl` and in `view_trace.py`'s tree output. The cache is exact-match only (no semantic matching) and does not persist across process restarts.
+- **Handled:** `gemini_reviewer.py` caches in memory for the lifetime of the process, in two layers. First, an exact-match cache keyed on a hash of (system instruction + prompt) — the fast, free first check. On a miss, a semantic cache checks the new prompt's embedding (`gemini-embedding-001`, via the same `google.genai` client already used for review calls — no new dependency) against previously-cached embeddings for the same `system_instruction`, and serves the cached response if cosine similarity clears a `0.98` threshold. That threshold is deliberately conservative: two versions of a security-relevant file can be 99%+ textually and semantically similar while having opposite implications (e.g. a one-line SQL-injection fix barely moves an embedding), so this only fires on genuinely near-identical content — an unchanged file re-reviewed later, or a diff that only touched a comment or whitespace — not merely "similar-looking" code. Scoping by `system_instruction` also means a crypto-audit prompt can never match against an injection-audit prompt's cached entries. Every real Gemini call also costs one embedding call to populate the semantic cache for next time; that overhead is tracked separately (`embed_calls`) and netted against hits (`net_calls_saved`) rather than hidden, and embedding calls are excluded from the RPD counter below since they sit in a different free-tier quota bucket than generation calls. Both cache layers are visible in `traces/trace.jsonl` (`cache_hit_type: "exact"` or `"semantic"`), `view_trace.py`'s tree output, and the Streamlit History tab's cache savings section. Neither layer persists across process restarts.
 - **Handled:** the single-finding `explain_issue()` call routes to the lighter `gemini-2.5-flash-lite` model by default (a routing decision, independent from the fallback mechanism above) since it's a simpler task than the full batch review — this reduces pressure on the primary model's quota.
 - **Not yet handled:** the 5-layer, 29-agent ADK graph in `agent.py` (`build_multi_agent_system`) has none of the above — no fallback, no caching, no model routing. Each `Agent(model=...)` object calls Gemini directly through ADK's own internal model-call machinery, which this project does not wrap. A rate-limit or outage there still surfaces as a raw `429`/`503` in the ADK Dev UI. Retrofitting the same resilience into the ADK graph would require a different mechanism (an ADK model wrapper or callback), which is a separate future task.
 - Free-tier Gemini keys cap total requests per day. `--max-files` defaults to `10` and batches include a short inter-batch delay specifically to stretch that quota. The RPD counter in `view_trace.py` only counts calls that actually reached the Gemini API — cache hits are excluded.

@@ -125,12 +125,12 @@ def _print_run_tree(run_span: dict, children: list[dict]) -> None:
         llm_by_parent[s.get("parent_id", "")].append(s)
 
     for stage in stage_spans:
-        _print_stage(stage, llm_by_parent.get(stage["span_id"], []))
+        _print_stage(stage, llm_by_parent.get(stage["span_id"], []), llm_by_parent)
 
     print()
 
 
-def _print_stage(span: dict, llm_children: list[dict]) -> None:
+def _print_stage(span: dict, llm_children: list[dict], llm_by_parent: dict[str, list[dict]]) -> None:
     f = span.get("fields", {})
     dur = _fmt_dur(span.get("duration_s", 0))
 
@@ -172,19 +172,26 @@ def _print_stage(span: dict, llm_children: list[dict]) -> None:
         print(_c(f"  │    error: {span['error']}", _RED))
 
     for llm in llm_children:
-        _print_llm(llm)
+        _print_llm(llm, llm_by_parent)
 
 
-def _print_llm(span: dict) -> None:
+def _print_llm(span: dict, llm_by_parent: dict[str, list[dict]] | None = None) -> None:
     f = span.get("fields", {})
     dur = _fmt_dur(span.get("duration_s", 0))
     batch = f.get("batch_index", "?")
     name  = span.get("name", "gemini_call")
 
     cache_hit = f.get("cache_hit") is True
+    cache_hit_type = f.get("cache_hit_type")  # "exact" | "semantic" | None
     tag = ""
-    if cache_hit:
-        tag = "  " + _c("[CACHE HIT]", _BOLD + _CYAN)
+    if cache_hit and cache_hit_type == "semantic":
+        sim = f.get("semantic_similarity")
+        sim_str = f" sim={sim}" if sim is not None else ""
+        tag = "  " + _c(f"[CACHE HIT: semantic{sim_str}]", _BOLD + _CYAN)
+    elif cache_hit:
+        # cache_hit_type absent means either "exact" (current code always
+        # sets it) or trace data written before this field existed.
+        tag = "  " + _c(f"[CACHE HIT: {cache_hit_type or 'exact'}]", _BOLD + _CYAN)
     elif f.get("fallback_used"):
         fb_model = f.get("fallback_model", "?")
         tag = "  " + _c(f"[FALLBACK → {fb_model}]", _BOLD + _YELLOW)
@@ -193,11 +200,19 @@ def _print_llm(span: dict) -> None:
           + f"  batch={batch}  {_status_icon(span)}  {dur}" + tag)
 
     if cache_hit:
-        # Cache hits skip the network call entirely — nothing else to show.
-        print(f"  │         served from in-memory cache, no Gemini call made")
+        # Cache hits skip the network call entirely — nothing else to show,
+        # except (for a semantic hit) the one embedding call it cost to
+        # check, printed below via the llm_by_parent nested-span lookup.
+        source = "the semantic cache" if cache_hit_type == "semantic" else "in-memory cache"
+        print(f"  │         served from {source}, no generate_content call made")
         if span.get("error"):
             print(_c(f"  │         error: {span['error']}", _RED))
+        _print_nested_embeds(span, llm_by_parent)
         return
+
+    if f.get("semantic_best_similarity") is not None:
+        print(f"  │         semantic cache checked, best match "
+              f"sim={f['semantic_best_similarity']} (below threshold, real call made)")
 
     parts = []
     if "prompt_chars" in f:
@@ -229,6 +244,30 @@ def _print_llm(span: dict) -> None:
 
     if span.get("error"):
         print(_c(f"  │         error: {span['error']}", _RED))
+
+    _print_nested_embeds(span, llm_by_parent)
+
+
+def _print_nested_embeds(span: dict, llm_by_parent: dict[str, list[dict]] | None) -> None:
+    """
+    Print any "gemini_embed" spans opened *inside* this llm_call span (see
+    GeminiReviewer._embed — embedding calls are nested under the generation
+    call they're supporting, not siblings under the stage), so their cost
+    is visible in the tree right next to the call they were checking/
+    populating the semantic cache for.
+    """
+    if not llm_by_parent:
+        return
+    for embed_span in llm_by_parent.get(span.get("span_id", ""), []):
+        ef = embed_span.get("fields", {})
+        edur = _fmt_dur(embed_span.get("duration_s", 0))
+        failed = ef.get("embed_failed") is True
+        icon = _c("✗", _RED) if failed else _c("✓", _GREEN)
+        print(f"  │         └─ EMBED  {_c('gemini_embed', _DIM)}  {icon}  {edur}")
+        if failed:
+            print(_c(f"  │              embedding call failed: {ef.get('error_note', '?')}", _RED))
+        else:
+            print(f"  │              vector_dims={ef.get('vector_dims', '?')}")
 
 
 # ---------------------------------------------------------------------------
@@ -268,9 +307,14 @@ def _print_flat(spans: list[dict]) -> None:
 
 def _print_rpd(spans: list[dict]) -> None:
     today = _today_prefix()
+    # "gemini_embed" spans (semantic-cache lookups) sit in a separate
+    # free-tier quota bucket from generation calls -- excluded here and
+    # reported on their own line instead, so this cap reflects only the
+    # generation model's actual daily usage.
     todays_llm_spans = [
         s for s in spans
         if s.get("span_type") == "llm_call"
+        and s.get("name") != "gemini_embed"
         and (s.get("start_ts") or "").startswith(today)
     ]
     # Cache hits never touch the Gemini API, so they don't count against the
@@ -287,6 +331,67 @@ def _print_rpd(spans: list[dict]) -> None:
     print(_c(f"  Gemini calls today: {count} / {_RPD_CAP}  [{bar}]  {pct:.0f}%", color))
     if cache_hits:
         print(_c(f"  ({cache_hits} additional call(s) served from cache, not counted)", _DIM))
+
+    todays_embed_spans = [
+        s for s in spans
+        if s.get("span_type") == "llm_call" and s.get("name") == "gemini_embed"
+        and (s.get("start_ts") or "").startswith(today)
+    ]
+    if todays_embed_spans:
+        print(_c(
+            f"  ({len(todays_embed_spans)} embedding call(s) today for the semantic "
+            "cache — separate quota bucket, not counted above)", _DIM,
+        ))
+    print()
+
+
+# ---------------------------------------------------------------------------
+# Cache savings summary
+# ---------------------------------------------------------------------------
+
+def _print_cache_savings(spans: list[dict]) -> None:
+    """
+    Project-wide (all-time) view of how much the exact-match and semantic
+    caches are each contributing, and the net cost of running the semantic
+    layer. Mirrors server.py's _compute_cache_savings_summary so the CLI and
+    the /traces endpoint / Streamlit History tab always agree on this math.
+    """
+    generation_spans = [
+        s for s in spans
+        if s.get("span_type") == "llm_call" and s.get("name") != "gemini_embed"
+    ]
+    embed_spans = [
+        s for s in spans
+        if s.get("span_type") == "llm_call" and s.get("name") == "gemini_embed"
+    ]
+
+    exact_hits = sum(1 for s in generation_spans if s.get("fields", {}).get("cache_hit_type") == "exact")
+    semantic_hits = sum(1 for s in generation_spans if s.get("fields", {}).get("cache_hit_type") == "semantic")
+    total_hits = exact_hits + semantic_hits
+    real_calls = [s for s in generation_spans if s.get("fields", {}).get("cache_hit") is not True]
+    total_seen = total_hits + len(real_calls)
+
+    if total_seen == 0:
+        return  # nothing to report yet
+
+    hit_rate = total_hits / total_seen * 100
+    real_with_tokens = [s for s in real_calls if s.get("fields", {}).get("tokens_available")]
+    avg_tokens = (
+        sum(s["fields"].get("total_tokens") or 0 for s in real_with_tokens) / len(real_with_tokens)
+        if real_with_tokens else 0.0
+    )
+    estimated_tokens_saved = round(avg_tokens * total_hits)
+    net_saved = total_hits - len(embed_spans)
+
+    print(_c("  Cache savings (all-time)", _BOLD))
+    print(f"    hit rate: {hit_rate:.0f}%  ({total_hits}/{total_seen} calls served from cache)")
+    print(f"      exact-match hits:    {exact_hits}")
+    print(f"      semantic hits:       {semantic_hits}")
+    print(f"    estimated tokens saved: ~{estimated_tokens_saved:,} "
+          f"(avg {avg_tokens:.0f} tokens/real call × {total_hits} hits)")
+    print(f"    embedding calls made:   {len(embed_spans)}  "
+          f"(semantic layer's own cost — separate quota bucket)")
+    print(f"    net calls saved:        {net_saved}  (hits − embedding calls)")
     print()
 
 
@@ -356,6 +461,7 @@ def main() -> None:
     if args.list:
         _list_runs(all_spans)
         _print_rpd(all_spans)
+        _print_cache_savings(all_spans)
         return
 
     # --- --tail N ---
@@ -365,6 +471,7 @@ def main() -> None:
               f"  from {trace_path}\n")
         _print_flat(tail_spans)
         _print_rpd(all_spans)
+        _print_cache_savings(all_spans)
         return
 
     # --- default: last full run (or --run <id>) ---
@@ -394,6 +501,7 @@ def main() -> None:
     print(f"\n{_c('Last run', _BOLD)}  ({total_runs} total run(s) in {trace_path})")
     _print_run_tree(run_span, children)
     _print_rpd(all_spans)
+    _print_cache_savings(all_spans)
 
 
 if __name__ == "__main__":

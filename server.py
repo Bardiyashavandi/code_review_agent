@@ -230,22 +230,47 @@ def _build_run_entry(run: dict, llm_spans_by_run: dict[str, list[dict]]) -> dict
     stats aggregated from that run's llm_call spans (cache hits, fallback
     usage, token totals). Pure function of (run span, llm-spans-by-run map)
     so it's unit-testable without touching the filesystem or FastAPI.
+
+    "gemini_embed" spans (the semantic cache's own embedding calls — see
+    GeminiReviewer._embed) are split out from the generation-call stats
+    below: they never themselves "have issues" or count toward the
+    generation model's RPD cap, and lumping them into llm_calls/total_tokens
+    would conflate two different kinds of API cost. They're reported
+    separately as embed_calls/embed_calls_failed.
     """
     fields = run.get("fields", {})
     run_id = run.get("span_id")
     run_llm_spans = llm_spans_by_run.get(run_id, [])
 
-    llm_calls = len(run_llm_spans)
+    embed_spans = [s for s in run_llm_spans if s.get("name") == "gemini_embed"]
+    generation_spans = [s for s in run_llm_spans if s.get("name") != "gemini_embed"]
+
+    llm_calls = len(generation_spans)
+    # cache_hits stays a straight "cache_hit is True" count for backward
+    # compatibility with trace data written before cache_hit_type existed.
+    # exact_cache_hits/semantic_cache_hits are the new breakdown, additive on
+    # top — both are 0 for old spans that predate this field, which is the
+    # correct/honest answer ("we don't know which kind, if any").
     cache_hits = sum(
-        1 for s in run_llm_spans if s.get("fields", {}).get("cache_hit") is True
+        1 for s in generation_spans if s.get("fields", {}).get("cache_hit") is True
+    )
+    exact_cache_hits = sum(
+        1 for s in generation_spans if s.get("fields", {}).get("cache_hit_type") == "exact"
+    )
+    semantic_cache_hits = sum(
+        1 for s in generation_spans if s.get("fields", {}).get("cache_hit_type") == "semantic"
     )
     fallback_used_count = sum(
-        1 for s in run_llm_spans if s.get("fields", {}).get("fallback_used") is True
+        1 for s in generation_spans if s.get("fields", {}).get("fallback_used") is True
     )
     total_tokens = sum(
         s.get("fields", {}).get("total_tokens") or 0
-        for s in run_llm_spans
+        for s in generation_spans
         if s.get("fields", {}).get("tokens_available")
+    )
+    embed_calls = len(embed_spans)
+    embed_calls_failed = sum(
+        1 for s in embed_spans if s.get("fields", {}).get("embed_failed") is True
     )
 
     return {
@@ -260,6 +285,10 @@ def _build_run_entry(run: dict, llm_spans_by_run: dict[str, list[dict]]) -> dict
         "stage_errors":        fields.get("stage_errors", []),
         "llm_calls":           llm_calls,
         "cache_hits":          cache_hits,
+        "exact_cache_hits":    exact_cache_hits,
+        "semantic_cache_hits": semantic_cache_hits,
+        "embed_calls":         embed_calls,
+        "embed_calls_failed":  embed_calls_failed,
         "fallback_used_count": fallback_used_count,
         "total_tokens":        total_tokens,
     }
@@ -272,11 +301,17 @@ def _compute_rpd_summary(all_spans: list[dict]) -> dict:
     free-tier daily cap. Computed from the FULL span list (not the
     limit-sliced run list) so the number matches `view_trace.py --list` for
     the same trace file regardless of the `limit` query param.
+
+    "gemini_embed" spans are excluded from this count: embedding calls sit
+    in a separate free-tier quota bucket from generation calls, so counting
+    them against the generation model's daily cap would overstate real
+    usage. They're reported separately via embed_calls_today.
     """
     today = _today_prefix()
     todays_llm_spans = [
         s for s in all_spans
         if s.get("span_type") == "llm_call"
+        and s.get("name") != "gemini_embed"
         and (s.get("start_ts") or "").startswith(today)
     ]
     cache_hits_today = sum(
@@ -286,11 +321,87 @@ def _compute_rpd_summary(all_spans: list[dict]) -> dict:
     calls_today = len(todays_llm_spans) - cache_hits_today
     pct = (calls_today / _RPD_CAP * 100) if _RPD_CAP else 0.0
 
+    todays_embed_spans = [
+        s for s in all_spans
+        if s.get("span_type") == "llm_call"
+        and s.get("name") == "gemini_embed"
+        and (s.get("start_ts") or "").startswith(today)
+    ]
+    embed_calls_today = len(todays_embed_spans)
+
     return {
-        "calls_today":      calls_today,
-        "cache_hits_today": cache_hits_today,
-        "cap":              _RPD_CAP,
-        "pct":              round(pct, 1),
+        "calls_today":       calls_today,
+        "cache_hits_today":  cache_hits_today,
+        "cap":               _RPD_CAP,
+        "pct":               round(pct, 1),
+        "embed_calls_today": embed_calls_today,
+    }
+
+
+def _compute_cache_savings_summary(all_spans: list[dict]) -> dict:
+    """
+    Project-wide (all-time, not just today) cache effectiveness summary
+    across the whole trace file — how much the exact-match cache and the
+    semantic cache are each contributing, and the net cost of running the
+    semantic layer at all.
+
+    estimated_tokens_saved is genuinely an estimate, not a measurement: a
+    cache hit means no generate_content call was made, so there's no
+    usage_metadata for that specific call. Instead it's (average tokens per
+    *real* generation call this project has actually made) x (hit count) --
+    labeled "estimated" throughout for that reason.
+
+    net_calls_saved subtracts embed_calls from total hits, since every real
+    semantic-cache-populating call also pays for one embedding call — this
+    is the honest "did the semantic layer pay for itself" number, not just
+    a raw hit count.
+    """
+    generation_spans = [
+        s for s in all_spans
+        if s.get("span_type") == "llm_call" and s.get("name") != "gemini_embed"
+    ]
+    embed_spans = [
+        s for s in all_spans
+        if s.get("span_type") == "llm_call" and s.get("name") == "gemini_embed"
+    ]
+
+    exact_hits = sum(
+        1 for s in generation_spans if s.get("fields", {}).get("cache_hit_type") == "exact"
+    )
+    semantic_hits = sum(
+        1 for s in generation_spans if s.get("fields", {}).get("cache_hit_type") == "semantic"
+    )
+    total_hits = exact_hits + semantic_hits
+    real_calls = [
+        s for s in generation_spans if s.get("fields", {}).get("cache_hit") is not True
+    ]
+    misses = len(real_calls)
+    total_calls_seen = total_hits + misses
+
+    hit_rate_pct = (total_hits / total_calls_seen * 100) if total_calls_seen else 0.0
+
+    real_calls_with_tokens = [
+        s for s in real_calls if s.get("fields", {}).get("tokens_available")
+    ]
+    if real_calls_with_tokens:
+        avg_tokens_per_real_call = sum(
+            s["fields"].get("total_tokens") or 0 for s in real_calls_with_tokens
+        ) / len(real_calls_with_tokens)
+    else:
+        avg_tokens_per_real_call = 0.0
+    estimated_tokens_saved = round(avg_tokens_per_real_call * total_hits)
+
+    embed_calls = len(embed_spans)
+
+    return {
+        "exact_cache_hits":        exact_hits,
+        "semantic_cache_hits":     semantic_hits,
+        "total_cache_hits":        total_hits,
+        "real_calls":              misses,
+        "hit_rate_pct":            round(hit_rate_pct, 1),
+        "estimated_tokens_saved":  estimated_tokens_saved,
+        "embed_calls":             embed_calls,
+        "net_calls_saved":         total_hits - embed_calls,
     }
 
 
@@ -300,23 +411,39 @@ async def list_traces(
 ) -> dict:
     """
     Return the last N pipeline runs from traces/trace.jsonl, each annotated
-    with its LLM-call reliability stats, plus a top-level RPD summary.
+    with its LLM-call reliability stats, plus a top-level RPD summary and a
+    top-level cache-savings summary.
 
     Each run entry includes: run_id, start_ts, duration_s, status, repo_url,
     files_fetched, semgrep_findings, review_issues, stage_errors, and —
     aggregated from that run's llm_call spans — llm_calls, cache_hits,
+    exact_cache_hits, semantic_cache_hits, embed_calls, embed_calls_failed,
     fallback_used_count, and total_tokens.
 
     The top-level "rpd" block mirrors view_trace.py's RPD counter: today's
-    real (non-cached) Gemini call count against the free-tier daily cap,
-    computed across the whole trace file regardless of `limit`.
+    real (non-cached, non-embed) Gemini generation-call count against the
+    free-tier daily cap, computed across the whole trace file regardless of
+    `limit`, plus today's embed_calls_today (a separate quota bucket).
 
-    Returns an empty list (and a zeroed rpd block) if no trace file exists yet.
+    The top-level "cache_savings" block is project-wide (not just today):
+    exact vs. semantic hit counts, overall hit rate, an *estimated* tokens-
+    saved figure (average tokens per real call x hit count — see
+    _compute_cache_savings_summary's docstring for why this is an estimate,
+    not a measurement), and net_calls_saved (total hits minus the embedding
+    calls the semantic layer itself cost to run).
+
+    Returns an empty list (and zeroed rpd/cache_savings blocks) if no trace
+    file exists yet.
     """
     trace_file = Path(os.environ.get("TRACE_FILE", "traces/trace.jsonl"))
-    empty_rpd = {"calls_today": 0, "cache_hits_today": 0, "cap": _RPD_CAP, "pct": 0.0}
+    empty_rpd = {"calls_today": 0, "cache_hits_today": 0, "cap": _RPD_CAP, "pct": 0.0, "embed_calls_today": 0}
+    empty_cache_savings = {
+        "exact_cache_hits": 0, "semantic_cache_hits": 0, "total_cache_hits": 0,
+        "real_calls": 0, "hit_rate_pct": 0.0, "estimated_tokens_saved": 0,
+        "embed_calls": 0, "net_calls_saved": 0,
+    }
     if not trace_file.exists():
-        return {"runs": [], "total": 0, "rpd": empty_rpd}
+        return {"runs": [], "total": 0, "rpd": empty_rpd, "cache_savings": empty_cache_savings}
 
     spans: list[dict] = []
     try:
@@ -330,9 +457,10 @@ async def list_traces(
                         pass
     except OSError as exc:
         logger.warning("Could not read trace file: %s", exc)
-        return {"runs": [], "total": 0, "rpd": empty_rpd}
+        return {"runs": [], "total": 0, "rpd": empty_rpd, "cache_savings": empty_cache_savings}
 
     rpd_summary = _compute_rpd_summary(spans)
+    cache_savings_summary = _compute_cache_savings_summary(spans)
 
     run_spans = [s for s in spans if s.get("span_type") == "run"]
     total = len(run_spans)
@@ -341,7 +469,7 @@ async def list_traces(
     llm_spans_by_run = _build_llm_spans_by_run(spans)
     runs = [_build_run_entry(run, llm_spans_by_run) for run in run_spans]
 
-    return {"runs": runs, "total": total, "rpd": rpd_summary}
+    return {"runs": runs, "total": total, "rpd": rpd_summary, "cache_savings": cache_savings_summary}
 
 
 @app.post("/analyze", response_model=AnalyzeResponse, tags=["review"])

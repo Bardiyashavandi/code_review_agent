@@ -20,7 +20,12 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 
-from server import _build_llm_spans_by_run, _build_run_entry, _compute_rpd_summary
+from server import (
+    _build_llm_spans_by_run,
+    _build_run_entry,
+    _compute_cache_savings_summary,
+    _compute_rpd_summary,
+)
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -48,13 +53,22 @@ def make_run_span(run_id: str, status: str = "ok", start_ts: str | None = None,
     }
 
 
-def make_llm_span(run_id: str, start_ts: str | None = None, **fields) -> dict:
+def make_llm_span(run_id: str, start_ts: str | None = None, name: str = "gemini_call",
+                   **fields) -> dict:
     return {
         "span_type": "llm_call",
+        "name": name,
         "run_id": run_id,
         "start_ts": start_ts or _today_ts(),
         "fields": fields,
     }
+
+
+def make_embed_span(run_id: str, start_ts: str | None = None, **fields) -> dict:
+    """Stand-in for a GeminiReviewer._embed() span (name='gemini_embed') --
+    a distinct kind of llm_call span that must be excluded from RPD/
+    generation-call counts and reported separately."""
+    return make_llm_span(run_id, start_ts=start_ts, name="gemini_embed", **fields)
 
 
 # ---------------------------------------------------------------------------
@@ -65,7 +79,23 @@ class TestComputeRpdSummary:
 
     def test_empty_spans_gives_zeroed_summary(self):
         summary = _compute_rpd_summary([])
-        assert summary == {"calls_today": 0, "cache_hits_today": 0, "cap": 500, "pct": 0.0}
+        assert summary == {
+            "calls_today": 0, "cache_hits_today": 0, "cap": 500, "pct": 0.0,
+            "embed_calls_today": 0,
+        }
+
+    def test_embed_spans_excluded_from_generation_call_count(self):
+        # Embedding calls (the semantic cache's own lookups) sit in a
+        # separate quota bucket from generation calls -- must not inflate
+        # calls_today, and must be counted separately instead.
+        spans = [
+            make_llm_span("r1", cache_hit=False),
+            make_embed_span("r1"),
+            make_embed_span("r1"),
+        ]
+        summary = _compute_rpd_summary(spans)
+        assert summary["calls_today"] == 1
+        assert summary["embed_calls_today"] == 2
 
     def test_counts_only_real_calls_not_cache_hits(self):
         spans = [
@@ -132,6 +162,54 @@ class TestBuildRunEntry:
         assert entry["fallback_used_count"] == 1
         assert entry["total_tokens"] == 150  # only run-A's tokens, 9999 excluded
 
+    def test_exact_and_semantic_cache_hits_broken_out_separately(self):
+        run = make_run_span("run-E")
+        spans = [
+            run,
+            make_llm_span("run-E", cache_hit=True, cache_hit_type="exact"),
+            make_llm_span("run-E", cache_hit=True, cache_hit_type="exact"),
+            make_llm_span("run-E", cache_hit=True, cache_hit_type="semantic",
+                           semantic_similarity=0.991),
+            make_llm_span("run-E", cache_hit=False),  # a genuine miss
+        ]
+        by_run = _build_llm_spans_by_run(spans)
+        entry = _build_run_entry(run, by_run)
+
+        assert entry["llm_calls"] == 4
+        assert entry["cache_hits"] == 3
+        assert entry["exact_cache_hits"] == 2
+        assert entry["semantic_cache_hits"] == 1
+
+    def test_old_cache_hits_without_type_still_counted_in_total_only(self):
+        # Trace data written before cache_hit_type existed: cache_hit=True
+        # but no cache_hit_type field. Must still count toward the total
+        # (backward compat) but toward neither of the new breakdown fields
+        # -- "we don't know which kind" is the honest answer, not a guess.
+        run = make_run_span("run-F")
+        spans = [run, make_llm_span("run-F", cache_hit=True)]
+        by_run = _build_llm_spans_by_run(spans)
+        entry = _build_run_entry(run, by_run)
+
+        assert entry["cache_hits"] == 1
+        assert entry["exact_cache_hits"] == 0
+        assert entry["semantic_cache_hits"] == 0
+
+    def test_embed_calls_counted_separately_from_llm_calls(self):
+        run = make_run_span("run-G")
+        spans = [
+            run,
+            make_llm_span("run-G", cache_hit=False),
+            make_embed_span("run-G", embed_failed=False),
+            make_embed_span("run-G", embed_failed=True),
+        ]
+        by_run = _build_llm_spans_by_run(spans)
+        entry = _build_run_entry(run, by_run)
+
+        # Embed spans must not inflate llm_calls (that's a generation-call count).
+        assert entry["llm_calls"] == 1
+        assert entry["embed_calls"] == 2
+        assert entry["embed_calls_failed"] == 1
+
     def test_run_with_no_llm_spans_gets_zeroed_fields(self):
         run = make_run_span("run-solo")
         by_run = _build_llm_spans_by_run([run])
@@ -140,6 +218,9 @@ class TestBuildRunEntry:
 
         assert entry["llm_calls"] == 0
         assert entry["cache_hits"] == 0
+        assert entry["exact_cache_hits"] == 0
+        assert entry["semantic_cache_hits"] == 0
+        assert entry["embed_calls"] == 0
         assert entry["fallback_used_count"] == 0
         assert entry["total_tokens"] == 0
 
@@ -175,3 +256,81 @@ class TestBuildRunEntry:
         entry = _build_run_entry(run, by_run)
 
         assert entry["llm_calls"] == 1
+
+
+# ---------------------------------------------------------------------------
+# _compute_cache_savings_summary
+# ---------------------------------------------------------------------------
+
+class TestComputeCacheSavingsSummary:
+
+    def test_empty_spans_gives_zeroed_summary(self):
+        summary = _compute_cache_savings_summary([])
+        assert summary == {
+            "exact_cache_hits": 0, "semantic_cache_hits": 0, "total_cache_hits": 0,
+            "real_calls": 0, "hit_rate_pct": 0.0, "estimated_tokens_saved": 0,
+            "embed_calls": 0, "net_calls_saved": 0,
+        }
+
+    def test_breaks_out_exact_vs_semantic_hits(self):
+        spans = [
+            make_llm_span("r1", cache_hit=True, cache_hit_type="exact"),
+            make_llm_span("r1", cache_hit=True, cache_hit_type="exact"),
+            make_llm_span("r1", cache_hit=True, cache_hit_type="semantic"),
+            make_llm_span("r1", cache_hit=False, tokens_available=True, total_tokens=200),
+        ]
+        summary = _compute_cache_savings_summary(spans)
+        assert summary["exact_cache_hits"] == 2
+        assert summary["semantic_cache_hits"] == 1
+        assert summary["total_cache_hits"] == 3
+        assert summary["real_calls"] == 1
+
+    def test_hit_rate_computed_against_total_calls_seen(self):
+        spans = [
+            make_llm_span("r1", cache_hit=True, cache_hit_type="exact"),
+            make_llm_span("r1", cache_hit=True, cache_hit_type="semantic"),
+            make_llm_span("r1", cache_hit=False, tokens_available=True, total_tokens=100),
+            make_llm_span("r1", cache_hit=False, tokens_available=True, total_tokens=100),
+        ]
+        summary = _compute_cache_savings_summary(spans)
+        # 2 hits out of 4 total calls seen (2 hits + 2 real) = 50%
+        assert summary["hit_rate_pct"] == 50.0
+
+    def test_estimated_tokens_saved_uses_average_of_real_calls(self):
+        spans = [
+            make_llm_span("r1", cache_hit=False, tokens_available=True, total_tokens=100),
+            make_llm_span("r1", cache_hit=False, tokens_available=True, total_tokens=200),
+            # average real-call cost = 150 tokens
+            make_llm_span("r1", cache_hit=True, cache_hit_type="exact"),
+            make_llm_span("r1", cache_hit=True, cache_hit_type="semantic"),
+        ]
+        summary = _compute_cache_savings_summary(spans)
+        assert summary["estimated_tokens_saved"] == 300  # 150 avg x 2 hits
+
+    def test_embed_calls_excluded_from_real_calls_and_hits(self):
+        spans = [
+            make_llm_span("r1", cache_hit=False, tokens_available=True, total_tokens=100),
+            make_embed_span("r1"),
+            make_embed_span("r1"),
+        ]
+        summary = _compute_cache_savings_summary(spans)
+        assert summary["real_calls"] == 1
+        assert summary["total_cache_hits"] == 0
+        assert summary["embed_calls"] == 2
+
+    def test_net_calls_saved_subtracts_embed_overhead(self):
+        # 3 hits, but the semantic layer cost 2 embed calls to achieve them
+        # (e.g. 1 embed per real call that populated the semantic cache,
+        # plus 1 embed per semantic-hit lookup) -- net_calls_saved should
+        # reflect that honest accounting, not just the raw hit count.
+        spans = [
+            make_llm_span("r1", cache_hit=True, cache_hit_type="exact"),
+            make_llm_span("r1", cache_hit=True, cache_hit_type="semantic"),
+            make_llm_span("r1", cache_hit=True, cache_hit_type="semantic"),
+            make_embed_span("r1"),
+            make_embed_span("r1"),
+        ]
+        summary = _compute_cache_savings_summary(spans)
+        assert summary["total_cache_hits"] == 3
+        assert summary["embed_calls"] == 2
+        assert summary["net_calls_saved"] == 1

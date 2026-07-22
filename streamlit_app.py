@@ -238,8 +238,14 @@ def _render_rpd_bar(rpd: dict) -> None:
     st.progress(min(pct / 100, 1.0))
     if cache_hits:
         st.caption(
-            f"{cache_hits} additional call(s) served from the in-memory cache "
-            f"today, not counted against the quota."
+            f"{cache_hits} additional call(s) served from cache (exact-match or "
+            f"semantic) today, not counted against the quota."
+        )
+    embed_calls = rpd.get("embed_calls_today", 0)
+    if embed_calls:
+        st.caption(
+            f"{embed_calls} embedding call(s) today for the semantic cache — "
+            f"a separate quota bucket, not counted above."
         )
 
 
@@ -268,6 +274,7 @@ def _render_history() -> None:
     runs = data.get("runs", [])
     total = data.get("total", 0)
     rpd = data.get("rpd", {})
+    cache_savings = data.get("cache_savings", {})
 
     if not runs:
         st.info("No runs recorded yet. Run a review first.")
@@ -299,6 +306,35 @@ def _render_history() -> None:
 
     st.markdown("**Gemini quota**")
     _render_rpd_bar(rpd)
+
+    st.divider()
+
+    # --- Cache savings (project-wide, exact vs. semantic broken out) ---
+    st.markdown("**Cache savings** — how much each caching layer is contributing")
+    st.caption(
+        "Computed project-wide across the whole trace file (not just the runs shown "
+        "above), so exact-match and semantic hit rates stay comparable across "
+        "however many runs are on screen."
+    )
+    exact_hits = cache_savings.get("exact_cache_hits", 0)
+    semantic_hits = cache_savings.get("semantic_cache_hits", 0)
+    hit_rate_pct = cache_savings.get("hit_rate_pct", 0.0)
+    embed_calls_total = cache_savings.get("embed_calls", 0)
+    net_saved = cache_savings.get("net_calls_saved", 0)
+    tokens_saved = cache_savings.get("estimated_tokens_saved", 0)
+
+    sc1, sc2, sc3, sc4 = st.columns(4)
+    sc1.metric("Overall hit rate", f"{hit_rate_pct:.0f}%")
+    sc2.metric("Exact-match hits", exact_hits)
+    sc3.metric("Semantic hits", semantic_hits)
+    sc4.metric("Est. tokens saved", f"{tokens_saved:,}")
+    st.caption(
+        f"Semantic layer cost {embed_calls_total} embedding call(s) to run — "
+        f"**net {net_saved} call(s) saved** (hits minus embedding overhead). "
+        "Tokens-saved is an estimate (average tokens per real call × hit count), "
+        "since a cache hit means no generate_content call was made, so there's no "
+        "usage_metadata for that specific call."
+    )
 
     st.divider()
 
@@ -356,13 +392,21 @@ def _render_history() -> None:
 
             llm_calls = run.get("llm_calls") or 0
             cache_hits = run.get("cache_hits") or 0
+            exact_hits = run.get("exact_cache_hits") or 0
+            semantic_hits = run.get("semantic_cache_hits") or 0
+            embed_calls = run.get("embed_calls") or 0
             fallback_used = run.get("fallback_used_count") or 0
             tokens = run.get("total_tokens") or 0
 
             call_word     = "call" if llm_calls == 1 else "calls"
             hit_word      = "hit" if cache_hits == 1 else "hits"
             fallback_word = "fallback" if fallback_used == 1 else "fallbacks"
-            reliability_line = f"{llm_calls} LLM {call_word} · {cache_hits} cache {hit_word} · {fallback_used} {fallback_word}"
+            reliability_line = f"{llm_calls} LLM {call_word} · {cache_hits} cache {hit_word}"
+            if cache_hits:
+                reliability_line += f" ({exact_hits} exact, {semantic_hits} semantic)"
+            reliability_line += f" · {fallback_used} {fallback_word}"
+            if embed_calls:
+                reliability_line += f" · {embed_calls} embed call(s)"
             if tokens:
                 reliability_line += f" · {tokens:,} tokens"
             st.caption(reliability_line)

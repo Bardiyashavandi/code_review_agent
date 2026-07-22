@@ -67,7 +67,7 @@ The same pipeline is reachable four ways: as a CLI (`main.py`), as a REST API (`
 
 ## Real-world verification, not synthetic testing
 
-A capstone project that only ever sees mocked inputs proves the code parses correctly, not that it works. So beyond the 147-test mocked suite (covering batching logic, severity sorting, error handling, input/output validation, and the security cases above — all running in a few seconds with no network access or credentials) and a separate 21-case scenario-based eval suite that scores the pipeline's actual judgment against real Gemini calls (detection accuracy, false-positive rate, dedup effectiveness, risk-scoring correctness, and resistance to an embedded prompt-injection attack — see `evals/README.md`), this project was run end-to-end against a real, unmodified GitHub repository with real credentials, real network calls, and real LLM output.
+A capstone project that only ever sees mocked inputs proves the code parses correctly, not that it works. So beyond the 166-test mocked suite (covering batching logic, severity sorting, error handling, input/output validation, exact-match and semantic caching, and the security cases above — all running in a few seconds with no network access or credentials) and a separate 21-case scenario-based eval suite that scores the pipeline's actual judgment against real Gemini calls (detection accuracy, false-positive rate, dedup effectiveness, risk-scoring correctness, and resistance to an embedded prompt-injection attack — see `evals/README.md`), this project was run end-to-end against a real, unmodified GitHub repository with real credentials, real network calls, and real LLM output.
 
 A real run (visible in the demo GIF) fetched 22 Python files, ran a live Semgrep scan, sent the results through the full multi-agent pipeline, and produced a 12-issue report in 37 seconds — including genuine HIGH-severity findings like subprocess environment variable leakage and hardcoded environment dependencies. These aren't synthetic test fixtures; they're real code smells found by the actual pipeline doing its actual job.
 
@@ -85,7 +85,7 @@ Every module started as a written specification (interface, expected behavior, e
 
 ## Tech stack
 
-Python, Google ADK 2.3 (`google-adk`), Gemini 3.1 Flash Lite via `google-genai` (with a `gemini-2.5-flash-lite` fallback for rate-limit resilience and lighter-task routing, plus an in-memory exact-match response cache), FastAPI + Uvicorn, Streamlit, the GitHub REST API, and Semgrep for static analysis. No paid services are used anywhere in the pipeline — all APIs are free-tier.
+Python, Google ADK 2.3 (`google-adk`), Gemini 3.1 Flash Lite via `google-genai` (with a `gemini-2.5-flash-lite` fallback for rate-limit resilience and lighter-task routing, plus a two-layer in-memory response cache — exact-match first, then a semantic layer using `gemini-embedding-001` to catch near-identical prompts the exact-match cache misses), FastAPI + Uvicorn, Streamlit, the GitHub REST API, and Semgrep for static analysis. No paid services are used anywhere in the pipeline — all APIs are free-tier.
 
 ## Setup
 
@@ -113,4 +113,4 @@ Full setup, usage, and ADK-agent examples are in the repository's `README.md`.
 
 ## What this demonstrates
 
-The project grew from a single-agent pipeline into a twenty-nine-agent, five-layer system — not to check rubric boxes, but because the multi-agent design naturally maps to how a real security team would divide the work: a strategist to plan, domain leads to coordinate, specialist analysts for each attack class, sub-specialists to validate and map findings to standards, and cross-cutting agents to deduplicate, score risk, and generate concrete fixes. The 147 tests, the 21-case eval suite, the CI pipeline, the tracing endpoint, and the three real bugs found during end-to-end testing are the evidence that this is a working system, not a demo assembled for a deadline.
+The project grew from a single-agent pipeline into a twenty-nine-agent, five-layer system — not to check rubric boxes, but because the multi-agent design naturally maps to how a real security team would divide the work: a strategist to plan, domain leads to coordinate, specialist analysts for each attack class, sub-specialists to validate and map findings to standards, and cross-cutting agents to deduplicate, score risk, and generate concrete fixes. The 166 tests, the 21-case eval suite, the CI pipeline, the tracing endpoint, and the three real bugs found during end-to-end testing are the evidence that this is a working system, not a demo assembled for a deadline.

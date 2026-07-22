@@ -169,6 +169,28 @@ DEFAULT_MAX_CHARS_PER_BATCH = 60_000
 MAX_RETRIES = 3
 INTER_BATCH_DELAY_S = 5
 
+# Semantic cache: catches near-identical prompts the exact-match cache (SHA-256
+# of system_instruction+prompt) misses -- e.g. a file re-submitted with only a
+# comment or whitespace changed, or an unchanged file re-reviewed in a later
+# PR. Uses the same google.genai Client already held by GeminiReviewer (no new
+# dependency); cosine similarity is pure Python (no numpy needed either).
+#
+# gemini-embedding-001 is the current-gen Gemini embedding model (vs. the
+# older text-embedding-004), matching this project's convention of using the
+# current Gemini generation elsewhere. SEMANTIC_SIMILARITY is the task_type
+# built specifically for this comparison use case.
+SEMANTIC_CACHE_MODEL = "gemini-embedding-001"
+SEMANTIC_CACHE_TASK_TYPE = "SEMANTIC_SIMILARITY"
+
+# Deliberately conservative. Two versions of a file can be 99%+ similar while
+# having opposite security implications (e.g. a one-line SQLi fix barely
+# moves an embedding) -- serving a stale cached review for a near-identical
+# but meaningfully-changed file is a silent correctness risk, not just an
+# efficiency question. 0.98 is chosen to reliably catch whitespace/comment/
+# reordering-only changes (which sit at ~0.99+) while being very unlikely to
+# match across a change that could alter the actual vulnerability profile.
+DEFAULT_SEMANTIC_CACHE_THRESHOLD = 0.98
+
 SEVERITY_LEVELS = ("CRITICAL", "HIGH", "MEDIUM", "LOW")
 SEVERITY_RANK = {level: rank for rank, level in enumerate(SEVERITY_LEVELS)}
 DEFAULT_SEVERITY = "MEDIUM"
@@ -965,6 +987,30 @@ Return a JSON object with exactly these fields:
 
 
 # ---------------------------------------------------------------------------
+# Semantic cache helpers
+# ---------------------------------------------------------------------------
+
+def _cosine_similarity(a: list[float], b: list[float]) -> float:
+    """
+    Pure-Python cosine similarity — deliberately no numpy dependency for
+    comparing two embedding vectors a handful of times per review; this
+    project prefers reusing what's already installed over adding a new
+    dependency for something this small.
+
+    Returns 0.0 for mismatched/empty/zero-norm vectors rather than raising,
+    since this only ever feeds a "is this above the threshold?" check.
+    """
+    if not a or not b or len(a) != len(b):
+        return 0.0
+    dot = sum(x * y for x, y in zip(a, b))
+    norm_a = sum(x * x for x in a) ** 0.5
+    norm_b = sum(y * y for y in b) ** 0.5
+    if norm_a == 0.0 or norm_b == 0.0:
+        return 0.0
+    return dot / (norm_a * norm_b)
+
+
+# ---------------------------------------------------------------------------
 # Reviewer
 # ---------------------------------------------------------------------------
 
@@ -983,6 +1029,15 @@ class GeminiReviewer:
         Max number of files sent in a single request.
     max_chars_per_batch : int
         Max total source characters sent in a single request.
+    enable_semantic_cache : bool
+        Whether to check/populate the semantic (embedding-similarity) cache
+        on top of the existing exact-match cache. Default True; set False to
+        disable if you don't have embedding quota or want byte-for-byte-only
+        caching behavior.
+    semantic_cache_threshold : float
+        Minimum cosine similarity (0-1) for a semantic cache hit. See
+        DEFAULT_SEMANTIC_CACHE_THRESHOLD's comment for why 0.98 is the
+        recommended default.
     """
 
     def __init__(
@@ -991,19 +1046,35 @@ class GeminiReviewer:
         model: str = DEFAULT_MODEL,
         max_files_per_batch: int = DEFAULT_MAX_FILES_PER_BATCH,
         max_chars_per_batch: int = DEFAULT_MAX_CHARS_PER_BATCH,
+        enable_semantic_cache: bool = True,
+        semantic_cache_threshold: float = DEFAULT_SEMANTIC_CACHE_THRESHOLD,
     ) -> None:
         if not api_key or not api_key.strip():
             raise ValueError("GEMINI_API_KEY must not be empty")
         self._model = model
         self._max_files_per_batch = max_files_per_batch
         self._max_chars_per_batch = max_chars_per_batch
+        self._enable_semantic_cache = enable_semantic_cache
+        self._semantic_cache_threshold = semantic_cache_threshold
         self._client = genai.Client(api_key=api_key)
 
         # Process-lifetime, in-memory, exact-match cache. Keyed on a hash of
         # (system_instruction, prompt) -> the raw response text that content
-        # produced. Deliberately simple: no persistence, no semantic/fuzzy
-        # matching, no eviction policy. Cleared when the process exits.
+        # produced. Deliberately simple: no persistence, no eviction policy.
+        # Cleared when the process exits. Checked first in _call_model since
+        # it's a free dict lookup -- cheaper than the semantic cache's
+        # embedding call.
         self._cache: dict[str, str] = {}
+
+        # Process-lifetime, in-memory semantic cache. Keyed by
+        # system_instruction (so e.g. a crypto-audit prompt can never match
+        # an injection-audit prompt's entries), each bucket a list of
+        # (embedding_vector, response_text) pairs for prompts of that audit
+        # type seen so far. Checked only on an exact-match miss, and only if
+        # its bucket for this system_instruction is non-empty (no point
+        # paying for an embedding call when there's nothing yet to compare
+        # against).
+        self._semantic_cache: dict[str, list[tuple[list[float], str]]] = {}
 
     # ------------------------------------------------------------------
     # Public API
@@ -1547,21 +1618,40 @@ class GeminiReviewer:
 
         Flow:
           1. Exact-match cache lookup on hash(system_instruction + prompt).
-             On hit, no network call is made at all.
-          2. On miss, call `model` (or self._model if not given) with
+             On hit, no network call is made at all — cheapest possible
+             check, tried first.
+          2. On an exact-match miss, if enable_semantic_cache and this
+             system_instruction's semantic bucket is non-empty: embed the
+             prompt and compare (cosine similarity) against every cached
+             entry for this exact system_instruction. On a hit at or above
+             semantic_cache_threshold, no generation call is made either —
+             only the one embedding call. The matched response is also
+             written into the exact-match cache so a byte-identical repeat
+             of *this* prompt is free next time.
+          3. On a full miss (or if embedding itself fails — best-effort,
+             never blocks the review), call `model` (or self._model) with
              retry/backoff on 429/500/503, up to MAX_RETRIES.
-          3. If retries are exhausted (GeminiRateLimitError / GeminiAPIError
+          4. If retries are exhausted (GeminiRateLimitError / GeminiAPIError
              — NOT GeminiAuthenticationError, which never benefits from
              switching models), make exactly one attempt against
              FALLBACK_MODEL with no further retries. On success, that
-             response is cached and returned. On failure, the *original*
-             exception is re-raised with a note that fallback also failed.
+             response is cached (both exact and semantic) and returned. On
+             failure, the *original* exception is re-raised with a note
+             that fallback also failed.
+          5. Whenever a real call succeeds (step 3 or 4), the prompt is also
+             embedded (reusing the step-2 embedding if one was already
+             computed) and stored in the semantic cache for future hits —
+             this is the one extra cost the semantic layer adds on every
+             real call, in exchange for future savings.
 
         Emits one llm_call tracing span per invocation with: cache_hit,
-        model (requested), model_used (whichever model actually produced
-        the response), fallback_used, retry_count, token usage (if the SDK
-        returns usage_metadata). status=error is recorded on any exception
-        that ultimately propagates.
+        cache_hit_type ("exact"|"semantic"), semantic_similarity (on a
+        semantic hit), model (requested), model_used (whichever model
+        actually produced the response), fallback_used, retry_count, token
+        usage (if the SDK returns usage_metadata). status=error is recorded
+        on any exception that ultimately propagates. Embedding calls get
+        their own separate "gemini_embed" span (see _embed), so their cost
+        is visible independently of the generation call they're part of.
         """
         effective_model = model or self._model
         cache_key = hashlib.sha256(
@@ -1580,8 +1670,36 @@ class GeminiReviewer:
         ) as llm_span:
             cached = self._cache.get(cache_key)
             if cached is not None:
-                llm_span.set(cache_hit=True, retry_count=0, fallback_used=False)
+                llm_span.set(cache_hit=True, cache_hit_type="exact", retry_count=0, fallback_used=False)
                 return cached
+
+            # Semantic cache check. Only pays for an embedding call if
+            # there's an existing bucket for this exact system_instruction
+            # to compare against — nothing to gain from embedding the very
+            # first prompt of a given audit type.
+            query_vector: list[float] | None = None
+            if self._enable_semantic_cache:
+                bucket = self._semantic_cache.get(system_instruction)
+                if bucket:
+                    query_vector = self._embed(prompt)
+                    if query_vector is not None:
+                        best_score, best_response = 0.0, None
+                        for cached_vector, cached_response in bucket:
+                            score = _cosine_similarity(query_vector, cached_vector)
+                            if score > best_score:
+                                best_score, best_response = score, cached_response
+                        if best_response is not None and best_score >= self._semantic_cache_threshold:
+                            llm_span.set(
+                                cache_hit=True, cache_hit_type="semantic",
+                                semantic_similarity=round(best_score, 4),
+                                retry_count=0, fallback_used=False,
+                            )
+                            self._cache[cache_key] = best_response
+                            return best_response
+                        llm_span.set(
+                            semantic_best_similarity=round(best_score, 4) if best_response else 0.0
+                        )
+
             llm_span.set(cache_hit=False)
 
             try:
@@ -1591,6 +1709,7 @@ class GeminiReviewer:
                 )
                 llm_span.set(model_used=effective_model, fallback_used=False)
                 self._cache[cache_key] = text
+                self._store_semantic_entry(system_instruction, prompt, text, query_vector)
                 return text
 
             except GeminiAuthenticationError:
@@ -1615,6 +1734,7 @@ class GeminiReviewer:
                     )
                     llm_span.set(model_used=FALLBACK_MODEL)
                     self._cache[cache_key] = text
+                    self._store_semantic_entry(system_instruction, prompt, text, query_vector)
                     return text
 
                 except (GeminiRateLimitError, GeminiAPIError, GeminiAuthenticationError):
@@ -1628,6 +1748,61 @@ class GeminiReviewer:
                         f"Fallback to {FALLBACK_MODEL} also failed.",
                         http_status=primary_exc.http_status,
                     ) from primary_exc
+
+    def _embed(self, text: str) -> list[float] | None:
+        """
+        Embed `text` via Gemini's embedding endpoint (gemini-embedding-001,
+        task_type=SEMANTIC_SIMILARITY), for semantic cache comparison.
+
+        Best-effort: returns None on ANY failure rather than raising.
+        Semantic caching is an optimization layered on top of a working
+        cache, not a hard requirement — an embedding outage should fall
+        through to a normal real Gemini call, never crash the review.
+
+        Emits its own "gemini_embed" llm_call span (separate from the
+        generation call it's supporting), so embedding-call volume/cost is
+        visible independently in traces/the /traces endpoint.
+        """
+        with tracing.span(
+            "llm_call", "gemini_embed", model=SEMANTIC_CACHE_MODEL, prompt_chars=len(text)
+        ) as embed_span:
+            try:
+                response = self._client.models.embed_content(
+                    model=SEMANTIC_CACHE_MODEL,
+                    contents=text,
+                    config=genai_types.EmbedContentConfig(task_type=SEMANTIC_CACHE_TASK_TYPE),
+                )
+                vector = list(response.embeddings[0].values)
+                embed_span.set(embed_failed=False, vector_dims=len(vector))
+                return vector
+            except Exception as exc:  # noqa: BLE001 — best-effort, never crash the review
+                logger.warning(
+                    "Embedding call failed (%s); falling back to a real Gemini call "
+                    "for this prompt.", exc,
+                )
+                embed_span.set(embed_failed=True, error_note=str(exc)[:200])
+                return None
+
+    def _store_semantic_entry(
+        self,
+        system_instruction: str,
+        prompt: str,
+        response_text: str,
+        precomputed_vector: list[float] | None = None,
+    ) -> None:
+        """
+        Record (embedding, response) for this system_instruction's semantic
+        cache bucket, so a future near-duplicate prompt of the same audit
+        type can hit. Reuses `precomputed_vector` if the semantic-cache
+        check already embedded this exact prompt (avoids embedding it
+        twice). Best-effort: silently no-ops if embedding fails/is disabled.
+        """
+        if not self._enable_semantic_cache:
+            return
+        vector = precomputed_vector if precomputed_vector is not None else self._embed(prompt)
+        if vector is None:
+            return
+        self._semantic_cache.setdefault(system_instruction, []).append((vector, response_text))
 
     def _attempt_with_retries(
         self,
