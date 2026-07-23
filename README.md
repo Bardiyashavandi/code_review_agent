@@ -9,7 +9,7 @@
 [![Gemini](https://img.shields.io/badge/Gemini-3.1%20Flash%20Lite-8E24AA?logo=google&logoColor=white)](https://ai.google.dev)
 [![FastAPI](https://img.shields.io/badge/FastAPI-0.115-009688?logo=fastapi&logoColor=white)](https://fastapi.tiangolo.com)
 [![Streamlit](https://img.shields.io/badge/Streamlit-1.45-FF4B4B?logo=streamlit&logoColor=white)](https://streamlit.io)
-[![Tests](https://img.shields.io/badge/tests-166%20passing-22c55e?logo=pytest&logoColor=white)](./tests)
+[![Tests](https://img.shields.io/badge/tests-190%20passing-22c55e?logo=pytest&logoColor=white)](./tests)
 [![Evals](https://img.shields.io/badge/evals-21%20scenarios-8E24AA?logo=checkmarx&logoColor=white)](./evals)
 [![CI](https://github.com/Bardiyashavandi/code_review_agent/actions/workflows/ci.yml/badge.svg)](https://github.com/Bardiyashavandi/code_review_agent/actions/workflows/ci.yml)
 [![Agents](https://img.shields.io/badge/agents-29-blueviolet)](#multi-agent-architecture)
@@ -504,6 +504,66 @@ Opens at `http://localhost:8501`.
 | `502` | GitHub API error unrelated to auth/rate-limit/not-found |
 | `504` | Pipeline exceeded timeout — try smaller `max_files` or raise `AGENT_TIMEOUT_S` |
 
+### `POST /remediate`
+
+Opt-in only — never triggered automatically by `/analyze`. Takes findings from a prior `/analyze` response (the exact `review.issues` array, or a hand-picked subset of it) and returns concrete before/after code patches. Exposes the same `generate_remediation_patches()` logic the `remediation_agent` ADK tool already used internally — nothing was reimplemented, this just gives the HTTP API and Streamlit UI a way to reach it.
+
+Re-fetches the repo's files from GitHub itself (the same `fetch_python_files()` call `/analyze` uses) and filters down to just the paths referenced in `findings`, so the caller never needs to carry file content around — just `repo_url`/`branch` and the findings.
+
+**Request:**
+
+```json
+{
+  "repo_url":  "https://github.com/owner/repo",
+  "branch":    "main",
+  "max_files": 100,
+  "findings": [
+    {
+      "path":          "auth.py",
+      "line":          42,
+      "severity":      "HIGH",
+      "title":         "Hardcoded secret",
+      "description":   "...",
+      "suggested_fix": "...",
+      "rule_id":       null
+    }
+  ]
+}
+```
+
+**Response `200`:**
+
+```json
+{
+  "patches": [
+    {
+      "finding_index":       0,
+      "path":                "auth.py",
+      "line":                42,
+      "title":               "Hardcoded secret",
+      "before":              "API_KEY = \"sk-live-abc123\"",
+      "after":                "API_KEY = os.environ[\"API_KEY\"]",
+      "explanation":          "Secrets must never be committed to source; load from environment instead.",
+      "dependencies":        [],
+      "breaking_change":     false,
+      "breaking_change_note": null
+    }
+  ],
+  "summary":        "1 patch generated.",
+  "parse_error":    false,
+  "missing_paths":  [],
+  "schema_errors":  []
+}
+```
+
+`missing_paths` lists any requested findings' paths that weren't found in the re-fetched repo (stale `repo_url`/`branch`, or `max_files` too small) — those findings are skipped rather than failing the whole request. `schema_errors` records any individual patch Gemini returned in an unexpected shape (dropped, not allowed to 500 the response) — mirrors `review.schema_errors`' existing pattern. `parse_error` is `true` only if the entire response couldn't be parsed as JSON at all.
+
+**Error codes:** same table as `/analyze` above, plus:
+
+| Status | Cause |
+|---|---|
+| `400` | None of the requested findings' paths were found in the re-fetched repo |
+
 ### `GET /health`
 
 ```json
@@ -580,6 +640,7 @@ Two tabs:
 - Semgrep findings with actual code snippets (`st.code`)
 - Metrics row: files fetched, issues found, duration, model used
 - Specific readable error messages for every failure mode — never a raw traceback
+- **Fix generation:** a checkbox on each issue card plus a "Generate fixes for N selected issue(s)" button — opt-in, never triggered automatically after a review. Calls `POST /remediate` with just the checked issues and renders each returned patch as a side-by-side before/after `st.code` block, with the explanation, any new dependencies, and a breaking-change warning if Gemini flagged one. Results persist across reruns (checking another issue's box, etc.) via `st.session_state`
 
 **📊 History tab**
 - Summary metrics: total runs, success rate, average issues, average duration
@@ -605,6 +666,7 @@ Every layer of the stack has explicit security decisions:
 | **Input size** | A hard aggregate cap (`PayloadTooLargeError`, 2MB default) rejects an oversized fetch outright — distinct from the existing per-file cap, which only silently skips individual large files and wouldn't catch many-small-files-add-up-large inputs |
 | **Output schema** | Gemini's JSON response is validated against a strict Pydantic schema (`extra="forbid"`, enum-constrained severity, required fields) before becoming a finding — a malformed or hijacked response fails loudly (`ReviewReport.schema_errors`) instead of being silently coerced or treated as "no issues found" |
 | **GitHub write actions** | Both `post_pr_review_tool` (PR comments) and `create_issue_tool` (repo issues) are opt-in only — never called automatically at the end of a review, only on explicit user request. `create_issue_tool` additionally won't open an issue at all unless at least one finding meets a severity bar (`min_severity`, default HIGH) — a repo issue is more visible/persistent than a PR comment, so the bar to create one is deliberately higher |
+| **Remediation cost control** | `POST /remediate` is opt-in only, same philosophy as the GitHub write actions above — never triggered automatically by `/analyze`. No server-side allow-list of "fixable" finding categories either: that judgment is left to the caller (e.g. the Streamlit checkboxes), since generating patches is one batched Gemini call regardless of how many findings are included, so call-count isn't the cost lever — whether the endpoint runs at all is |
 | **Credentials** | API keys load from environment variables only; `test_secrets_never_logged` asserts no key ever appears in a log line or exception message |
 | **Output rendering** | Model output is never evaluated as code or interpolated unsafely into the Streamlit UI — tested with an injected `__import__` payload |
 
@@ -616,7 +678,9 @@ Every layer of the stack has explicit security decisions:
 pytest -v
 ```
 
-166 tests across all modules. Every external dependency — GitHub API, Semgrep subprocess, Gemini SDK (including `embed_content`) — is mocked, so the full suite runs in a few seconds with no network access or credentials required. These tests check plumbing: batching, JSON parsing, retries, exact-match and semantic caching (hits, misses, per-system-instruction scoping, threshold behavior, embedding-failure fallback), error handling, size caps, schema validation. They do not check whether the pipeline's judgment is actually good — that's what the eval suite below is for.
+190 tests across all modules. Every external dependency — GitHub API, Semgrep subprocess, Gemini SDK (including `embed_content`) — is mocked, so the full suite runs in a few seconds with no network access or credentials required. These tests check plumbing: batching, JSON parsing, retries, exact-match and semantic caching (hits, misses, per-system-instruction scoping, threshold behavior, embedding-failure fallback), error handling, size caps, schema validation. They do not check whether the pipeline's judgment is actually good — that's what the eval suite below is for.
+
+`tests/test_server.py` additionally tests `/remediate` at the HTTP route level with FastAPI's `TestClient` — request validation, status codes, file-filtering, and malformed-patch handling — rather than only the pure aggregation functions `tests/test_server_traces.py` covers for `/traces`. `TestClient(app)` is constructed without entering it as a context manager, so the real `lifespan` (which needs a working Semgrep binary and real credentials) never runs; `app.state.agent` is swapped for a mock instead.
 
 ---
 
@@ -627,7 +691,7 @@ cd evals
 python3 runner.py --mode live   # needs GEMINI_API_KEY; ~19 real Gemini calls
 ```
 
-21 scenario-based cases exercising the full pipeline end to end, not individual functions — do the specialist agents actually catch known-bad patterns, does the validator actually reject fabricated findings against clean code, does deduplication actually merge true duplicates without over-merging distinct ones, does risk scoring actually rank an obvious CRITICAL above an obvious LOW, does the main review pipeline resist an actual embedded prompt-injection attack. `deduplicate_findings`, `generate_risk_scores`, `validate_review_findings`, and every specialist audit method are pure LLM judgment calls with no deterministic fallback, so these cases call real `CodeReviewAgent` methods against realistic fixture files rather than mocking Gemini — a mocked response would only re-test JSON parsing, which the 166 unit tests above already cover.
+21 scenario-based cases exercising the full pipeline end to end, not individual functions — do the specialist agents actually catch known-bad patterns, does the validator actually reject fabricated findings against clean code, does deduplication actually merge true duplicates without over-merging distinct ones, does risk scoring actually rank an obvious CRITICAL above an obvious LOW, does the main review pipeline resist an actual embedded prompt-injection attack. `deduplicate_findings`, `generate_risk_scores`, `validate_review_findings`, and every specialist audit method are pure LLM judgment calls with no deterministic fallback, so these cases call real `CodeReviewAgent` methods against realistic fixture files rather than mocking Gemini — a mocked response would only re-test JSON parsing, which the 190 unit tests above already cover.
 
 | Category | Cases | Checks |
 |---|---|---|
@@ -696,7 +760,9 @@ code_review_agent/
 │   └── *_spec.md                 # Interface, behavior, error hierarchy, test table
 │
 ├── Tests
-│   └── tests/                    # 166 tests, one file per module, all mocked
+│   └── tests/                    # 190 tests, one file per module, all mocked
+│                                  #   test_server.py additionally exercises
+│                                  #   /remediate via FastAPI's TestClient
 │
 └── Evals
     └── evals/                    # 21 scenario cases: detection, false-positive,

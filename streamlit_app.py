@@ -92,12 +92,21 @@ def _severity_rank(issue: dict) -> int:
 # Result renderers
 # ---------------------------------------------------------------------------
 
-def _render_issues(issues: list[dict]) -> None:
+def _render_issues(issues: list[dict]) -> list[dict]:
+    """Render the issues list with a per-issue "include in fix" checkbox.
+
+    Returns the subset of issues (in the same dict shape /remediate expects
+    for `findings`) whose checkbox is currently checked, so the caller can
+    wire up a single "generate fixes for selected issues" action without
+    this function needing to know anything about repo_url/branch or the
+    remediation endpoint itself.
+    """
     if not issues:
         st.info("No review issues found.")
-        return
+        return []
 
     sorted_issues = sorted(issues, key=_severity_rank)
+    selected: list[dict] = []
 
     for idx, issue in enumerate(sorted_issues, 1):
         sev   = issue.get("severity", "INFO").upper()
@@ -122,6 +131,147 @@ def _render_issues(issues: list[dict]) -> None:
 
             st.markdown("**Suggested fix**")
             st.markdown(issue.get("suggested_fix", ""))
+
+            # Stable-ish key: position + path + line survives reruns
+            # triggered by other widgets (e.g. the remediation button
+            # below), since sort order for the same issue list is stable.
+            checkbox_key = f"remediate_select_{idx}_{path}_{line}"
+            include = st.checkbox("Include in fix generation", key=checkbox_key)
+            if include:
+                selected.append(issue)
+
+    return selected
+
+
+def _render_patch(patch: dict) -> None:
+    """Render a single before/after remediation patch."""
+    path        = patch.get("path", "")
+    line        = patch.get("line")
+    title       = patch.get("title", "")
+    explanation = patch.get("explanation", "")
+    before      = patch.get("before", "")
+    after       = patch.get("after", "")
+    deps        = patch.get("dependencies", []) or []
+    breaking    = patch.get("breaking_change", False)
+    breaking_note = patch.get("breaking_change_note")
+
+    label = f"{path}:{line} — {title}" if line else f"{path} — {title}"
+    with st.expander(label, expanded=True):
+        if explanation:
+            st.markdown(f"**Why this fix:** {explanation}")
+
+        col_before, col_after = st.columns(2)
+        with col_before:
+            st.markdown("**Before**")
+            st.code(before, language="python")
+        with col_after:
+            st.markdown("**After**")
+            st.code(after, language="python")
+
+        if deps:
+            st.caption(f"New dependencies: {', '.join(deps)}")
+        if breaking:
+            st.warning(f"⚠️ Breaking change: {breaking_note or 'callers may need to update.'}")
+
+
+def _render_remediation_result(result: dict) -> None:
+    """Render a /remediate response: summary, any warnings, then each patch."""
+    patches       = result.get("patches", [])
+    summary       = result.get("summary", "")
+    missing_paths = result.get("missing_paths", []) or []
+    schema_errors = result.get("schema_errors", []) or []
+    parse_error   = result.get("parse_error", False)
+
+    if parse_error:
+        st.error("Gemini's remediation response couldn't be parsed as JSON. Try again.")
+        return
+
+    if summary:
+        st.info(summary)
+    if missing_paths:
+        st.warning(
+            "These paths weren't found in the re-fetched repo and were skipped: "
+            + ", ".join(missing_paths)
+        )
+    if schema_errors:
+        st.warning(f"{len(schema_errors)} patch(es) had an unexpected shape and were dropped.")
+
+    if not patches:
+        st.caption("No patches were generated for the selected issues.")
+        return
+
+    for patch in patches:
+        _render_patch(patch)
+
+
+def _render_remediation_section(issues: list[dict], repo_url: str, branch: str) -> None:
+    """"Generate fixes" action: renders the issue checkboxes, a button to
+    request patches for whatever's checked, and the resulting patches.
+
+    Calls POST /remediate — opt-in only, never fired automatically after a
+    review. Results are cached in st.session_state so they survive the
+    rerun that Streamlit triggers on every widget interaction (including
+    ticking another issue's checkbox).
+    """
+    st.subheader("Fix generation")
+    st.caption(
+        "Select the issues you want concrete before/after patches for, then "
+        "generate fixes. This re-fetches the relevant files from GitHub and "
+        "makes one additional Gemini call — nothing here runs automatically."
+    )
+
+    selected = _render_issues(issues)
+
+    button_disabled = not selected
+    button_label = (
+        f"🔧 Generate fixes for {len(selected)} selected issue(s)"
+        if selected else "🔧 Generate fixes for selected issues"
+    )
+
+    if st.button(button_label, disabled=button_disabled, type="primary"):
+        findings = [
+            {
+                "path": i.get("path", ""),
+                "line": i.get("line", 0),
+                "severity": i.get("severity", "MEDIUM"),
+                "title": i.get("title", "Finding"),
+                "description": i.get("description", ""),
+                "suggested_fix": i.get("suggested_fix", ""),
+                "rule_id": i.get("rule_id"),
+            }
+            for i in selected
+        ]
+        with st.spinner("Generating patches…"):
+            try:
+                resp = requests.post(
+                    f"{BASE_URL}/remediate",
+                    json={
+                        "repo_url": repo_url,
+                        "branch": branch,
+                        "findings": findings,
+                    },
+                    timeout=REQUEST_TIMEOUT,
+                )
+                if resp.status_code == 200:
+                    st.session_state["remediation_result"] = resp.json()
+                else:
+                    try:
+                        detail = resp.json().get("detail", resp.text)
+                    except Exception:
+                        detail = resp.text
+                    st.session_state["remediation_result"] = None
+                    st.error(f"Remediation failed ({resp.status_code}): {detail}")
+            except requests.ConnectionError:
+                st.session_state["remediation_result"] = None
+                st.error(f"Cannot reach the review server at `{BASE_URL}`.")
+            except requests.Timeout:
+                st.session_state["remediation_result"] = None
+                st.error("Remediation request timed out on the client side.")
+
+    if st.session_state.get("remediation_result"):
+        st.markdown("---")
+        st.markdown("**Generated patches**")
+        _render_remediation_result(st.session_state["remediation_result"])
 
 
 def _render_scan(scan: dict) -> None:
@@ -159,7 +309,7 @@ def _render_scan(scan: dict) -> None:
                 st.code(snippet, language="python")
 
 
-def _render_results(data: dict) -> None:
+def _render_results(data: dict, repo_url: str, branch: str) -> None:
     review       = data.get("review", {})
     scan         = data.get("scan", {})
     stage_errors = data.get("stage_errors", [])
@@ -187,9 +337,9 @@ def _render_results(data: dict) -> None:
     st.subheader("Summary")
     st.info(review.get("summary") or "No summary returned.")
 
-    # --- Issues ---
+    # --- Issues + remediation ---
     st.subheader(f"Issues ({len(issues)})")
-    _render_issues(issues)
+    _render_remediation_section(issues, repo_url, branch)
 
     # --- Scan details (collapsed by default) ---
     finding_count = len(scan.get("findings", []))
@@ -480,8 +630,21 @@ with tab_review:
                     )
 
                     if resp.status_code == 200:
-                        _render_results(resp.json())
+                        # Stashed in session_state (rather than rendered
+                        # immediately) so the result survives the rerun
+                        # Streamlit triggers on every later widget click —
+                        # e.g. ticking an issue's "include in fix" checkbox
+                        # or clicking "Generate fixes" below.
+                        st.session_state["last_analysis"] = {
+                            "data": resp.json(),
+                            "repo_url": url,
+                            "branch": branch.strip() or "main",
+                        }
+                        # A fresh review invalidates any patches generated
+                        # against a previous one.
+                        st.session_state["remediation_result"] = None
                     else:
+                        st.session_state["last_analysis"] = None
                         try:
                             detail = resp.json().get("detail", resp.text)
                         except Exception:
@@ -497,17 +660,23 @@ with tab_review:
                             st.error(base_msg)
 
                 except requests.ConnectionError:
+                    st.session_state["last_analysis"] = None
                     st.error(
                         f"Cannot reach the review server at `{BASE_URL}`. "
                         f"Make sure it is running:\n\n"
                         f"```\nuvicorn server:app --reload\n```"
                     )
                 except requests.Timeout:
+                    st.session_state["last_analysis"] = None
                     st.error(
                         "The request timed out on the client side. "
                         "The pipeline may still be running on the server. "
                         "Try reducing **max_files** or increase `AGENT_TIMEOUT_S` on the server."
                     )
+
+    last_analysis = st.session_state.get("last_analysis")
+    if last_analysis:
+        _render_results(last_analysis["data"], last_analysis["repo_url"], last_analysis["branch"])
 
 # ---------------------------------------------------------------------------
 # Tab 2 — History

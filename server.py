@@ -4,9 +4,19 @@ server.py
 FastAPI HTTP wrapper around CodeReviewAgent.
 
 The agent is instantiated once at startup from environment variables;
-callers never pass credentials.  The single route POST /analyze runs the
-existing review_repo() pipeline in a thread-pool executor (it is
-synchronous/blocking) and maps its PipelineResult to a JSON response.
+callers never pass credentials. Routes:
+
+  POST /analyze     Runs the full review_repo() pipeline (fetch -> scan ->
+                     review) in a thread-pool executor (synchronous/blocking)
+                     and maps its PipelineResult to a JSON response.
+  POST /remediate    Opt-in only — takes findings from a prior /analyze
+                     response and returns concrete before/after code
+                     patches, via the existing generate_remediation_patches()
+                     tool logic. Re-fetches files from GitHub itself; never
+                     triggered automatically by /analyze.
+  GET  /traces      Reliability/cost stats (cache hit rate, RPD, etc.)
+                     aggregated from traces/trace.jsonl.
+  GET  /health      Liveness check.
 
 Run locally:
     uvicorn server:app --reload           # dev, auto-reload on save
@@ -18,6 +28,13 @@ Example curl:
     curl -s -X POST http://127.0.0.1:8000/analyze \
          -H "Content-Type: application/json" \
          -d '{"repo_url": "https://github.com/octocat/Hello-World"}' | python3 -m json.tool
+
+    curl -s -X POST http://127.0.0.1:8000/remediate \
+         -H "Content-Type: application/json" \
+         -d '{"repo_url": "https://github.com/octocat/Hello-World",
+              "findings": [{"path": "README", "line": 1, "severity": "HIGH",
+                            "title": "example", "description": "...", "suggested_fix": "..."}]}' \
+         | python3 -m json.tool
 """
 
 from __future__ import annotations
@@ -34,7 +51,7 @@ from urllib.parse import urlparse
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Query
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, ValidationError, field_validator
 
 # ---------------------------------------------------------------------------
 # Make sibling modules importable when server.py is the entry point
@@ -76,6 +93,18 @@ _RPD_CAP = 500
 # Pydantic models — request
 # ---------------------------------------------------------------------------
 
+def _validate_github_repo_url(v: str) -> str:
+    """Shared repo_url validation, used by both AnalyzeRequest and
+    RemediateRequest so the two endpoints reject malformed URLs identically."""
+    parsed = urlparse(v)
+    if parsed.scheme not in ("http", "https") or parsed.netloc != "github.com":
+        raise ValueError("repo_url must be a github.com URL (https://github.com/owner/repo)")
+    parts = parsed.path.strip("/").split("/")
+    if len(parts) < 2 or not all(parts[:2]):
+        raise ValueError("repo_url must include owner and repo, e.g. https://github.com/owner/repo")
+    return v
+
+
 class AnalyzeRequest(BaseModel):
     repo_url: str = Field(
         ...,
@@ -93,13 +122,48 @@ class AnalyzeRequest(BaseModel):
     @field_validator("repo_url")
     @classmethod
     def must_be_github_url(cls, v: str) -> str:
-        parsed = urlparse(v)
-        if parsed.scheme not in ("http", "https") or parsed.netloc != "github.com":
-            raise ValueError("repo_url must be a github.com URL (https://github.com/owner/repo)")
-        parts = parsed.path.strip("/").split("/")
-        if len(parts) < 2 or not all(parts[:2]):
-            raise ValueError("repo_url must include owner and repo, e.g. https://github.com/owner/repo")
-        return v
+        return _validate_github_repo_url(v)
+
+
+class FindingIn(BaseModel):
+    """A finding to remediate. Same shape as IssueOut below, so a caller can
+    pass back the exact `review.issues` array from a prior /analyze response
+    (in full, or a hand-picked subset) without reshaping anything."""
+    path: str
+    line: int = 0
+    severity: str = "MEDIUM"
+    title: str = "Finding"
+    description: str = ""
+    suggested_fix: str = ""
+    rule_id: str | None = None
+
+
+class RemediateRequest(BaseModel):
+    repo_url: str = Field(
+        ...,
+        description="Same GitHub repository URL the findings came from",
+        examples=["https://github.com/octocat/Hello-World"],
+    )
+    branch: str = Field(default="main", description="Branch the findings were reviewed against")
+    max_files: int = Field(
+        default=100,
+        ge=1,
+        le=500,
+        description=(
+            "Cap on files re-fetched from GitHub — must be large enough that "
+            "every path referenced in `findings` is actually re-fetched"
+        ),
+    )
+    findings: list[FindingIn] = Field(
+        ...,
+        min_length=1,
+        description="Findings to remediate — typically review.issues (or a subset) from a prior /analyze call",
+    )
+
+    @field_validator("repo_url")
+    @classmethod
+    def must_be_github_url(cls, v: str) -> str:
+        return _validate_github_repo_url(v)
 
 
 # ---------------------------------------------------------------------------
@@ -155,6 +219,27 @@ class AnalyzeResponse(BaseModel):
     review: ReviewOut
     scan: ScanOut
     stage_errors: list[StageErrorOut]
+
+
+class PatchOut(BaseModel):
+    finding_index: int | None = None
+    path: str = ""
+    line: int | None = None
+    title: str = ""
+    before: str = ""
+    after: str = ""
+    explanation: str = ""
+    dependencies: list[str] = []
+    breaking_change: bool = False
+    breaking_change_note: str | None = None
+
+
+class RemediateResponse(BaseModel):
+    patches: list[PatchOut] = []
+    summary: str = ""
+    parse_error: bool = False
+    missing_paths: list[str] = []
+    schema_errors: list[str] = []
 
 
 # ---------------------------------------------------------------------------
@@ -569,3 +654,147 @@ async def analyze(req: AnalyzeRequest) -> AnalyzeResponse:
             for e in result.stage_errors
         ],
     )
+
+
+# ---------------------------------------------------------------------------
+# /remediate — pure helper functions (tested directly, no HTTP needed)
+# ---------------------------------------------------------------------------
+
+def _filter_relevant_files(files: list, requested_paths: set[str]) -> tuple[list, list[str]]:
+    """Filter a re-fetched file list down to just the paths referenced by a
+    remediation request, and report which requested paths weren't found
+    (stale repo_url/branch since the prior /analyze, or max_files too small
+    to include them this time)."""
+    relevant = [f for f in files if f.path in requested_paths]
+    found_paths = {f.path for f in relevant}
+    missing = sorted(requested_paths - found_paths)
+    return relevant, missing
+
+
+def _build_remediate_response(raw_result: dict) -> RemediateResponse:
+    """Convert generate_remediation_patches()'s raw dict into a validated
+    RemediateResponse.
+
+    Mirrors the review pipeline's schema_errors pattern (see ReviewOut):
+    generate_remediation_patches() itself does no schema validation, only a
+    bare json.loads with a {"raw": ..., "parse_error": True} fallback on
+    total failure. A single malformed patch inside an otherwise-valid
+    response is dropped and recorded in schema_errors rather than 500-ing
+    the whole request.
+    """
+    if raw_result.get("parse_error"):
+        return RemediateResponse(
+            patches=[], summary="", parse_error=True,
+            schema_errors=["Gemini response was not valid JSON"],
+        )
+
+    patches: list[PatchOut] = []
+    schema_errors: list[str] = []
+    for i, p in enumerate(raw_result.get("patches", [])):
+        try:
+            patches.append(PatchOut(**p))
+        except ValidationError as exc:
+            schema_errors.append(f"patch {i}: {exc}")
+
+    return RemediateResponse(
+        patches=patches,
+        summary=raw_result.get("summary", ""),
+        parse_error=False,
+        schema_errors=schema_errors,
+    )
+
+
+@app.post("/remediate", response_model=RemediateResponse, tags=["review"])
+async def remediate(req: RemediateRequest) -> RemediateResponse:
+    """
+    Generate concrete before/after code patches for a set of findings.
+
+    Opt-in only, mirroring post_pr_review_tool/create_issue_tool's design —
+    never triggered automatically by /analyze. Re-fetches the repo's files
+    via GitHub using the exact same fetch_python_files() call /analyze
+    itself uses (no new fetch logic), filters down to just the paths
+    referenced in `findings`, then hands both to the existing
+    generate_remediation_patches() tool logic unchanged — this endpoint
+    does not reimplement any patch-generation logic.
+
+    `findings` is typically the exact `review.issues` array from a prior
+    /analyze response for the same repo_url/branch (or a hand-picked
+    subset of it, e.g. only the issues a user checked in the UI).
+
+    Returns 400 if none of the requested findings' paths were found in the
+    re-fetched files. `missing_paths` in a successful response lists any
+    requested paths that weren't found but didn't block the rest.
+    """
+    agent: CodeReviewAgent = app.state.agent
+    loop = asyncio.get_event_loop()
+
+    def _fetch():
+        return agent.fetch_files(req.repo_url, branch=req.branch, max_files=req.max_files)
+
+    try:
+        fetch_result = await asyncio.wait_for(
+            loop.run_in_executor(None, _fetch),
+            timeout=_AGENT_TIMEOUT_S,
+        )
+    except asyncio.TimeoutError:
+        raise HTTPException(
+            status_code=504,
+            detail=f"Fetch timed out after {_AGENT_TIMEOUT_S:.0f}s. "
+                   "Try a smaller max_files value or increase AGENT_TIMEOUT_S.",
+        )
+    except RepoNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=exc.message)
+    except AuthenticationError as exc:
+        raise HTTPException(status_code=401, detail=exc.message)
+    except RateLimitError as exc:
+        raise HTTPException(status_code=429, detail=exc.message)
+    except PayloadTooLargeError as exc:
+        raise HTTPException(status_code=413, detail=exc.message)
+    except GitHubAPIError as exc:
+        raise HTTPException(status_code=502, detail=f"GitHub API error: {exc.message}")
+    except GitHubFetcherError as exc:
+        raise HTTPException(status_code=502, detail=f"GitHub fetch error: {exc.message}")
+    except (AgentError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception as exc:
+        logger.exception("Unexpected error re-fetching files for remediation of %s", req.repo_url)
+        raise HTTPException(status_code=500, detail=f"Internal error: {exc}")
+
+    requested_paths = {f.path for f in req.findings}
+    relevant_files, missing_paths = _filter_relevant_files(fetch_result.files, requested_paths)
+
+    if not relevant_files:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "None of the requested findings' file paths were found in the "
+                f"re-fetched repo: {', '.join(missing_paths)}. Check that repo_url/"
+                "branch match the prior /analyze call, and that max_files is large "
+                "enough to include them."
+            ),
+        )
+
+    findings_dicts = [f.model_dump() for f in req.findings]
+
+    def _remediate():
+        return agent.generate_remediation_patches(findings_dicts, relevant_files)
+
+    try:
+        raw_result = await asyncio.wait_for(
+            loop.run_in_executor(None, _remediate),
+            timeout=_AGENT_TIMEOUT_S,
+        )
+    except asyncio.TimeoutError:
+        raise HTTPException(
+            status_code=504,
+            detail=f"Remediation timed out after {_AGENT_TIMEOUT_S:.0f}s.",
+        )
+    except (AgentError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception as exc:
+        logger.exception("Unexpected error generating remediation patches for %s", req.repo_url)
+        raise HTTPException(status_code=500, detail=f"Internal error: {exc}")
+
+    response = _build_remediate_response(raw_result)
+    response.missing_paths = missing_paths
+    return response
