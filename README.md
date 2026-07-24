@@ -9,7 +9,7 @@
 [![Gemini](https://img.shields.io/badge/Gemini-3.1%20Flash%20Lite-8E24AA?logo=google&logoColor=white)](https://ai.google.dev)
 [![FastAPI](https://img.shields.io/badge/FastAPI-0.115-009688?logo=fastapi&logoColor=white)](https://fastapi.tiangolo.com)
 [![Streamlit](https://img.shields.io/badge/Streamlit-1.45-FF4B4B?logo=streamlit&logoColor=white)](https://streamlit.io)
-[![Tests](https://img.shields.io/badge/tests-190%20passing-22c55e?logo=pytest&logoColor=white)](./tests)
+[![Tests](https://img.shields.io/badge/tests-223%20passing-22c55e?logo=pytest&logoColor=white)](./tests)
 [![Evals](https://img.shields.io/badge/evals-21%20scenarios-8E24AA?logo=checkmarx&logoColor=white)](./evals)
 [![CI](https://github.com/Bardiyashavandi/code_review_agent/actions/workflows/ci.yml/badge.svg)](https://github.com/Bardiyashavandi/code_review_agent/actions/workflows/ci.yml)
 [![Agents](https://img.shields.io/badge/agents-29-blueviolet)](#multi-agent-architecture)
@@ -90,7 +90,7 @@ flowchart TD
         Crypto["🔐 crypto_agent\nMD5 · ECB · predictable random · hardcoded keys"]
         Sec2["🔓 secrets_agent\nAPI keys · passwords · private keys"]
         DF["🌊 data_flow_agent\ntaint analysis: source → sink"]
-        Qual["📐 quality_agent\ncode quality + best practices"]
+        Qual["📐 quality_agent\ncode quality + best practices\n(RAG-grounded in this repo's own conventions)"]
         Cx["🧮 complexity_agent\ncyclomatic · nesting · god classes"]
         Test["🧪 test_agent\ncoverage gaps · missing edge cases"]
         Doc["📝 doc_agent\ndocstrings · type hints · TODO debt"]
@@ -106,6 +106,17 @@ flowchart TD
         CWE["🏷️ cwe_agent\nmap findings to CWE Top 25"]
     end
 
+    subgraph Infra["Shared review infrastructure — not agents, underlies every LLM call above"]
+        Cache["💾 Exact + semantic cache\ngemini-embedding-001, process-lifetime"]
+        Guard["🛡️ Output validation\nstrict Pydantic schema, extra=forbid"]
+        RAGNode["📚 RAG project context\nREADME/CONTRIBUTING + past PR comments,\nindexed once per repo"]
+    end
+
+    subgraph External["External entry points — reuse this graph's tools, not a parallel implementation"]
+        RemediateAPI["🔧 POST /remediate\nopt-in before/after patches"]
+        EvalSuite["✅ Eval suite (21 cases)\nscores real judgment, not mocks"]
+    end
+
     Root --> Planner & Context & Scout & PR & Report & Dedup & Risk & Remed
     Planner --> SecCoord & QualCoord & IntelCoord
     SecCoord --> SAST & Inj & Auth & Crypto & Sec2 & DF
@@ -114,19 +125,26 @@ flowchart TD
     SAST --> Val
     DF --> TVal
     Comp --> OWASP & CWE
+    Qual -.-> RAGNode
+    RemediateAPI -.-> Remed
+    EvalSuite -.-> SAST & Qual & Dedup & Risk
 
     classDef root  fill:#1a7340,color:#fff,stroke:#0d5c2e
     classDef l1    fill:#1d3557,color:#fff,stroke:#14253d
     classDef l2    fill:#5c2a2a,color:#fff,stroke:#3d1a1a
     classDef l3    fill:#5c4200,color:#fff,stroke:#3d2c00
     classDef l4    fill:#2a2a5c,color:#fff,stroke:#1a1a3d
+    classDef infra fill:#3d3d00,color:#fff,stroke:#2b2b00
 
     class Root root
     class Planner,Context,Scout,PR,Report,Dedup,Risk,Remed l1
     class SecCoord,QualCoord,IntelCoord l2
     class SAST,Inj,Auth,Crypto,Sec2,DF,Qual,Cx,Test,Doc,Dep,TM,Comp l3
     class Val,TVal,OWASP,CWE l4
+    class Cache,Guard,RAGNode,RemediateAPI,EvalSuite infra
 ```
+
+`Cache` and `Guard` apply to every LLM call in the graph (they live in `gemini_reviewer.py`'s shared `_call_model`), not just the agents they're drawn near — `RAGNode` is currently wired specifically into `quality_agent` (see [Agent roles](#agent-roles) below for why).
 
 ```
 LAYER 0 ─ Root Orchestrator
@@ -150,19 +168,31 @@ LAYER 2 ─ Domain Coordinators (children of planner_agent)
 └──────────────────────┘  └──────────────────────┘  └──────────────────────┘
 
 LAYER 3 ─ Specialists
-Under security_coordinator:         Under quality_coordinator:      Under intel_coordinator:
-  sast_agent      (Semgrep+LLM)       quality_agent   (best practices)  dependency_agent (OSV CVEs)
-  injection_agent (SQL/XSS/SSRF)      complexity_agent (cyclomatic)     threat_model_agent (STRIDE)
-  auth_agent      (IDOR/broken auth)   test_agent       (coverage gaps)  compliance_agent (OWASP/CWE)
-  crypto_agent    (weak algorithms)    doc_agent        (docstrings)
-  secrets_agent   (hardcoded creds)
-  data_flow_agent (taint analysis)
+Under security_coordinator:         Under quality_coordinator:               Under intel_coordinator:
+  sast_agent      (Semgrep+LLM)       quality_agent (best practices,           dependency_agent (OSV CVEs)
+  injection_agent (SQL/XSS/SSRF)                     RAG-grounded in this      threat_model_agent (STRIDE)
+  auth_agent      (IDOR/broken auth)                 repo's own conventions)   compliance_agent (OWASP/CWE)
+  crypto_agent    (weak algorithms)   complexity_agent (cyclomatic)
+  secrets_agent   (hardcoded creds)   test_agent       (coverage gaps)
+  data_flow_agent (taint analysis)    doc_agent        (docstrings)
 
 LAYER 4 ─ Sub-Specialists (innermost)
   validator_agent       ← child of sast_agent       (false-positive filter)
   taint_validator_agent ← child of data_flow_agent  (confirms path reachability)
   owasp_agent           ← child of compliance_agent (OWASP Top 10 2021 mapping)
   cwe_agent             ← child of compliance_agent (CWE Top 25 mapping)
+
+SHARED REVIEW INFRASTRUCTURE ─ not agents, underlies every LLM call above
+  exact + semantic response cache  (gemini_reviewer.py, gemini-embedding-001)
+  strict Pydantic output validation (extra="forbid", malformed responses rejected loudly)
+  RAG project context               (README/CONTRIBUTING/lint config + past PR
+                                      comments, indexed once per repo — wired
+                                      into quality_agent's generate_review_tool
+                                      call and into the main review_repo() pipeline)
+
+EXTERNAL ENTRY POINTS ─ reuse this graph's tools, not a parallel implementation
+  POST /remediate   (opt-in before/after patches, via remediation_agent's own tool logic)
+  eval suite         (21 scenario cases scoring real judgment against real Gemini calls)
 ```
 
 ### Agent roles
@@ -204,7 +234,7 @@ LAYER 4 ─ Sub-Specialists (innermost)
 | `crypto_agent` | Security | Weak hashing, ECB mode, predictable randomness, hardcoded keys, disabled TLS | `fetch_repo_files_tool`, `crypto_audit_tool` |
 | `secrets_agent` | Security | Hardcoded API keys, passwords, private keys, JWT signing secrets | `fetch_repo_files_tool`, `secrets_audit_tool`, `search_code_in_files_tool` |
 | `data_flow_agent` | Security | Taint analysis — traces input sources to dangerous sinks | `fetch_repo_files_tool`, `data_flow_tool` |
-| `quality_agent` | Quality | Code quality, readability, Python best practices | `fetch_repo_files_tool`, `generate_review_tool`, `search_code_in_files_tool` |
+| `quality_agent` | Quality | Code quality, readability, Python best practices — grounded in this repo's own README/CONTRIBUTING/lint config and relevant past PR review comments (RAG), not just generic advice | `fetch_repo_files_tool`, `generate_review_tool`, `search_code_in_files_tool` |
 | `complexity_agent` | Quality | Cyclomatic complexity, nesting depth, god classes, magic numbers | `fetch_repo_files_tool`, `complexity_tool` |
 | `test_agent` | Quality | Test coverage gaps, missing edge cases, untested security-critical paths | `fetch_repo_files_tool`, `test_coverage_tool` |
 | `doc_agent` | Quality | Missing docstrings, type hints, stale comments, TODO debt | `fetch_repo_files_tool`, `doc_quality_tool` |
@@ -261,7 +291,7 @@ All `transfer_to_agent` calls are visible in the ADK Dev UI Traces panel in real
 
 ## Pipeline Internals
 
-Under every agent's tool calls, the same three-stage pipeline runs:
+Under every agent's tool calls, the same four-stage pipeline runs:
 
 ```
   repo URL
@@ -291,6 +321,21 @@ Under every agent's tool calls, the same three-stage pipeline runs:
 └────────┬─────────┘
          │  files + findings
          ▼
+┌──────────────────┐      GitHub REST API + gemini-embedding-001
+│ project_context  │ ──── (github_fetcher + gemini_reviewer)
+│      (RAG)       │
+│  · README/       │
+│    CONTRIBUTING/ │
+│    lint config   │
+│  · past PR       │
+│    review        │
+│    comments,     │
+│    embedded      │
+│  · cached once   │
+│    per repo      │
+└────────┬─────────┘
+         │  ProjectContext
+         ▼
 ┌──────────────────┐      Gemini 3.1 Flash Lite
 │ gemini_reviewer  │ ──── (google-genai SDK)
 │                  │      + gemini-2.5-flash-lite (fallback / light routing)
@@ -299,6 +344,10 @@ Under every agent's tool calls, the same three-stage pipeline runs:
 │  · exact cache,  │
 │    then semantic │
 │    (embeddings)  │
+│  · retrieves top-│
+│    K relevant PR │
+│    comments per  │
+│    batch (RAG)   │
 │  · structured    │
 │    JSON response │
 │  · retry on 429  │
@@ -316,9 +365,25 @@ Under every agent's tool calls, the same three-stage pipeline runs:
 |---|---|---|
 | **Fetch** | `github_fetcher.py` | Walks the repo tree via the GitHub REST API, pulls every `.py` file, strips venv/build noise |
 | **Scan** | `semgrep_runner.py` | Writes files into an isolated sandbox, runs Semgrep, parses findings into typed `Finding` objects |
-| **Review** | `gemini_reviewer.py` | Batches code + findings into prompts, checks an in-memory exact-match cache then a semantic (embedding-similarity) cache, calls Gemini (`gemini-3.1-flash-lite`, falling back once to `gemini-2.5-flash-lite` if retries are exhausted) for a structured, severity-ranked `ReviewReport` |
+| **Project context (RAG)** | `github_fetcher.py` + `gemini_reviewer.py` | Best-effort fetch of the repo's own README/CONTRIBUTING/lint config (always included in full) and its recent PR review comments (embedded once for retrieval) — built once per (repo, branch) and cached for the process's lifetime; see [RAG project context](#rag-project-context) below |
+| **Review** | `gemini_reviewer.py` | Batches code + findings into prompts, checks an in-memory exact-match cache then a semantic (embedding-similarity) cache, retrieves the most relevant past PR comments for each batch, calls Gemini (`gemini-3.1-flash-lite`, falling back once to `gemini-2.5-flash-lite` if retries are exhausted) for a structured, severity-ranked `ReviewReport` |
 
-Only a fetch failure is fatal — there's nothing to review without files. Semgrep or Gemini failures are captured as non-fatal `StageError` entries so the pipeline always returns a usable, possibly degraded, result.
+Only a fetch failure is fatal — there's nothing to review without files. Semgrep, project-context, or Gemini failures are captured as non-fatal `StageError`/best-effort fallbacks so the pipeline always returns a usable, possibly degraded, result.
+
+### RAG project context
+
+The standout addition this week: reviews can now cite a repo's *own* conventions instead of only generic best practices — "this violates this repo's own naming convention" rather than "consider PEP 8".
+
+**What gets indexed**, once per `(repo, branch)` and cached for the process's lifetime (conventions don't change per-file or even per-review, so re-fetching/re-embedding on every call would be pure waste):
+
+- **Style guide/conventions** — whichever of `README.md`, `CONTRIBUTING.md`, `pyproject.toml`, `setup.cfg`, `.flake8`, `.pylintrc`, or `.editorconfig` actually exist in the repo (most repos won't have all of them — a missing file is the expected common case, not an error). Small enough to always include in full (capped at 8,000 combined characters) — no retrieval needed for this part.
+- **Past PR review comments** — up to the 50 most recent, fetched via a single `GET /repos/{owner}/{repo}/pulls/comments` call (lists comments across every PR, no need to enumerate PR numbers). Each is embedded once with `gemini-embedding-001` (`task_type=RETRIEVAL_DOCUMENT`) — the same model and client already used by the semantic cache, no new dependency.
+
+**Retrieval, per batch:** each batch's code is embedded as a query (`task_type=RETRIEVAL_QUERY`) and ranked by cosine similarity against the indexed comments; only the top 3 most relevant are injected into that batch's prompt. This asymmetric document/query task-type pairing is what Gemini's embedding API recommends for exactly this shape of search — distinct from the semantic cache's `SEMANTIC_SIMILARITY` task type, which is tuned for "are these two prompts near-duplicates" rather than retrieval ranking.
+
+**Where it's wired in:** into `review_repo()` directly (so `/analyze`, the CLI, and the Streamlit UI all benefit) and into `quality_agent`'s `generate_review_tool` call (passing the same `repo_url` it used to fetch files) — `quality_agent` is the intended primary beneficiary since project conventions are most relevant to a style/best-practice lens, but since `generate_review_tool` is shared, `sast_agent` and `pr_agent` can pick up the same grounding too if they pass a `repo_url`.
+
+**Failure handling:** every step is best-effort — a private repo, a brand-new repo with no PR history, or a transient GitHub/embedding error results in an empty `ProjectContext` (a review with no project-specific grounding), never a failed review. Both the convention-doc text and the past-PR-comment sections in the prompt are explicitly labeled untrusted data in the system instruction, extending this project's existing prompt-injection defense to these new context sources.
 
 ---
 
@@ -678,9 +743,11 @@ Every layer of the stack has explicit security decisions:
 pytest -v
 ```
 
-190 tests across all modules. Every external dependency — GitHub API, Semgrep subprocess, Gemini SDK (including `embed_content`) — is mocked, so the full suite runs in a few seconds with no network access or credentials required. These tests check plumbing: batching, JSON parsing, retries, exact-match and semantic caching (hits, misses, per-system-instruction scoping, threshold behavior, embedding-failure fallback), error handling, size caps, schema validation. They do not check whether the pipeline's judgment is actually good — that's what the eval suite below is for.
+223 tests across all modules. Every external dependency — GitHub API, Semgrep subprocess, Gemini SDK (including `embed_content`) — is mocked, so the full suite runs in a few seconds with no network access or credentials required. These tests check plumbing: batching, JSON parsing, retries, exact-match and semantic caching (hits, misses, per-system-instruction scoping, threshold behavior, embedding-failure fallback), error handling, size caps, schema validation. They do not check whether the pipeline's judgment is actually good — that's what the eval suite below is for.
 
 `tests/test_server.py` additionally tests `/remediate` at the HTTP route level with FastAPI's `TestClient` — request validation, status codes, file-filtering, and malformed-patch handling — rather than only the pure aggregation functions `tests/test_server_traces.py` covers for `/traces`. `TestClient(app)` is constructed without entering it as a context manager, so the real `lifespan` (which needs a working Semgrep binary and real credentials) never runs; `app.state.agent` is swapped for a mock instead.
+
+RAG project-context coverage spans all three layers: `tests/test_github_fetcher.py` covers `fetch_convention_files`/`fetch_recent_review_comments` (missing files, oversized files, no PR history, API failures — all best-effort, never raising), `tests/test_gemini_reviewer.py` covers comment embedding and top-K retrieval (including that `review()` with no `project_context` produces byte-identical prompts to before this feature existed), and `tests/test_agent.py` covers `build_project_context`'s per-`(repo, branch)` caching and its wiring into both `review_repo()` and `generate_review()`.
 
 ---
 
@@ -691,7 +758,7 @@ cd evals
 python3 runner.py --mode live   # needs GEMINI_API_KEY; ~19 real Gemini calls
 ```
 
-21 scenario-based cases exercising the full pipeline end to end, not individual functions — do the specialist agents actually catch known-bad patterns, does the validator actually reject fabricated findings against clean code, does deduplication actually merge true duplicates without over-merging distinct ones, does risk scoring actually rank an obvious CRITICAL above an obvious LOW, does the main review pipeline resist an actual embedded prompt-injection attack. `deduplicate_findings`, `generate_risk_scores`, `validate_review_findings`, and every specialist audit method are pure LLM judgment calls with no deterministic fallback, so these cases call real `CodeReviewAgent` methods against realistic fixture files rather than mocking Gemini — a mocked response would only re-test JSON parsing, which the 190 unit tests above already cover.
+21 scenario-based cases exercising the full pipeline end to end, not individual functions — do the specialist agents actually catch known-bad patterns, does the validator actually reject fabricated findings against clean code, does deduplication actually merge true duplicates without over-merging distinct ones, does risk scoring actually rank an obvious CRITICAL above an obvious LOW, does the main review pipeline resist an actual embedded prompt-injection attack. `deduplicate_findings`, `generate_risk_scores`, `validate_review_findings`, and every specialist audit method are pure LLM judgment calls with no deterministic fallback, so these cases call real `CodeReviewAgent` methods against realistic fixture files rather than mocking Gemini — a mocked response would only re-test JSON parsing, which the 223 unit tests above already cover.
 
 | Category | Cases | Checks |
 |---|---|---|
@@ -729,8 +796,10 @@ code_review_agent/
 │
 ├── Core pipeline
 │   ├── github_fetcher.py         # Stage 1: fetch Python files via GitHub API
+│   │                             #   + convention files/past PR comments (RAG)
 │   ├── semgrep_runner.py         # Stage 2: run Semgrep, parse findings
-│   ├── gemini_reviewer.py        # Stage 3: LLM review via Gemini 3.1 Flash Lite
+│   ├── gemini_reviewer.py        # Stage 4: LLM review via Gemini 3.1 Flash Lite
+│   │                             #   + exact/semantic cache + RAG retrieval
 │   └── report_generator.py       # Render PipelineResult → Markdown
 │
 ├── Orchestration
@@ -748,7 +817,7 @@ code_review_agent/
 │
 ├── Entry points
 │   ├── main.py                   # CLI: python3 main.py <url>
-│   ├── server.py                 # HTTP API: FastAPI, POST /analyze
+│   ├── server.py                 # HTTP API: FastAPI, POST /analyze + /remediate
 │   ├── streamlit_app.py          # Browser UI: calls server.py over HTTP
 │   └── adk_demo.py               # Standalone ADK tool-calling demo
 │
@@ -760,7 +829,7 @@ code_review_agent/
 │   └── *_spec.md                 # Interface, behavior, error hierarchy, test table
 │
 ├── Tests
-│   └── tests/                    # 190 tests, one file per module, all mocked
+│   └── tests/                    # 223 tests, one file per module, all mocked
 │                                  #   test_server.py additionally exercises
 │                                  #   /remediate via FastAPI's TestClient
 │
@@ -792,6 +861,8 @@ code_review_agent/
 **Genuine multi-agent architecture.** Twenty-nine agents across five layers — root orchestrator, eight strategic agents (planner, context analyzer, scout, PR reviewer, reporter, deduplicator, risk scorer, remediation), three domain coordinators (security, quality, intel), thirteen specialists (SAST, injection, auth, crypto, secrets, data flow, quality, complexity, test coverage, documentation, dependency CVE, threat model, compliance), and four sub-specialists (findings validator, taint validator, OWASP mapper, CWE mapper). Each has a narrow role, focused instructions, and only the tools it actually needs. Agent-to-agent transfers are explicit and visible in the ADK playground. A dedicated `pr_agent` reviews only the changed files in a Pull Request and can post its findings as **inline comments directly on the GitHub PR**. The `dependency_agent` queries the free [OSV](https://osv.dev) database for known CVEs in pinned dependencies. The `data_flow_agent` traces untrusted input from entry points through to dangerous sinks, with the `taint_validator_agent` confirming path reachability. The `compliance_agent` delegates to `owasp_agent` and `cwe_agent` to map every finding to OWASP Top 10 2021 and CWE Top 25. The `risk_scorer_agent` quantifies findings with a CVSS-like composite score; the `remediation_agent` produces copy-pasteable before/after code patches.
 
 **Four access surfaces, one pipeline.** The same `CodeReviewAgent` is reachable via CLI (`main.py`), HTTP API (`server.py`/FastAPI), browser chat (`adk web`/ADK Dev UI), and a visual web UI (`streamlit_app.py`/Streamlit) — without duplicating any logic.
+
+**Project-aware RAG, not just generic advice.** Before reviewing, the pipeline indexes a repo's own README/CONTRIBUTING/lint config plus its past PR review comments (embedded once with `gemini-embedding-001` — the same model and client already powering the semantic cache, no new dependency) so findings can cite the project's *own* stated conventions — "this violates this repo's own naming convention" — rather than only generic best practices. Built once per repo and cached for the process's lifetime, since conventions don't change per-file or per-review; every step degrades gracefully (empty context, not a failed review) if a repo has no conventions doc or PR history.
 
 **Full observability.** `tracing.py` emits structured JSON spans (run → stage → LLM call) to `traces/trace.jsonl`. `view_trace.py` renders them as an annotated tree with token counts, retries, and a live Gemini RPD counter.
 

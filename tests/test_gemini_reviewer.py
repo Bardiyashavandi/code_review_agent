@@ -22,6 +22,8 @@ from gemini_reviewer import (
     DEFAULT_MODEL,
     FALLBACK_MODEL,
     MAX_RETRIES,
+    RAG_DOCUMENT_TASK_TYPE,
+    RAG_QUERY_TASK_TYPE,
     SEMANTIC_CACHE_MODEL,
     SYSTEM_INSTRUCTION,
     GeminiAPIError,
@@ -29,6 +31,7 @@ from gemini_reviewer import (
     GeminiRateLimitError,
     GeminiResponseValidationError,
     GeminiReviewer,
+    ProjectContext,
     ReviewReport,
 )
 
@@ -703,3 +706,185 @@ class TestPromptSafety:
 
         # The string is stored verbatim as data — never executed.
         assert report.issues[0].title == malicious_title
+
+
+# ---------------------------------------------------------------------------
+# 7. Project-context RAG
+# ---------------------------------------------------------------------------
+
+class TestEmbedReviewComments:
+
+    def test_embeds_each_comment_with_document_task_type(self):
+        reviewer, mock_client = make_reviewer()
+        mock_client.models.embed_content.return_value = embedding_response(NEAR_DUPLICATE_VECTOR_A)
+        comments = [
+            {"body": "Please use snake_case.", "path": "a.py", "line": 1},
+            {"body": "Missing docstring.", "path": "b.py", "line": 2},
+        ]
+
+        indexed = reviewer.embed_review_comments(comments)
+
+        assert len(indexed) == 2
+        assert mock_client.models.embed_content.call_count == 2
+        for call in mock_client.models.embed_content.call_args_list:
+            assert call.kwargs["config"].task_type == RAG_DOCUMENT_TASK_TYPE
+        # Each entry pairs the embedding with its original comment dict.
+        vector, comment = indexed[0]
+        assert vector == NEAR_DUPLICATE_VECTOR_A
+        assert comment == comments[0]
+
+    def test_comment_with_empty_body_skipped(self):
+        reviewer, mock_client = make_reviewer()
+        mock_client.models.embed_content.return_value = embedding_response(NEAR_DUPLICATE_VECTOR_A)
+        comments = [{"body": "", "path": "a.py", "line": 1}]
+
+        indexed = reviewer.embed_review_comments(comments)
+
+        assert indexed == []
+        mock_client.models.embed_content.assert_not_called()
+
+    def test_embedding_failure_on_one_comment_does_not_drop_others(self):
+        reviewer, mock_client = make_reviewer()
+        mock_client.models.embed_content.side_effect = [
+            Exception("transient failure"),
+            embedding_response(NEAR_DUPLICATE_VECTOR_A),
+        ]
+        comments = [
+            {"body": "first comment", "path": "a.py", "line": 1},
+            {"body": "second comment", "path": "b.py", "line": 2},
+        ]
+
+        indexed = reviewer.embed_review_comments(comments)
+
+        assert len(indexed) == 1
+        assert indexed[0][1]["body"] == "second comment"
+
+
+class TestRetrieveRelevantComments:
+
+    def test_empty_index_returns_empty_list_without_embedding(self):
+        reviewer, mock_client = make_reviewer()
+
+        result = reviewer.retrieve_relevant_comments("some batch content", [])
+
+        assert result == []
+        mock_client.models.embed_content.assert_not_called()
+
+    def test_returns_top_k_most_similar_comments(self):
+        reviewer, mock_client = make_reviewer()
+        comment_a = {"body": "closely related feedback", "path": "a.py", "line": 1}
+        comment_b = {"body": "unrelated feedback", "path": "b.py", "line": 2}
+        comment_index = [
+            (NEAR_DUPLICATE_VECTOR_A, comment_a),
+            (DISSIMILAR_VECTOR, comment_b),
+        ]
+        mock_client.models.embed_content.return_value = embedding_response(NEAR_DUPLICATE_VECTOR_B)
+
+        result = reviewer.retrieve_relevant_comments("batch content", comment_index, top_k=1)
+
+        assert len(result) == 1
+        assert result[0] == comment_a  # closer cosine similarity to the query
+
+    def test_query_embedded_with_query_task_type(self):
+        reviewer, mock_client = make_reviewer()
+        comment_index = [(NEAR_DUPLICATE_VECTOR_A, {"body": "x", "path": "a.py", "line": 1})]
+        mock_client.models.embed_content.return_value = embedding_response(NEAR_DUPLICATE_VECTOR_B)
+
+        reviewer.retrieve_relevant_comments("batch content", comment_index)
+
+        call = mock_client.models.embed_content.call_args
+        assert call.kwargs["config"].task_type == RAG_QUERY_TASK_TYPE
+
+    def test_query_embedding_failure_returns_empty_list(self):
+        reviewer, mock_client = make_reviewer()
+        comment_index = [(NEAR_DUPLICATE_VECTOR_A, {"body": "x", "path": "a.py", "line": 1})]
+        mock_client.models.embed_content.side_effect = Exception("boom")
+
+        result = reviewer.retrieve_relevant_comments("batch content", comment_index)
+
+        assert result == []
+
+    def test_respects_top_k_smaller_than_index(self):
+        reviewer, mock_client = make_reviewer()
+        comment_index = [
+            (NEAR_DUPLICATE_VECTOR_A, {"body": f"c{i}", "path": "a.py", "line": i})
+            for i in range(5)
+        ]
+        mock_client.models.embed_content.return_value = embedding_response(NEAR_DUPLICATE_VECTOR_A)
+
+        result = reviewer.retrieve_relevant_comments("batch content", comment_index, top_k=2)
+
+        assert len(result) == 2
+
+
+class TestReviewWithProjectContext:
+
+    def test_no_project_context_produces_identical_prompt_to_before(self):
+        # Backward-compatibility guarantee: review() with no project_context
+        # arg (or None) must build the exact same prompt as pre-RAG code.
+        reviewer, mock_client = make_reviewer()
+        mock_client.models.generate_content.return_value = response_text(summary="ok")
+        files = [make_file("a.py", "x = 1\n")]
+
+        reviewer.review(files, make_scan_report())
+
+        prompt = mock_client.models.generate_content.call_args.kwargs["contents"]
+        assert "Project conventions" not in prompt
+        assert "Relevant past review feedback" not in prompt
+
+    def test_empty_project_context_produces_identical_prompt(self):
+        reviewer, mock_client = make_reviewer()
+        mock_client.models.generate_content.return_value = response_text(summary="ok")
+        files = [make_file("a.py", "x = 1\n")]
+
+        reviewer.review(files, make_scan_report(), project_context=ProjectContext())
+
+        prompt = mock_client.models.generate_content.call_args.kwargs["contents"]
+        assert "Project conventions" not in prompt
+
+    def test_conventions_text_injected_into_prompt(self):
+        reviewer, mock_client = make_reviewer()
+        mock_client.models.generate_content.return_value = response_text(summary="ok")
+        files = [make_file("a.py", "x = 1\n")]
+        context = ProjectContext(conventions_text="Use snake_case for all functions.")
+
+        reviewer.review(files, make_scan_report(), project_context=context)
+
+        prompt = mock_client.models.generate_content.call_args.kwargs["contents"]
+        assert "Project conventions" in prompt
+        assert "Use snake_case for all functions." in prompt
+
+    def test_relevant_comments_retrieved_and_injected_per_batch(self):
+        reviewer, mock_client = make_reviewer()
+        mock_client.models.generate_content.return_value = response_text(summary="ok")
+        mock_client.models.embed_content.return_value = embedding_response(NEAR_DUPLICATE_VECTOR_B)
+        files = [make_file("a.py", "x = 1\n")]
+        comment = {"body": "We always validate input at the boundary here.", "path": "a.py", "line": 1}
+        context = ProjectContext(comment_index=[(NEAR_DUPLICATE_VECTOR_A, comment)])
+
+        reviewer.review(files, make_scan_report(), project_context=context)
+
+        prompt = mock_client.models.generate_content.call_args.kwargs["contents"]
+        assert "Relevant past review feedback" in prompt
+        assert "We always validate input at the boundary here." in prompt
+
+    def test_no_retrieval_embedding_call_when_comment_index_is_empty(self):
+        # conventions_text alone (no past comments indexed) must not trigger
+        # a RAG retrieval embedding call — nothing to retrieve against. Note
+        # _call_model's own semantic cache still makes its own store-side
+        # embed call (SEMANTIC_SIMILARITY) after every real generate_content
+        # call, independent of RAG — that's pre-existing, unrelated
+        # behavior, so this asserts no RAG_QUERY_TASK_TYPE call happened
+        # rather than asserting zero embed_content calls overall.
+        reviewer, mock_client = make_reviewer()
+        mock_client.models.generate_content.return_value = response_text(summary="ok")
+        files = [make_file("a.py", "x = 1\n")]
+        context = ProjectContext(conventions_text="Some conventions.")
+
+        reviewer.review(files, make_scan_report(), project_context=context)
+
+        task_types = [
+            call.kwargs["config"].task_type
+            for call in mock_client.models.embed_content.call_args_list
+        ]
+        assert RAG_QUERY_TASK_TYPE not in task_types

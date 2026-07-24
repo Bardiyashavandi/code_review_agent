@@ -32,7 +32,7 @@ from agent import (
     make_scan_code_tool,
     make_search_code_tool,
 )
-from gemini_reviewer import GeminiRateLimitError
+from gemini_reviewer import RAG_MAX_CONVENTIONS_CHARS, GeminiRateLimitError
 from semgrep_runner import SemgrepExecutionError
 
 # ---------------------------------------------------------------------------
@@ -262,10 +262,126 @@ class TestGranularEntryPoints:
         scan_report = make_scan_report()
         result = agent.generate_review(files, scan_report)
 
-        mock_reviewer.review.assert_called_once_with(files, scan_report)
+        # project_context=None is the default no-op case — no repo_url was
+        # given, so no project-context lookup/build happens either.
+        mock_reviewer.review.assert_called_once_with(files, scan_report, project_context=None)
         mock_fetcher.fetch_python_files.assert_not_called()
         mock_semgrep.scan.assert_not_called()
         assert result is mock_reviewer.review.return_value
+
+
+# ---------------------------------------------------------------------------
+# 4c. build_project_context (RAG project-context indexing + caching)
+# ---------------------------------------------------------------------------
+
+class TestBuildProjectContext:
+
+    def test_builds_context_from_conventions_and_comments(self):
+        agent, mock_fetcher, _, mock_reviewer = make_agent()
+        mock_fetcher.fetch_convention_files.return_value = {"README.md": "Use snake_case."}
+        mock_fetcher.fetch_recent_review_comments.return_value = [
+            {"body": "Please add a docstring.", "path": "a.py", "line": 1},
+        ]
+        indexed = [([1.0, 0.0], {"body": "Please add a docstring.", "path": "a.py", "line": 1})]
+        mock_reviewer.embed_review_comments.return_value = indexed
+
+        context = agent.build_project_context("https://github.com/owner/repo")
+
+        assert context.conventions_text == "### README.md\nUse snake_case."
+        assert context.comment_index == indexed
+        assert "README.md" in context.sources
+        assert any("past_pr_comments" in s for s in context.sources)
+
+    def test_no_conventions_or_comments_gives_empty_context(self):
+        agent, mock_fetcher, _, mock_reviewer = make_agent()
+        mock_fetcher.fetch_convention_files.return_value = {}
+        mock_fetcher.fetch_recent_review_comments.return_value = []
+
+        context = agent.build_project_context("https://github.com/owner/repo")
+
+        assert context.is_empty
+        mock_reviewer.embed_review_comments.assert_not_called()
+
+    def test_second_call_for_same_repo_and_branch_is_cached(self):
+        agent, mock_fetcher, _, mock_reviewer = make_agent()
+        mock_fetcher.fetch_convention_files.return_value = {"README.md": "conventions"}
+        mock_fetcher.fetch_recent_review_comments.return_value = []
+
+        context1 = agent.build_project_context("https://github.com/owner/repo", branch="main")
+        context2 = agent.build_project_context("https://github.com/owner/repo", branch="main")
+
+        assert context1 is context2
+        mock_fetcher.fetch_convention_files.assert_called_once()
+        mock_fetcher.fetch_recent_review_comments.assert_called_once()
+
+    def test_different_branch_is_a_cache_miss(self):
+        agent, mock_fetcher, _, mock_reviewer = make_agent()
+        mock_fetcher.fetch_convention_files.return_value = {}
+        mock_fetcher.fetch_recent_review_comments.return_value = []
+
+        agent.build_project_context("https://github.com/owner/repo", branch="main")
+        agent.build_project_context("https://github.com/owner/repo", branch="develop")
+
+        assert mock_fetcher.fetch_convention_files.call_count == 2
+
+    def test_different_repo_is_a_cache_miss(self):
+        agent, mock_fetcher, _, mock_reviewer = make_agent()
+        mock_fetcher.fetch_convention_files.return_value = {}
+        mock_fetcher.fetch_recent_review_comments.return_value = []
+
+        agent.build_project_context("https://github.com/owner/repo-a")
+        agent.build_project_context("https://github.com/owner/repo-b")
+
+        assert mock_fetcher.fetch_convention_files.call_count == 2
+
+    def test_fetch_failure_returns_empty_context_not_raised(self):
+        agent, mock_fetcher, _, mock_reviewer = make_agent()
+        mock_fetcher.fetch_convention_files.side_effect = RuntimeError("network blip")
+
+        context = agent.build_project_context("https://github.com/owner/repo")
+
+        assert context.is_empty
+
+    def test_conventions_text_truncated_to_cap(self):
+        agent, mock_fetcher, _, mock_reviewer = make_agent()
+        huge_readme = "x" * 20_000
+        mock_fetcher.fetch_convention_files.return_value = {"README.md": huge_readme}
+        mock_fetcher.fetch_recent_review_comments.return_value = []
+
+        context = agent.build_project_context("https://github.com/owner/repo")
+
+        assert len(context.conventions_text) == RAG_MAX_CONVENTIONS_CHARS
+
+    def test_review_repo_passes_built_context_to_reviewer(self):
+        agent, mock_fetcher, _, mock_reviewer = make_agent()
+        mock_fetcher.fetch_convention_files.return_value = {"README.md": "conventions"}
+        mock_fetcher.fetch_recent_review_comments.return_value = []
+
+        agent.review_repo("https://github.com/owner/repo")
+
+        _, _, kwargs = mock_reviewer.review.mock_calls[0]
+        assert kwargs["project_context"].conventions_text == "### README.md\nconventions"
+
+    def test_generate_review_with_repo_url_builds_and_passes_context(self):
+        agent, mock_fetcher, _, mock_reviewer = make_agent()
+        mock_fetcher.fetch_convention_files.return_value = {"README.md": "conventions"}
+        mock_fetcher.fetch_recent_review_comments.return_value = []
+        files = [SimpleNamespace(path="a.py", content="x = 1\n")]
+
+        agent.generate_review(files, make_scan_report(), repo_url="https://github.com/owner/repo")
+
+        mock_fetcher.fetch_convention_files.assert_called_once()
+        _, _, kwargs = mock_reviewer.review.mock_calls[0]
+        assert kwargs["project_context"].conventions_text == "### README.md\nconventions"
+
+    def test_generate_review_without_repo_url_skips_context_building(self):
+        agent, mock_fetcher, _, mock_reviewer = make_agent()
+        files = [SimpleNamespace(path="a.py", content="x = 1\n")]
+
+        agent.generate_review(files, make_scan_report())
+
+        mock_fetcher.fetch_convention_files.assert_not_called()
+        mock_fetcher.fetch_recent_review_comments.assert_not_called()
 
 
 class TestGranularAdkTools:

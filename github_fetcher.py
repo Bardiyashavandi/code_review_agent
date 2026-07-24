@@ -126,6 +126,28 @@ DEFAULT_MAX_TOTAL_BYTES = 2_000_000
 DEFAULT_TIMEOUT = 10
 MAX_RETRIES = 3
 
+# Candidate files checked by fetch_convention_files() — a repo's own style
+# guide/conventions, if it has one. Most repos won't have all of these; a
+# missing file is the expected common case, not an error (see the 404
+# handling in fetch_convention_files itself).
+CONVENTION_FILENAMES = (
+    "README.md", "README.rst", "README",
+    "CONTRIBUTING.md", "CONTRIBUTING.rst", "CONTRIBUTING",
+    "pyproject.toml", "setup.cfg", ".flake8", ".pylintrc", ".editorconfig",
+)
+
+# Skip an individual convention file if it's implausibly large (e.g. a huge
+# generated README) — this is grounding context for a prompt, not the
+# subject of the review, so it doesn't need fetch_python_files' full
+# size-cap machinery, just a simple sanity ceiling.
+MAX_CONVENTION_FILE_BYTES = 20_000
+
+# Cap on how many past PR review comments fetch_recent_review_comments()
+# will return. This is enrichment, not a core capability — bounded to keep
+# the one-time indexing cost (one embedding call per comment) predictable
+# regardless of how long-lived or high-traffic the repo is.
+DEFAULT_MAX_REVIEW_COMMENTS = 50
+
 
 # ---------------------------------------------------------------------------
 # Fetcher
@@ -608,6 +630,97 @@ class GitHubFetcher:
         self._enforce_total_size_cap(files, max_total_bytes)
 
         return FetchResult(files=files, truncated=truncated)
+
+    def fetch_convention_files(self, url: str, branch: str = DEFAULT_BRANCH) -> dict[str, str]:
+        """
+        Best-effort fetch of the repo's own style guide/convention files —
+        README, CONTRIBUTING, and common Python lint configs — so a review
+        can ground findings in the project's own stated conventions rather
+        than only generic best practices.
+
+        Each candidate filename is independent: most repos won't have all
+        of CONVENTION_FILENAMES, so a 404 for any one of them is the
+        expected common case, not an error — it's simply skipped. Returns
+        {filename: content} for whichever files actually exist.
+        """
+        owner, repo = self.parse_repo_url(url)
+        found: dict[str, str] = {}
+
+        for filename in CONVENTION_FILENAMES:
+            try:
+                data = self._get(
+                    f"{self._base_url}/repos/{owner}/{repo}/contents/{filename}?ref={branch}"
+                )
+            except GitHubFetcherError:
+                continue
+
+            if not isinstance(data, dict):
+                continue
+
+            size = data.get("size", 0)
+            if size > MAX_CONVENTION_FILE_BYTES:
+                logger.info(
+                    "Skipping convention file %s — %d bytes exceeds the %d byte cap.",
+                    filename, size, MAX_CONVENTION_FILE_BYTES,
+                )
+                continue
+
+            raw_content = data.get("content", "")
+            try:
+                decoded = base64.b64decode(raw_content).decode("utf-8")
+            except Exception:
+                logger.debug("Could not decode convention file %s — skipping.", filename)
+                continue
+
+            found[filename] = decoded
+
+        return found
+
+    def fetch_recent_review_comments(
+        self, url: str, max_comments: int = DEFAULT_MAX_REVIEW_COMMENTS,
+    ) -> list[dict]:
+        """
+        Best-effort fetch of the repo's most recent PR review comments via
+        GET /repos/{owner}/{repo}/pulls/comments — this lists review
+        comments across ALL pull requests in one call, no need to
+        enumerate individual PR numbers.
+
+        This is enrichment, not a core capability: a brand-new repo with
+        no PR history, a token without sufficient scope, or any other
+        failure here returns an empty list rather than raising — a review
+        should never fail just because this extra context wasn't
+        available. Returns a list of {"body", "path", "line"} dicts, most
+        recent first, capped at max_comments.
+        """
+        owner, repo = self.parse_repo_url(url)
+        try:
+            data = self._get(
+                f"{self._base_url}/repos/{owner}/{repo}/pulls/comments"
+                f"?sort=created&direction=desc&per_page={max_comments}"
+            )
+        except GitHubFetcherError as exc:
+            logger.info(
+                "Could not fetch review comments for %s/%s (%s) — "
+                "continuing without them.", owner, repo, exc.message,
+            )
+            return []
+
+        if not isinstance(data, list):
+            return []
+
+        comments: list[dict] = []
+        for item in data[:max_comments]:
+            if not isinstance(item, dict):
+                continue
+            body = (item.get("body") or "").strip()
+            if not body:
+                continue
+            comments.append({
+                "body": body,
+                "path": item.get("path") or "",
+                "line": item.get("line") or item.get("original_line") or 0,
+            })
+        return comments
 
     # ------------------------------------------------------------------
     # Internal helpers

@@ -597,3 +597,156 @@ class TestContextManager:
             assert fetcher is not None
         # Should not raise; client is closed
         assert fetcher._client.is_closed
+
+
+# ---------------------------------------------------------------------------
+# 10. fetch_convention_files (project-context RAG)
+# ---------------------------------------------------------------------------
+
+class TestFetchConventionFiles:
+
+    def test_finds_files_that_exist(self):
+        readme = "# My Project\n\nUse 4-space indents."
+        routes: dict[str, tuple[int, object]] = {
+            "/contents/README.md": (200, contents_response("README.md", readme)),
+        }
+        fetcher = make_fetcher()
+        fetcher._client = httpx.Client(
+            transport=mock_transport(routes),
+            headers={"Authorization": "Bearer ghp_faketoken123"},
+        )
+        result = fetcher.fetch_convention_files("https://github.com/owner/repo")
+        assert result == {"README.md": readme}
+
+    def test_missing_files_silently_skipped(self):
+        # No routes match anything -> every candidate 404s. Should return
+        # {}, not raise -- most repos won't have all of CONVENTION_FILENAMES.
+        fetcher = make_fetcher()
+        fetcher._client = httpx.Client(
+            transport=mock_transport({}),
+            headers={"Authorization": "Bearer ghp_faketoken123"},
+        )
+        result = fetcher.fetch_convention_files("https://github.com/owner/repo")
+        assert result == {}
+
+    def test_finds_multiple_convention_files(self):
+        readme = "# Project"
+        contributing = "## Contributing\n\nRun black before committing."
+        routes: dict[str, tuple[int, object]] = {
+            "/contents/README.md": (200, contents_response("README.md", readme)),
+            "/contents/CONTRIBUTING.md": (200, contents_response("CONTRIBUTING.md", contributing)),
+        }
+        fetcher = make_fetcher()
+        fetcher._client = httpx.Client(
+            transport=mock_transport(routes),
+            headers={"Authorization": "Bearer ghp_faketoken123"},
+        )
+        result = fetcher.fetch_convention_files("https://github.com/owner/repo")
+        assert result == {"README.md": readme, "CONTRIBUTING.md": contributing}
+
+    def test_oversized_file_skipped(self):
+        huge = "x" * 50_000
+        payload = contents_response("README.md", huge)
+        payload["size"] = 50_000  # exceeds MAX_CONVENTION_FILE_BYTES (20_000)
+        routes: dict[str, tuple[int, object]] = {
+            "/contents/README.md": (200, payload),
+        }
+        fetcher = make_fetcher()
+        fetcher._client = httpx.Client(
+            transport=mock_transport(routes),
+            headers={"Authorization": "Bearer ghp_faketoken123"},
+        )
+        result = fetcher.fetch_convention_files("https://github.com/owner/repo")
+        assert result == {}
+
+    def test_invalid_base64_skipped_not_raised(self):
+        bad_payload = {
+            "path": "README.md", "sha": "abc", "size": 10,
+            "content": "@@@NOT_VALID_BASE64@@@", "encoding": "base64",
+        }
+        routes: dict[str, tuple[int, object]] = {
+            "/contents/README.md": (200, bad_payload),
+        }
+        fetcher = make_fetcher()
+        fetcher._client = httpx.Client(
+            transport=mock_transport(routes),
+            headers={"Authorization": "Bearer ghp_faketoken123"},
+        )
+        result = fetcher.fetch_convention_files("https://github.com/owner/repo")
+        assert result == {}
+
+
+# ---------------------------------------------------------------------------
+# 11. fetch_recent_review_comments (project-context RAG)
+# ---------------------------------------------------------------------------
+
+def comments_transport(comments: list[dict] | None, status: int = 200) -> httpx.MockTransport:
+    """Build a MockTransport that returns `comments` (a JSON array, as the
+    real /pulls/comments endpoint does) for any /pulls/comments request."""
+    def handler(request: httpx.Request) -> httpx.Response:
+        if "/pulls/comments" in str(request.url):
+            return httpx.Response(status_code=status, json=comments if comments is not None else [])
+        return httpx.Response(404, json={"message": "Not Found"})
+    return httpx.MockTransport(handler)
+
+
+class TestFetchRecentReviewComments:
+
+    def test_returns_comment_bodies_and_locations(self):
+        comments = [
+            {"body": "Please use snake_case here.", "path": "app.py", "line": 12},
+            {"body": "Missing docstring.", "path": "utils.py", "line": 5},
+        ]
+        fetcher = make_fetcher()
+        fetcher._client = httpx.Client(
+            transport=comments_transport(comments),
+            headers={"Authorization": "Bearer ghp_faketoken123"},
+        )
+        result = fetcher.fetch_recent_review_comments("https://github.com/owner/repo")
+        assert len(result) == 2
+        assert result[0]["body"] == "Please use snake_case here."
+        assert result[0]["path"] == "app.py"
+        assert result[0]["line"] == 12
+
+    def test_no_pr_history_returns_empty_list(self):
+        fetcher = make_fetcher()
+        fetcher._client = httpx.Client(
+            transport=comments_transport([]),
+            headers={"Authorization": "Bearer ghp_faketoken123"},
+        )
+        result = fetcher.fetch_recent_review_comments("https://github.com/owner/repo")
+        assert result == []
+
+    def test_api_failure_returns_empty_list_not_raised(self):
+        fetcher = make_fetcher()
+        fetcher._client = httpx.Client(
+            transport=comments_transport(None, status=403),
+            headers={"Authorization": "Bearer ghp_faketoken123"},
+        )
+        result = fetcher.fetch_recent_review_comments("https://github.com/owner/repo")
+        assert result == []
+
+    def test_respects_max_comments_cap(self):
+        comments = [{"body": f"comment {i}", "path": "a.py", "line": i} for i in range(10)]
+        fetcher = make_fetcher()
+        fetcher._client = httpx.Client(
+            transport=comments_transport(comments),
+            headers={"Authorization": "Bearer ghp_faketoken123"},
+        )
+        result = fetcher.fetch_recent_review_comments("https://github.com/owner/repo", max_comments=3)
+        assert len(result) == 3
+
+    def test_comments_with_empty_body_skipped(self):
+        comments = [
+            {"body": "", "path": "a.py", "line": 1},
+            {"body": "   ", "path": "a.py", "line": 2},
+            {"body": "actual feedback", "path": "a.py", "line": 3},
+        ]
+        fetcher = make_fetcher()
+        fetcher._client = httpx.Client(
+            transport=comments_transport(comments),
+            headers={"Authorization": "Bearer ghp_faketoken123"},
+        )
+        result = fetcher.fetch_recent_review_comments("https://github.com/owner/repo")
+        assert len(result) == 1
+        assert result[0]["body"] == "actual feedback"

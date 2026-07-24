@@ -46,7 +46,14 @@ from google.adk.tools import FunctionTool
 import report_generator
 import tracing
 from dependency_scanner import scan_dependencies
-from gemini_reviewer import GeminiReviewer, GeminiReviewerError, ReviewIssue, ReviewReport
+from gemini_reviewer import (
+    RAG_MAX_CONVENTIONS_CHARS,
+    GeminiReviewer,
+    GeminiReviewerError,
+    ProjectContext,
+    ReviewIssue,
+    ReviewReport,
+)
 from github_fetcher import FetchResult, FileResult, GitHubFetcher
 from semgrep_runner import Finding, ScanReport, SemgrepRunner, SemgrepRunnerError
 
@@ -126,6 +133,73 @@ class CodeReviewAgent:
         self._semgrep = SemgrepRunner(config=semgrep_config)
         self._reviewer = GeminiReviewer(api_key=gemini_api_key)
 
+        # Process-lifetime, in-memory cache of built ProjectContexts, keyed
+        # by (repo_url, branch). Building one costs a handful of GitHub
+        # calls plus (if past PR comments exist) one embedding call per
+        # comment — conventions don't change per-file or even per-review,
+        # so this is built once per repo/branch and reused for every
+        # subsequent review_repo()/generate_review() call against it in
+        # this process, exactly like the exact-match/semantic response
+        # caches in gemini_reviewer.py.
+        self._project_context_cache: dict[tuple[str, str], ProjectContext] = {}
+
+    def build_project_context(self, url: str, branch: str = DEFAULT_BRANCH) -> ProjectContext:
+        """
+        Build (or return the cached) ProjectContext for a repo — its own
+        style guide/conventions (README, CONTRIBUTING, lint config) plus an
+        embedded index of its recent PR review comments, so review() can
+        ground findings in the project's own conventions instead of only
+        generic best practices.
+
+        Cached per (url, branch) for the life of this CodeReviewAgent
+        instance: conventions don't change per-file or even per-review, so
+        re-fetching/re-embedding on every call would just waste GitHub and
+        Gemini calls for no benefit. Call this as many times as you like
+        for the same repo — only the first call does any real work.
+
+        Best-effort end to end: if fetching conventions or comments fails
+        for any reason (private repo, no PR history, a transient GitHub
+        error), this logs a warning and returns an empty ProjectContext
+        rather than raising — indexing failures should never block a
+        review, the same philosophy as _embed()'s own failure handling.
+        """
+        cache_key = (url, branch)
+        cached = self._project_context_cache.get(cache_key)
+        if cached is not None:
+            return cached
+
+        conventions_text = ""
+        comment_index: list = []
+        sources: list[str] = []
+
+        try:
+            conventions = self._fetcher.fetch_convention_files(url, branch=branch)
+            if conventions:
+                sources.extend(sorted(conventions.keys()))
+                combined = "\n\n".join(
+                    f"### {name}\n{content}" for name, content in conventions.items()
+                )
+                conventions_text = combined[:RAG_MAX_CONVENTIONS_CHARS]
+
+            raw_comments = self._fetcher.fetch_recent_review_comments(url)
+            if raw_comments:
+                comment_index = self._reviewer.embed_review_comments(raw_comments)
+                if comment_index:
+                    sources.append(f"past_pr_comments({len(comment_index)})")
+        except Exception as exc:  # noqa: BLE001 — best-effort, never block a review
+            logger.warning(
+                "Could not fully build project context for %s (%s); "
+                "continuing with whatever was gathered so far.", url, exc,
+            )
+
+        context = ProjectContext(
+            conventions_text=conventions_text,
+            comment_index=comment_index,
+            sources=sources,
+        )
+        self._project_context_cache[cache_key] = context
+        return context
+
     def review_repo(
         self,
         url: str,
@@ -170,10 +244,25 @@ class CodeReviewAgent:
                     duration_s=0.0,
                 )
 
+            # --- Project context: best-effort, cached per (repo, branch) ----
+            # Cheap on a repeat review of the same repo (cache hit, no new
+            # GitHub/embedding calls); on the first review of a repo, a
+            # handful of extra GitHub calls plus one embedding call per past
+            # PR comment found.
+            with tracing.span("stage", "project_context", repo_url=url, branch=branch) as context_span:
+                project_context = self.build_project_context(url, branch=branch)
+                context_span.set(
+                    conventions_found=bool(project_context.conventions_text),
+                    comments_indexed=len(project_context.comment_index),
+                    sources=project_context.sources,
+                )
+
             # --- Review: non-fatal on failure --------------------------------
             try:
                 with tracing.span("stage", "review", files_in=len(fetch_result.files)) as review_span:
-                    review_report = self._reviewer.review(fetch_result.files, scan_report)
+                    review_report = self._reviewer.review(
+                        fetch_result.files, scan_report, project_context=project_context,
+                    )
                     review_span.set(
                         files_reviewed=review_report.files_reviewed,
                         issues=len(review_report.issues),
@@ -237,10 +326,22 @@ class CodeReviewAgent:
         """Run Semgrep on an already-fetched list of files only."""
         return self._semgrep.scan(files)
 
-    def generate_review(self, files: list[FileResult], scan_report: ScanReport) -> ReviewReport:
+    def generate_review(
+        self,
+        files: list[FileResult],
+        scan_report: ScanReport,
+        repo_url: str = "",
+        branch: str = DEFAULT_BRANCH,
+    ) -> ReviewReport:
         """Ask Gemini to review an already-fetched list of files, optionally
-        grounded by an already-computed ScanReport — no fetch, no scan."""
-        return self._reviewer.review(files, scan_report)
+        grounded by an already-computed ScanReport — no fetch, no scan.
+
+        If repo_url is given, also grounds the review in that repo's own
+        conventions and past PR review comments (built once per repo, then
+        cached — see build_project_context). Leave repo_url empty for a
+        plain review with no project-specific grounding."""
+        project_context = self.build_project_context(repo_url, branch=branch) if repo_url else None
+        return self._reviewer.review(files, scan_report, project_context=project_context)
 
     # --- PR diff entry point -----------------------------------------------
 
@@ -514,13 +615,25 @@ def make_scan_code_tool(agent: CodeReviewAgent) -> Callable[..., dict]:
 def make_generate_review_tool(agent: CodeReviewAgent) -> Callable[..., dict]:
     """Build a standalone 'review only' ADK tool bound to a CodeReviewAgent instance."""
 
-    def generate_review_tool(files: list[dict], findings: list[dict] | None = None) -> dict:
+    def generate_review_tool(
+        files: list[dict],
+        findings: list[dict] | None = None,
+        repo_url: str = "",
+        branch: str = DEFAULT_BRANCH,
+    ) -> dict:
         """Ask Gemini to produce a structured, severity-ranked code review for
         a list of files, each given as {"path": ..., "content": ...}, optionally
         grounded by Semgrep findings (each {"path", "line_start", "line_end",
         "rule_id", "severity", "message", "snippet"}) from scan_code_tool.
         Use this when files and/or findings were already gathered by the
-        other tools and only the review step is still needed."""
+        other tools and only the review step is still needed.
+
+        Pass the same repo_url (and branch, if not "main") you used with
+        fetch_repo_files_tool to also ground this review in the project's
+        own conventions (README/CONTRIBUTING/lint config) and relevant past
+        PR review comments, so findings can cite this repo's own stated
+        conventions instead of only generic best practices. Leave repo_url
+        empty for a plain review with no project-specific grounding."""
         if not isinstance(files, list) or not files:
             raise ValueError("files must be a non-empty list of {path, content} objects")
 
@@ -542,7 +655,7 @@ def make_generate_review_tool(agent: CodeReviewAgent) -> Callable[..., dict]:
         ]
         scan_report = ScanReport(findings=finding_objs, scanned=len(file_results), skipped=[], duration_s=0.0)
 
-        review_report = agent.generate_review(file_results, scan_report)
+        review_report = agent.generate_review(file_results, scan_report, repo_url=repo_url, branch=branch)
         return {
             "issues": [
                 {
@@ -1549,7 +1662,13 @@ def build_multi_agent_system(
             "2. (optional) search_code_in_files_tool — spot anti-patterns like bare "
             "   'except:', 'global', magic numbers.\n"
             "3. generate_review_tool — LLM quality review: naming, complexity, "
-            "   docstring coverage, DRY, error handling, PEP 8.\n\n"
+            "   docstring coverage, DRY, error handling, PEP 8. Pass the SAME "
+            "   repo_url (and branch, if not 'main') you used in step 1, so the "
+            "   review is also grounded in this repo's own README/CONTRIBUTING/"
+            "   lint config and relevant past PR review comments — findings "
+            "   should cite the project's own stated conventions when relevant "
+            "   ('this violates this repo's own naming convention') rather than "
+            "   only generic best practices ('consider PEP 8').\n\n"
             "Severity: LOW/MEDIUM for style; HIGH only when a quality flaw is likely "
             "to cause a runtime bug. Transfer back to quality_coordinator when done."
         ),
