@@ -888,3 +888,104 @@ class TestReviewWithProjectContext:
             for call in mock_client.models.embed_content.call_args_list
         ]
         assert RAG_QUERY_TASK_TYPE not in task_types
+
+
+# ---------------------------------------------------------------------------
+# Remediation: retry_context + verify_patch_resolves_finding
+# ---------------------------------------------------------------------------
+
+class TestRemediationRetryContext:
+    """generate_remediation_patches' retry_context param -- what lets a
+    regenerated patch address WHY the previous attempt failed verification,
+    instead of repeating the same blind guess (agent.py's remediation_loop /
+    generate_remediation_patches_with_verification)."""
+
+    def test_no_retry_context_produces_no_failure_note_in_prompt(self):
+        reviewer, mock_client = make_reviewer()
+        mock_client.models.generate_content.return_value = SimpleNamespace(
+            text=json.dumps({"patches": [], "summary": "s"})
+        )
+        findings = [{"path": "a.py", "line": 1, "title": "t", "severity": "HIGH"}]
+
+        reviewer.generate_remediation_patches(findings, [make_file("a.py")])
+
+        prompt = mock_client.models.generate_content.call_args.kwargs["contents"]
+        assert "PREVIOUS ATTEMPT" not in prompt
+
+    def test_retry_context_folds_failure_reason_into_the_prompt(self):
+        reviewer, mock_client = make_reviewer()
+        mock_client.models.generate_content.return_value = SimpleNamespace(
+            text=json.dumps({"patches": [], "summary": "s"})
+        )
+        findings = [{"path": "a.py", "line": 1, "title": "t", "severity": "HIGH"}]
+
+        reviewer.generate_remediation_patches(
+            findings, [make_file("a.py")],
+            retry_context={0: ["Semgrep rule python.lang.security.exec-use still fires."]},
+        )
+
+        prompt = mock_client.models.generate_content.call_args.kwargs["contents"]
+        assert "PREVIOUS ATTEMPT(S) FAILED VERIFICATION" in prompt
+        assert "Semgrep rule python.lang.security.exec-use still fires." in prompt
+
+    def test_retry_context_only_annotates_the_matching_finding_index(self):
+        reviewer, mock_client = make_reviewer()
+        mock_client.models.generate_content.return_value = SimpleNamespace(
+            text=json.dumps({"patches": [], "summary": "s"})
+        )
+        findings = [
+            {"path": "a.py", "line": 1, "title": "finding zero", "severity": "HIGH"},
+            {"path": "b.py", "line": 2, "title": "finding one", "severity": "LOW"},
+        ]
+
+        reviewer.generate_remediation_patches(
+            findings, [make_file("a.py"), make_file("b.py")],
+            retry_context={1: ["still broken"]},
+        )
+
+        prompt = mock_client.models.generate_content.call_args.kwargs["contents"]
+        # Only finding [1]'s block should carry the failure note.
+        assert prompt.index("finding one") < prompt.index("still broken")
+        assert "PREVIOUS ATTEMPT" not in prompt.split("[1]")[0]
+
+
+class TestVerifyPatchResolvesFinding:
+    """The LLM-judged fallback check for findings with no Semgrep rule_id --
+    must reuse _call_model's existing path (caching, retry, span), not a new
+    Gemini-calling mechanism."""
+
+    def test_parses_resolved_true(self):
+        reviewer, mock_client = make_reviewer()
+        mock_client.models.generate_content.return_value = SimpleNamespace(
+            text=json.dumps({"resolved": True, "reason": "No longer exhibits the issue."})
+        )
+
+        result = reviewer.verify_patch_resolves_finding(
+            {"title": "Weak crypto", "severity": "MEDIUM", "description": "MD5 used for passwords"},
+            "hashlib.sha256(x).hexdigest()",
+        )
+
+        assert result == {
+            "resolved": True, "reason": "No longer exhibits the issue.", "method": "llm",
+        }
+
+    def test_parses_resolved_false(self):
+        reviewer, mock_client = make_reviewer()
+        mock_client.models.generate_content.return_value = SimpleNamespace(
+            text=json.dumps({"resolved": False, "reason": "Still exploitable."})
+        )
+
+        result = reviewer.verify_patch_resolves_finding({"title": "t"}, "still_bad()")
+
+        assert result["resolved"] is False
+        assert result["reason"] == "Still exploitable."
+        assert result["method"] == "llm"
+
+    def test_unparseable_response_reports_unresolved_not_a_crash(self):
+        reviewer, mock_client = make_reviewer()
+        mock_client.models.generate_content.return_value = SimpleNamespace(text="not json")
+
+        result = reviewer.verify_patch_resolves_finding({"title": "t"}, "code()")
+
+        assert result["resolved"] is False
+        assert result["method"] == "llm"

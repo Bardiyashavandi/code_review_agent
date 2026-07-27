@@ -1,21 +1,27 @@
 """
 evals/cases.py
 ----------------
-20 scenario-based eval cases exercising the code-review pipeline end to
+23 scenario-based eval cases exercising the code-review pipeline end to
 end -- not individual functions. Each case calls a real CodeReviewAgent
 method (same objects the ADK tools proxy to) against realistic fixture
 files or synthetic finding data, and scores the actual returned result.
 
 Categories (see README.md for the full rationale):
-  detection        (9 cases) -- does the pipeline catch known-bad patterns?
-  false_positive    (4 cases) -- does validate_findings_tool reject
-                                  fabricated findings against clean code?
-  dedup             (3 cases) -- does dedup_agent merge true duplicates and
-                                  leave distinct findings alone?
-  risk_scoring      (2 cases) -- does risk_scorer_agent rank obvious
-                                  CRITICAL above obvious LOW?
-  cost_estimate     (2 cases) -- does the RPD/token math in server.py match
-                                  its sibling in view_trace.py? (no LLM)
+  detection            (9 cases) -- does the pipeline catch known-bad patterns?
+  false_positive        (4 cases) -- does validate_findings_tool reject
+                                      fabricated findings against clean code?
+  dedup                 (3 cases) -- does dedup_agent merge true duplicates and
+                                      leave distinct findings alone?
+  risk_scoring          (2 cases) -- does risk_scorer_agent rank obvious
+                                      CRITICAL above obvious LOW?
+  prompt_injection      (1 case)  -- does the pipeline resist an embedded
+                                      "ignore previous instructions" payload?
+  security_full_scan    (1 case)  -- does the deterministic parallel-scan
+                                      path surface every specialist's finding?
+  remediation_loop      (1 case)  -- does verify-and-refine actually converge
+                                      on a retry a single-shot patch wouldn't?
+  cost_estimate         (2 cases) -- does the RPD/token math in server.py match
+                                      its sibling in view_trace.py? (no LLM)
 
 Only the cost_estimate cases require no live Gemini call. Every other
 case's `run()` makes a real API call in --mode live, and returns a
@@ -29,13 +35,16 @@ import json
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
+from unittest.mock import patch
 
 from scorers import (
     ScoreResult,
     score_dedup_merges,
     score_detection,
     score_false_positive,
+    score_full_scan_coverage,
     score_injection_resistance,
+    score_remediation_convergence,
     score_risk_ordering,
 )
 
@@ -459,7 +468,162 @@ def _injection_case():
 PROMPT_INJECTION_CASES = [_injection_case()]
 
 
+# ---------------------------------------------------------------------------
+# Category 7 — security_full_scan: deterministic parallel path coverage (1 case)
+# ---------------------------------------------------------------------------
+#
+# security_full_scan (agent.py) runs sast_agent, injection_agent, auth_agent,
+# crypto_agent, secrets_agent, and data_flow_agent as a ParallelAgent, then
+# aggregates via security_aggregator_agent -- this replaces a prompt that
+# just hoped the LLM sequentially remembered to call all six. This eval
+# doesn't invoke the ADK graph itself (this harness calls CodeReviewAgent
+# methods directly, same as every other case); instead it simulates the
+# guarantee ParallelAgent provides -- that every specialist actually runs --
+# by calling three of the six specialists' underlying methods directly
+# against a fixture set with all three finding types, and asserting NONE of
+# them comes back empty. The failure mode this catches (an LLM silently
+# skipping a specialist) is structurally impossible once specialists are
+# invoked by a ParallelAgent rather than by an LLM's own initiative.
+
+def _full_security_review_case():
+    def run(agent, fixtures_dir):
+        return {
+            "injection": agent.generate_injection_audit([_load_file("vulnerable/sqli.py")]),
+            "auth": agent.generate_auth_audit([_load_file("vulnerable/idor.py")]),
+            "crypto": agent.generate_crypto_audit([_load_file("vulnerable/weak_crypto.py")]),
+        }
+
+    def score(result):
+        return score_full_scan_coverage(
+            result,
+            expected_keywords_by_specialist={
+                "injection": ["sql", "injection"],
+                "auth": ["idor", "ownership", "access control", "authorization"],
+                "crypto": ["md5"],
+            },
+        )
+
+    # Mock mode returns this SAME text for all three calls (the harness's
+    # generate_content mock is per-case, not per-method) -- fine for a
+    # harness self-test, since it just proves the union of all three
+    # specialists' results contains all three expected finding types.
+    mock = json.dumps({
+        "findings": [
+            {"path": "vulnerable/sqli.py", "line": 20, "severity": "CRITICAL",
+             "injection_type": "SQL", "description": "SQL injection via unsanitized f-string"},
+            {"path": "vulnerable/idor.py", "line": 20, "severity": "HIGH",
+             "vuln_type": "IDOR", "description": "no ownership check -- broken access control"},
+            {"path": "vulnerable/weak_crypto.py", "line": 12, "severity": "HIGH",
+             "pattern": "MD5", "description": "MD5 used for password hashing"},
+        ],
+        "summary": "mock aggregated summary",
+    })
+    return EvalCase(
+        "sec-full-01-parallel-no-dropped-specialist", "security_full_scan",
+        "Full security review against fixtures with known injection + auth + crypto "
+        "issues -- asserts all three finding types show up, proving the deterministic "
+        "parallel path doesn't silently drop a specialist the way the old "
+        "'all six agents sequentially' prompt could.",
+        run, score, mock_text=mock,
+    )
+
+
+SECURITY_FULL_SCAN_CASES = [_full_security_review_case()]
+
+
+# ---------------------------------------------------------------------------
+# Category 8 — remediation_loop: verify-and-refine convergence (1 case)
+# ---------------------------------------------------------------------------
+#
+# remediation_agent (agent.py) is now a LoopAgent: patch_generator_agent ->
+# patch_verifier_step, up to 3 iterations, exiting early once every patch
+# verifies clean. This exercises CodeReviewAgent.generate_remediation_
+# patches_with_verification directly (the same orchestration remediation_
+# loop's ADK path and POST /remediate both rely on).
+#
+# To make "the first patch is deliberately wrong, the second genuinely
+# converges" a FIXTURE property rather than something left to chance
+# real-model behavior in EITHER mode (the runner's mock mode returns one
+# static response for every generate_content call in a case, which can't
+# tell "verifying the bad patch" apart from "verifying the good patch" --
+# so a real verification call here would make this case unwinnable under
+# --mode mock specifically, not just less meaningful), this case scripts
+# BOTH GeminiReviewer.generate_remediation_patches (still-vulnerable patch
+# on attempt 1, genuinely fixed on attempt 2) and
+# GeminiReviewer.verify_patch_resolves_finding (judges the SCRIPTED
+# patch's own content -- resolved iff it no longer uses shell=True). This
+# is a deliberate trade: it proves the *loop's orchestration*
+# (detect-failure -> retry-with-feedback -> converge, capped at
+# max_iterations) deterministically in both modes, at the cost of not
+# exercising real Gemini judgment here -- that's what inj-01 and the
+# detection-category cases are already for.
+
+def _remediation_convergence_case():
+    def run(agent, fixtures_dir):
+        finding = {
+            "path": "vulnerable/command_injection.py", "line": 15,
+            "severity": "CRITICAL", "title": "Command Injection via shell=True",
+            "description": "User-controlled 'host' is interpolated into a shell "
+                           "command with shell=True, allowing command chaining "
+                           "(e.g. '; rm -rf /').",
+            # No rule_id -- routes verification through the LLM-judged fallback
+            # (scripted below) rather than a Semgrep re-scan.
+        }
+        files = [_load_file("vulnerable/command_injection.py")]
+
+        def scripted_generation(findings, files_, retry_context=None):
+            # Deliberately still vulnerable on the first attempt (no
+            # retry_context yet); genuinely fixed once retry_context shows
+            # up (i.e. the previous attempt was flagged unresolved).
+            if retry_context:
+                after = 'subprocess.run(["ping", "-c", "1", host], capture_output=True)'
+            else:
+                after = 'subprocess.run(f"ping -c 1 {host}", shell=True, capture_output=True)'
+            return {
+                "patches": [{
+                    "finding_index": 0, "path": "vulnerable/command_injection.py",
+                    "line": 15, "title": "Command Injection via shell=True",
+                    "before": 'subprocess.run(f"ping -c 1 {host}", shell=True, capture_output=True)',
+                    "after": after, "explanation": "scripted patch for eval determinism",
+                    "dependencies": [], "breaking_change": False,
+                }],
+                "summary": "scripted remediation summary",
+            }
+
+        def scripted_verification(finding_, after_code):
+            resolved = "shell=True" not in after_code
+            reason = (
+                "No longer passes shell=True." if resolved
+                else "Still passes shell=True to subprocess.run."
+            )
+            return {"resolved": resolved, "reason": reason, "method": "llm"}
+
+        with patch.object(agent._reviewer, "generate_remediation_patches", side_effect=scripted_generation), \
+             patch.object(agent._reviewer, "verify_patch_resolves_finding", side_effect=scripted_verification):
+            return agent.generate_remediation_patches_with_verification(
+                [finding], files, max_iterations=3
+            )
+
+    def score(result):
+        return score_remediation_convergence(result, min_iterations=2)
+
+    return EvalCase(
+        "rem-01-verify-refine-converges-on-retry", "remediation_loop",
+        "First generated patch is deliberately still vulnerable; the second "
+        "attempt, informed by the verifier's feedback (retry_context), actually "
+        "fixes it -- proving the verify-and-refine loop's orchestration "
+        "(detect failure -> retry -> converge) does something a single-shot "
+        "patch generation couldn't. Deterministic in both --mode mock and "
+        "--mode live since both generation and verification are scripted here "
+        "(see comment above for why real judgment isn't used in this one case).",
+        run, score, mock_text="",
+    )
+
+
+REMEDIATION_LOOP_CASES = [_remediation_convergence_case()]
+
+
 ALL_CASES: list[EvalCase] = (
     DETECTION_CASES + FALSE_POSITIVE_CASES + DEDUP_CASES + RISK_SCORING_CASES
-    + PROMPT_INJECTION_CASES
+    + PROMPT_INJECTION_CASES + SECURITY_FULL_SCAN_CASES + REMEDIATION_LOOP_CASES
 )

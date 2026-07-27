@@ -232,6 +232,8 @@ class PatchOut(BaseModel):
     dependencies: list[str] = []
     breaking_change: bool = False
     breaking_change_note: str | None = None
+    verified: bool | None = None
+    verification_reason: str | None = None
 
 
 class RemediateResponse(BaseModel):
@@ -240,6 +242,9 @@ class RemediateResponse(BaseModel):
     parse_error: bool = False
     missing_paths: list[str] = []
     schema_errors: list[str] = []
+    iterations_run: int = 0
+    fully_resolved: bool = True
+    unresolved_finding_indices: list[int] = []
 
 
 # ---------------------------------------------------------------------------
@@ -672,15 +677,15 @@ def _filter_relevant_files(files: list, requested_paths: set[str]) -> tuple[list
 
 
 def _build_remediate_response(raw_result: dict) -> RemediateResponse:
-    """Convert generate_remediation_patches()'s raw dict into a validated
-    RemediateResponse.
+    """Convert generate_remediation_patches_with_verification()'s raw dict
+    into a validated RemediateResponse.
 
     Mirrors the review pipeline's schema_errors pattern (see ReviewOut):
-    generate_remediation_patches() itself does no schema validation, only a
-    bare json.loads with a {"raw": ..., "parse_error": True} fallback on
-    total failure. A single malformed patch inside an otherwise-valid
-    response is dropped and recorded in schema_errors rather than 500-ing
-    the whole request.
+    the underlying generator does no schema validation, only a bare
+    json.loads with a {"raw": ..., "parse_error": True} fallback on total
+    failure. A single malformed patch inside an otherwise-valid response is
+    dropped and recorded in schema_errors rather than 500-ing the whole
+    request.
     """
     if raw_result.get("parse_error"):
         return RemediateResponse(
@@ -701,21 +706,35 @@ def _build_remediate_response(raw_result: dict) -> RemediateResponse:
         summary=raw_result.get("summary", ""),
         parse_error=False,
         schema_errors=schema_errors,
+        iterations_run=raw_result.get("iterations_run", 0),
+        fully_resolved=raw_result.get("fully_resolved", True),
+        unresolved_finding_indices=raw_result.get("unresolved_finding_indices", []),
     )
 
 
 @app.post("/remediate", response_model=RemediateResponse, tags=["review"])
 async def remediate(req: RemediateRequest) -> RemediateResponse:
     """
-    Generate concrete before/after code patches for a set of findings.
+    Generate concrete before/after code patches for a set of findings, then
+    verify each patch actually resolves the finding it targets and refine
+    up to 3 times if not (generate_remediation_patches_with_verification —
+    the same verify-and-refine shape as the ADK graph's remediation_loop
+    LoopAgent, for this HTTP path which doesn't go through the ADK graph).
 
     Opt-in only, mirroring post_pr_review_tool/create_issue_tool's design —
     never triggered automatically by /analyze. Re-fetches the repo's files
     via GitHub using the exact same fetch_python_files() call /analyze
     itself uses (no new fetch logic), filters down to just the paths
     referenced in `findings`, then hands both to the existing
-    generate_remediation_patches() tool logic unchanged — this endpoint
-    does not reimplement any patch-generation logic.
+    generate_remediation_patches_with_verification() logic unchanged — this
+    endpoint does not reimplement any patch-generation or verification logic.
+
+    Each returned patch includes `verified` (bool) and `verification_reason`
+    (str) from the last iteration that touched it. The response also
+    reports `iterations_run` and `fully_resolved` — if `fully_resolved` is
+    false, `unresolved_finding_indices` lists which findings' patches never
+    verified clean within 3 attempts (rare, but reported honestly rather
+    than silently presented as fixed).
 
     `findings` is typically the exact `review.issues` array from a prior
     /analyze response for the same repo_url/branch (or a hand-picked
@@ -777,7 +796,9 @@ async def remediate(req: RemediateRequest) -> RemediateResponse:
     findings_dicts = [f.model_dump() for f in req.findings]
 
     def _remediate():
-        return agent.generate_remediation_patches(findings_dicts, relevant_files)
+        return agent.generate_remediation_patches_with_verification(
+            findings_dicts, relevant_files
+        )
 
     try:
         raw_result = await asyncio.wait_for(

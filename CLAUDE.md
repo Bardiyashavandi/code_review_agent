@@ -1,4 +1,4 @@
-You are helping me build a Code Review Agent for the Kaggle 5-Day AI Agents Capstone (deadline July 6, 2026).
+You are helping me build a Code Review Agent.
 
 Project: AI Code Review Agent
 Track: Agents for Business

@@ -100,7 +100,7 @@ class TestRemediateSuccess:
 
     def test_returns_patches_for_a_single_finding(self, client, mock_agent):
         mock_agent.fetch_files.return_value = make_fetch_result(paths=("app.py",))
-        mock_agent.generate_remediation_patches.return_value = {
+        mock_agent.generate_remediation_patches_with_verification.return_value = {
             "patches": [make_patch()],
             "summary": "1 patch generated.",
         }
@@ -123,7 +123,7 @@ class TestRemediateSuccess:
 
     def test_fetches_with_requested_branch_and_max_files(self, client, mock_agent):
         mock_agent.fetch_files.return_value = make_fetch_result(paths=("app.py",))
-        mock_agent.generate_remediation_patches.return_value = {"patches": [], "summary": ""}
+        mock_agent.generate_remediation_patches_with_verification.return_value = {"patches": [], "summary": ""}
 
         client.post("/remediate", json={
             "repo_url": VALID_REPO,
@@ -135,26 +135,27 @@ class TestRemediateSuccess:
         mock_agent.fetch_files.assert_called_once_with(VALID_REPO, branch="develop", max_files=42)
 
     def test_reimplements_nothing_passes_findings_and_files_through_unchanged(self, client, mock_agent):
-        """The endpoint's whole job is to expose generate_remediation_patches(),
-        not reimplement it — assert the exact findings dict and exact filtered
-        file objects reach it."""
+        """The endpoint's whole job is to expose
+        generate_remediation_patches_with_verification(), not reimplement it —
+        assert the exact findings dict and exact filtered file objects reach
+        it."""
         mock_agent.fetch_files.return_value = make_fetch_result(paths=("app.py", "unrelated.py"))
-        mock_agent.generate_remediation_patches.return_value = {"patches": [], "summary": ""}
+        mock_agent.generate_remediation_patches_with_verification.return_value = {"patches": [], "summary": ""}
 
         client.post("/remediate", json={
             "repo_url": VALID_REPO,
             "findings": [make_finding(path="app.py", title="SQL Injection")],
         })
 
-        mock_agent.generate_remediation_patches.assert_called_once()
-        call_findings, call_files = mock_agent.generate_remediation_patches.call_args[0]
+        mock_agent.generate_remediation_patches_with_verification.assert_called_once()
+        call_findings, call_files = mock_agent.generate_remediation_patches_with_verification.call_args[0]
         assert call_findings == [make_finding(path="app.py", title="SQL Injection")]
         # Only the referenced file is passed through — not the unrelated one.
         assert [f.path for f in call_files] == ["app.py"]
 
     def test_missing_path_reported_but_others_still_proceed(self, client, mock_agent):
         mock_agent.fetch_files.return_value = make_fetch_result(paths=("app.py",))
-        mock_agent.generate_remediation_patches.return_value = {"patches": [], "summary": "ok"}
+        mock_agent.generate_remediation_patches_with_verification.return_value = {"patches": [], "summary": "ok"}
 
         resp = client.post("/remediate", json={
             "repo_url": VALID_REPO,
@@ -164,12 +165,12 @@ class TestRemediateSuccess:
         assert resp.status_code == 200
         assert resp.json()["missing_paths"] == ["gone.py"]
         # Only the found file reaches the remediation call.
-        call_files = mock_agent.generate_remediation_patches.call_args[0][1]
+        call_files = mock_agent.generate_remediation_patches_with_verification.call_args[0][1]
         assert [f.path for f in call_files] == ["app.py"]
 
     def test_malformed_patch_dropped_and_recorded_not_500(self, client, mock_agent):
         mock_agent.fetch_files.return_value = make_fetch_result(paths=("app.py",))
-        mock_agent.generate_remediation_patches.return_value = {
+        mock_agent.generate_remediation_patches_with_verification.return_value = {
             "patches": [
                 make_patch(),
                 {"path": "app.py", "line": "not-an-int"},  # malformed: line must be int
@@ -189,7 +190,7 @@ class TestRemediateSuccess:
 
     def test_parse_error_surfaced_not_500(self, client, mock_agent):
         mock_agent.fetch_files.return_value = make_fetch_result(paths=("app.py",))
-        mock_agent.generate_remediation_patches.return_value = {"raw": "not json", "parse_error": True}
+        mock_agent.generate_remediation_patches_with_verification.return_value = {"raw": "not json", "parse_error": True}
 
         resp = client.post("/remediate", json={
             "repo_url": VALID_REPO,
@@ -219,7 +220,7 @@ class TestRemediateErrors:
 
         assert resp.status_code == 400
         assert "gone.py" in resp.json()["detail"]
-        mock_agent.generate_remediation_patches.assert_not_called()
+        mock_agent.generate_remediation_patches_with_verification.assert_not_called()
 
     def test_repo_not_found_returns_404(self, client, mock_agent):
         mock_agent.fetch_files.side_effect = RepoNotFoundError("no such repo")
@@ -262,7 +263,7 @@ class TestRemediateErrors:
             "repo_url": VALID_REPO, "findings": [make_finding()],
         })
         assert resp.status_code == 500
-        mock_agent.generate_remediation_patches.assert_not_called()
+        mock_agent.generate_remediation_patches_with_verification.assert_not_called()
 
 
 # ---------------------------------------------------------------------------

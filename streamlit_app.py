@@ -155,10 +155,22 @@ def _render_patch(patch: dict) -> None:
     breaking    = patch.get("breaking_change", False)
     breaking_note = patch.get("breaking_change_note")
 
+    verified = patch.get("verified")
+    verification_reason = patch.get("verification_reason", "")
+
     label = f"{path}:{line} — {title}" if line else f"{path} — {title}"
+    if verified is True:
+        label = f"✅ {label}"
+    elif verified is False:
+        label = f"⚠️ {label} (unresolved after retries)"
+
     with st.expander(label, expanded=True):
         if explanation:
             st.markdown(f"**Why this fix:** {explanation}")
+        if verified is True and verification_reason:
+            st.caption(f"✅ Verified: {verification_reason}")
+        elif verified is False and verification_reason:
+            st.warning(f"This patch did not verify as resolved: {verification_reason}")
 
         col_before, col_after = st.columns(2)
         with col_before:
@@ -181,6 +193,8 @@ def _render_remediation_result(result: dict) -> None:
     missing_paths = result.get("missing_paths", []) or []
     schema_errors = result.get("schema_errors", []) or []
     parse_error   = result.get("parse_error", False)
+    iterations_run = result.get("iterations_run", 0)
+    fully_resolved = result.get("fully_resolved", True)
 
     if parse_error:
         st.error("Gemini's remediation response couldn't be parsed as JSON. Try again.")
@@ -195,6 +209,18 @@ def _render_remediation_result(result: dict) -> None:
         )
     if schema_errors:
         st.warning(f"{len(schema_errors)} patch(es) had an unexpected shape and were dropped.")
+
+    if iterations_run:
+        if fully_resolved:
+            st.caption(
+                f"✅ All patches verified resolved after {iterations_run} "
+                f"iteration{'s' if iterations_run != 1 else ''}."
+            )
+        else:
+            st.warning(
+                f"After {iterations_run} verify-and-refine iterations, some patches "
+                "still didn't verify as resolved — see the ⚠️ patches below."
+            )
 
     if not patches:
         st.caption("No patches were generated for the selected issues.")

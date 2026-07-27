@@ -19,6 +19,9 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from google.adk.agents import LoopAgent, ParallelAgent, SequentialAgent
+
+import agent as agent_module
 from agent import (
     CodeReviewAgent,
     PipelineResult,
@@ -28,12 +31,13 @@ from agent import (
     make_generate_report_file_tool,
     make_generate_review_tool,
     make_get_repo_metadata_tool,
+    make_patch_verifier_tool,
     make_review_repo_tool,
     make_scan_code_tool,
     make_search_code_tool,
 )
 from gemini_reviewer import RAG_MAX_CONVENTIONS_CHARS, GeminiRateLimitError
-from semgrep_runner import SemgrepExecutionError
+from semgrep_runner import Finding, ScanReport, SemgrepExecutionError
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -699,4 +703,268 @@ class TestSecretHygiene:
 
         for record in caplog.records:
             assert "ghp_faketoken" not in record.getMessage()
+
+
+# ---------------------------------------------------------------------------
+# 6. security_full_scan (ParallelAgent + aggregator, deterministic full scan)
+# ---------------------------------------------------------------------------
+
+def _find_agent(root, name):
+    """Depth-first search of an ADK agent tree by name."""
+    if root.name == name:
+        return root
+    for sub in getattr(root, "sub_agents", None) or []:
+        found = _find_agent(sub, name)
+        if found is not None:
+            return found
+    return None
+
+
+def _build_root():
+    """Build the full ADK agent graph with all underlying clients mocked,
+    the same pattern make_agent() uses for CodeReviewAgent directly."""
+    with patch("agent.GitHubFetcher"), patch("agent.SemgrepRunner"), patch("agent.GeminiReviewer"):
+        return agent_module.build_multi_agent_system(
+            github_token="ghp_faketoken", gemini_api_key="gem_fakekey"
+        )
+
+
+class TestSecurityFullScan:
+
+    def test_security_coordinator_keeps_existing_specialists_and_gains_full_scan(self):
+        root = _build_root()
+        security_coordinator = _find_agent(root, "security_coordinator")
+        assert security_coordinator is not None
+        names = {a.name for a in security_coordinator.sub_agents}
+        # Existing single-specialist routing must be untouched.
+        assert {"sast_agent", "injection_agent", "auth_agent", "crypto_agent",
+                "secrets_agent", "data_flow_agent"} <= names
+        # New deterministic full-scan path is an addition, not a replacement.
+        assert "security_full_scan" in names
+
+    def test_security_full_scan_is_sequential_parallel_then_aggregator(self):
+        root = _build_root()
+        full_scan = _find_agent(root, "security_full_scan")
+        assert isinstance(full_scan, SequentialAgent)
+        assert len(full_scan.sub_agents) == 2
+
+        parallel_scan, aggregator = full_scan.sub_agents
+        assert isinstance(parallel_scan, ParallelAgent)
+        assert aggregator.name == "security_aggregator_agent"
+
+        parallel_names = {a.name for a in parallel_scan.sub_agents}
+        assert parallel_names == {
+            "sast_agent_scan", "injection_agent_scan", "auth_agent_scan",
+            "crypto_agent_scan", "secrets_agent_scan", "data_flow_agent_scan",
+        }
+
+    def test_parallel_scan_specialists_are_distinct_instances_from_coordinator_specialists(self):
+        """ADK requires a single-parent agent tree -- the parallel-scan path
+        must use cloned specialists, not the same instances security_coordinator
+        routes single-specialist requests to (which would otherwise raise a
+        duplicate-parent error at construction time -- the fact this builds at
+        all already proves that, but assert the instances differ explicitly)."""
+        root = _build_root()
+        sast_standalone = _find_agent(root, "sast_agent")
+        sast_scan = _find_agent(root, "sast_agent_scan")
+        assert sast_standalone is not sast_scan
+        assert sast_standalone.name != sast_scan.name
+
+    def test_output_keys_set_for_state_passing_to_aggregator(self):
+        root = _build_root()
+        expected = {
+            "sast_agent": "sast_result",
+            "injection_agent": "injection_result",
+            "auth_agent": "auth_result",
+            "crypto_agent": "crypto_result",
+            "secrets_agent": "secrets_result",
+            "data_flow_agent": "data_flow_result",
+        }
+        for name, key in expected.items():
+            specialist = _find_agent(root, name)
+            assert specialist.output_key == key
+            scan_clone = _find_agent(root, f"{name}_scan")
+            assert scan_clone.output_key == key
+
+
+# ---------------------------------------------------------------------------
+# 7. remediation_loop (LoopAgent verify-and-refine)
+# ---------------------------------------------------------------------------
+
+class TestRemediationLoop:
+
+    def test_remediation_agent_is_a_loop_of_generator_then_verifier(self):
+        root = _build_root()
+        remediation = _find_agent(root, "remediation_agent")
+        assert isinstance(remediation, LoopAgent)
+        assert remediation.max_iterations == 3
+        names = [a.name for a in remediation.sub_agents]
+        assert names == ["patch_generator_agent", "patch_verifier_step"]
+
+    def test_root_still_transfers_to_remediation_agent_by_name(self):
+        """B4: root, POST /remediate, and Streamlit all still refer to
+        'remediation_agent' -- only its internal implementation changed."""
+        root = _build_root()
+        names = [a.name for a in root.sub_agents]
+        assert "remediation_agent" in names
+
+
+class TestGenerateRemediationPatchesWithVerification:
+    """CodeReviewAgent.generate_remediation_patches_with_verification --
+    the non-ADK verify-and-refine path used by POST /remediate and the
+    Streamlit fix-generation button (which bypass the ADK graph entirely,
+    so remediation_loop's LoopAgent behavior doesn't reach them on its own)."""
+
+    def test_clean_on_first_try_exits_after_one_iteration_not_three(self):
+        agent, _fetcher, _semgrep, reviewer = make_agent()
+        reviewer.generate_remediation_patches.return_value = {
+            "patches": [{"finding_index": 0, "path": "a.py", "before": "bad", "after": "good"}],
+            "summary": "1 patch generated.",
+        }
+        reviewer.verify_patch_resolves_finding.return_value = {
+            "resolved": True, "reason": "No longer vulnerable.", "method": "llm",
+        }
+        findings = [{"path": "a.py", "title": "Hardcoded secret", "severity": "HIGH"}]
+        files = [SimpleNamespace(path="a.py", content="bad")]
+
+        result = agent.generate_remediation_patches_with_verification(findings, files, max_iterations=3)
+
+        assert result["iterations_run"] == 1
+        assert result["fully_resolved"] is True
+        assert result["patches"][0]["verified"] is True
+        assert "unresolved_finding_indices" not in result
+        # Only the initial generation call -- no wasted retry regeneration.
+        assert reviewer.generate_remediation_patches.call_count == 1
+
+    def test_still_fails_after_retries_runs_all_three_and_reports_honestly(self):
+        agent, _fetcher, _semgrep, reviewer = make_agent()
+        reviewer.generate_remediation_patches.return_value = {
+            "patches": [{"finding_index": 0, "path": "a.py", "before": "bad", "after": "still_bad"}],
+            "summary": "1 patch generated.",
+        }
+        reviewer.verify_patch_resolves_finding.return_value = {
+            "resolved": False, "reason": "Still exploitable.", "method": "llm",
+        }
+        findings = [{"path": "a.py", "title": "Hardcoded secret", "severity": "HIGH"}]
+        files = [SimpleNamespace(path="a.py", content="bad")]
+
+        result = agent.generate_remediation_patches_with_verification(findings, files, max_iterations=3)
+
+        assert result["iterations_run"] == 3
+        assert result["fully_resolved"] is False
+        assert result["unresolved_finding_indices"] == [0]
+        assert result["patches"][0]["verified"] is False
+        # Initial call + 2 retries (iteration 3 doesn't regenerate again since
+        # it's the last allowed attempt) -- capped, not unbounded.
+        assert reviewer.generate_remediation_patches.call_count == 3
+
+    def test_no_findings_short_circuits_without_calling_reviewer(self):
+        agent, _fetcher, _semgrep, reviewer = make_agent()
+
+        result = agent.generate_remediation_patches_with_verification([], [])
+
+        assert result == {
+            "patches": [], "summary": "No findings to remediate.",
+            "iterations_run": 0, "fully_resolved": True,
+        }
+        reviewer.generate_remediation_patches.assert_not_called()
+
+    def test_parse_error_from_initial_generation_is_reported_not_crashed(self):
+        agent, _fetcher, _semgrep, reviewer = make_agent()
+        reviewer.generate_remediation_patches.return_value = {
+            "raw": "not json", "parse_error": True,
+        }
+
+        result = agent.generate_remediation_patches_with_verification(
+            [{"path": "a.py", "title": "t"}], [SimpleNamespace(path="a.py", content="x")],
+        )
+
+        assert result["parse_error"] is True
+        assert result["fully_resolved"] is False
+        reviewer.verify_patch_resolves_finding.assert_not_called()
+
+
+class TestVerifyPatch:
+    """CodeReviewAgent.verify_patch -- the check step both remediation_loop's
+    ADK tool (patch_verifier_tool) and generate_remediation_patches_with_verification
+    share, so both surfaces behave consistently."""
+
+    def test_rule_id_backed_finding_uses_semgrep_rescan_not_llm(self):
+        agent, _fetcher, mock_semgrep, reviewer = make_agent()
+        mock_semgrep.scan.return_value = ScanReport(findings=[], scanned=1, skipped=[], duration_s=0.01)
+
+        finding = {"path": "a.py", "line": 1, "rule_id": "python.lang.security.exec-use"}
+        patch = {"finding_index": 0, "path": "a.py", "after": "safe_code()"}
+
+        verdict = agent.verify_patch(finding, patch)
+
+        assert verdict == {
+            "resolved": True,
+            "reason": "Semgrep rule python.lang.security.exec-use no longer fires on the patched code.",
+            "method": "semgrep",
+        }
+        mock_semgrep.scan.assert_called_once()
+        reviewer.verify_patch_resolves_finding.assert_not_called()
+
+    def test_rule_id_still_firing_is_not_resolved(self):
+        agent, _fetcher, mock_semgrep, _reviewer = make_agent()
+        mock_semgrep.scan.return_value = ScanReport(
+            findings=[Finding(path="a.py", line_start=1, line_end=1,
+                               rule_id="python.lang.security.exec-use",
+                               severity="ERROR", message="m", snippet="exec(x)")],
+            scanned=1, skipped=[], duration_s=0.01,
+        )
+
+        finding = {"path": "a.py", "rule_id": "python.lang.security.exec-use"}
+        patch = {"finding_index": 0, "path": "a.py", "after": "exec(x)"}
+
+        verdict = agent.verify_patch(finding, patch)
+
+        assert verdict["resolved"] is False
+        assert "python.lang.security.exec-use" in verdict["reason"]
+
+    def test_no_rule_id_falls_back_to_llm_judged_check(self):
+        agent, _fetcher, mock_semgrep, reviewer = make_agent()
+        reviewer.verify_patch_resolves_finding.return_value = {
+            "resolved": True, "reason": "ok", "method": "llm",
+        }
+
+        finding = {"path": "a.py", "title": "Quality nit"}  # no rule_id -- LLM-only finding
+        patch = {"finding_index": 0, "path": "a.py", "after": "clean_code()"}
+
+        verdict = agent.verify_patch(finding, patch)
+
+        assert verdict == {"resolved": True, "reason": "ok", "method": "llm"}
+        mock_semgrep.scan.assert_not_called()
+        reviewer.verify_patch_resolves_finding.assert_called_once_with(finding, "clean_code()")
+
+    def test_patch_with_no_after_code_is_unresolved(self):
+        agent, *_ = make_agent()
+        verdict = agent.verify_patch({"path": "a.py"}, {"after": ""})
+        assert verdict["resolved"] is False
+        assert verdict["method"] == "none"
+
+
+class TestPatchVerifierTool:
+    """The ADK-tool wrapper (make_patch_verifier_tool) used by
+    patch_verifier_step inside remediation_loop."""
+
+    def test_wraps_verify_patch_and_logs_a_tracing_span(self):
+        agent, _fetcher, mock_semgrep, _reviewer = make_agent()
+        mock_semgrep.scan.return_value = ScanReport(findings=[], scanned=1, skipped=[], duration_s=0.01)
+        tool = make_patch_verifier_tool(agent)
+
+        result = tool(
+            finding={"path": "a.py", "rule_id": "r1", "title": "t"},
+            patch={"finding_index": 0, "path": "a.py", "after": "fixed()"},
+        )
+
+        assert result["resolved"] is True
+        json.dumps(result)
+
+    def test_rejects_non_dict_arguments(self):
+        agent, *_ = make_agent()
+        tool = make_patch_verifier_tool(agent)
+        with pytest.raises(ValueError):
+            tool(finding="not a dict", patch={})
             assert "gem_fakekey" not in record.getMessage()

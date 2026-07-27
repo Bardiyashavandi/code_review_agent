@@ -40,8 +40,9 @@ _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 if _THIS_DIR not in sys.path:
     sys.path.insert(0, _THIS_DIR)
 
-from google.adk.agents import Agent
+from google.adk.agents import Agent, LoopAgent, ParallelAgent, SequentialAgent
 from google.adk.tools import FunctionTool
+from google.adk.tools.tool_context import ToolContext
 
 import report_generator
 import tracing
@@ -412,10 +413,179 @@ class CodeReviewAgent:
         return self._reviewer.generate_risk_scores(findings)
 
     def generate_remediation_patches(
-        self, findings: list[dict], files: list[FileResult]
+        self,
+        findings: list[dict],
+        files: list[FileResult],
+        retry_context: dict[int, list[str]] | None = None,
     ) -> dict:
         """Generate concrete, copy-pasteable fix patches for security findings."""
-        return self._reviewer.generate_remediation_patches(findings, files)
+        return self._reviewer.generate_remediation_patches(
+            findings, files, retry_context=retry_context
+        )
+
+    def verify_patch(self, finding: dict, patch: dict) -> dict:
+        """Check whether a generated patch actually resolves the finding it
+        targets — the check step of remediation's verify-and-refine loop.
+
+        If the finding has a Semgrep rule_id, re-runs Semgrep against just the
+        patched ('after') code using the SAME sandboxing SemgrepRunner.scan()
+        already uses elsewhere (isolated temp dir, explicit subprocess args,
+        no new subprocess pattern) and checks whether that rule_id still
+        fires. If the finding has no rule_id (an LLM-only finding, not
+        Semgrep-backed), falls back to a lighter LLM-judged check via
+        GeminiReviewer's existing _call_model path.
+
+        Returns {"resolved": bool, "reason": str, "method": "semgrep"|"llm"|"none"}.
+        """
+        if not isinstance(finding, dict) or not isinstance(patch, dict):
+            raise ValueError("finding and patch must both be dicts")
+
+        after_code = patch.get("after", "")
+        if not after_code.strip():
+            return {
+                "resolved": False,
+                "reason": "Patch has no 'after' code to verify.",
+                "method": "none",
+            }
+
+        rule_id = finding.get("rule_id")
+        path = finding.get("path") or patch.get("path") or "patched_snippet.py"
+
+        if rule_id:
+            file_obj = FileResult(
+                path=path, content=after_code, sha="", size=len(after_code), url=""
+            )
+            try:
+                scan_report = self._semgrep.scan([file_obj])
+            except SemgrepRunnerError as exc:
+                return {
+                    "resolved": False,
+                    "reason": f"Verifier scan failed: {exc}",
+                    "method": "semgrep",
+                }
+            still_firing = any(f.rule_id == rule_id for f in scan_report.findings)
+            if still_firing:
+                return {
+                    "resolved": False,
+                    "reason": f"Semgrep rule {rule_id} still fires on the patched code.",
+                    "method": "semgrep",
+                }
+            return {
+                "resolved": True,
+                "reason": f"Semgrep rule {rule_id} no longer fires on the patched code.",
+                "method": "semgrep",
+            }
+
+        return self._reviewer.verify_patch_resolves_finding(finding, after_code)
+
+    def generate_remediation_patches_with_verification(
+        self,
+        findings: list[dict],
+        files: list[FileResult],
+        max_iterations: int = 3,
+    ) -> dict:
+        """Generate remediation patches and iteratively verify + refine them,
+        for callers that don't go through the ADK graph's remediation_loop
+        (POST /remediate, the Streamlit fix-generation button). Mirrors the
+        same verify-and-refine shape as remediation_loop (LoopAgent) in
+        build_multi_agent_system, capped at the same max_iterations=3, so
+        both surfaces behave consistently and neither silently costs
+        unbounded Gemini calls.
+
+        Each iteration: verify every current patch (verify_patch); patches
+        that still fail get regenerated with the failure reason folded into
+        the prompt (generate_remediation_patches' retry_context), while
+        already-resolved patches are left untouched. Stops early once every
+        patch verifies clean, or after max_iterations, whichever comes
+        first — most patches should exit after 1 iteration.
+
+        Returns the same shape as generate_remediation_patches(), plus
+        iterations_run (int), fully_resolved (bool), and, if not fully
+        resolved, unresolved_finding_indices (list[int])."""
+        if not findings:
+            return {
+                "patches": [], "summary": "No findings to remediate.",
+                "iterations_run": 0, "fully_resolved": True,
+            }
+
+        result = self.generate_remediation_patches(findings, files)
+        patches = result.get("patches")
+        if not isinstance(patches, list):
+            # parse_error or malformed response -- nothing to verify/refine.
+            result.setdefault("iterations_run", 1)
+            result.setdefault("fully_resolved", False)
+            return result
+
+        patches_by_index: dict[int, dict] = {
+            p.get("finding_index"): p for p in patches if isinstance(p, dict)
+        }
+        feedback: dict[int, list[str]] = {}
+        unresolved: set = set()
+        fully_resolved = True
+        iterations_run = 0
+
+        for iteration in range(1, max_iterations + 1):
+            iterations_run = iteration
+            unresolved = set()
+            with tracing.span(
+                "stage", "remediation_verify_iteration",
+                iteration=iteration, patch_count=len(patches_by_index),
+            ) as span:
+                for idx, patch in patches_by_index.items():
+                    finding = (
+                        findings[idx]
+                        if isinstance(idx, int) and 0 <= idx < len(findings)
+                        else None
+                    )
+                    if finding is None:
+                        continue
+                    verdict = self.verify_patch(finding, patch)
+                    patch["verified"] = verdict["resolved"]
+                    patch["verification_reason"] = verdict["reason"]
+                    if not verdict["resolved"]:
+                        unresolved.add(idx)
+                        feedback.setdefault(idx, []).append(verdict["reason"])
+                span.set(
+                    unresolved_count=len(unresolved),
+                    resolved_count=len(patches_by_index) - len(unresolved),
+                )
+
+            if not unresolved:
+                fully_resolved = True
+                break
+            fully_resolved = False
+            if iteration == max_iterations:
+                break
+
+            remap = sorted(unresolved)
+            retry_findings = [findings[i] for i in remap]
+            retry_context = {
+                local_i: feedback[original_i]
+                for local_i, original_i in enumerate(remap)
+            }
+            retry_result = self.generate_remediation_patches(
+                retry_findings, files, retry_context=retry_context
+            )
+            retry_patches = retry_result.get("patches")
+            if not isinstance(retry_patches, list):
+                # Regeneration failed to parse -- stop iterating, report honestly.
+                break
+            for rp in retry_patches:
+                if not isinstance(rp, dict):
+                    continue
+                local_idx = rp.get("finding_index")
+                if not isinstance(local_idx, int) or not (0 <= local_idx < len(remap)):
+                    continue
+                original_idx = remap[local_idx]
+                rp["finding_index"] = original_idx
+                patches_by_index[original_idx] = rp
+
+        result["patches"] = [patches_by_index[i] for i in sorted(patches_by_index, key=lambda x: (x is None, x))]
+        result["iterations_run"] = iterations_run
+        result["fully_resolved"] = fully_resolved
+        if not fully_resolved:
+            result["unresolved_finding_indices"] = sorted(unresolved)
+        return result
 
     def analyze_context(self, files: list[FileResult]) -> dict:
         """Analyze the codebase to understand framework, architecture, and security surface."""
@@ -1309,6 +1479,52 @@ def make_remediation_tool(agent: CodeReviewAgent) -> Callable[..., dict]:
     return remediation_tool
 
 
+def make_patch_verifier_tool(agent: CodeReviewAgent) -> Callable[..., dict]:
+    """Build the verify step of remediation_loop's verify-and-refine cycle.
+
+    Wraps CodeReviewAgent.verify_patch (Semgrep re-scan for rule_id-backed
+    findings, LLM-judged fallback otherwise) and logs each call as its own
+    tracing span so the loop's behavior — how many iterations it actually
+    took, and why — is visible in traces/trace.jsonl / view_trace.py rather
+    than being a black box."""
+    call_count = {"n": 0}
+
+    def patch_verifier_tool(finding: dict, patch: dict) -> dict:
+        """Verify whether a generated patch actually resolves the security
+        finding it targets, by re-checking the patched ('after') code.
+
+        finding: the original finding dict, e.g. {path, line, rule_id, title,
+        description, ...} — rule_id present means it's Semgrep-backed.
+        patch: the generated patch dict from remediation_tool, e.g.
+        {finding_index, path, before, after, explanation, ...}.
+
+        Returns {resolved: bool, reason: str, method: 'semgrep'|'llm'|'none'}.
+        Call exit_loop once every patch in the current batch verifies
+        resolved — do not keep iterating past that point."""
+        if not isinstance(finding, dict) or not isinstance(patch, dict):
+            raise ValueError("finding and patch must both be dicts")
+        call_count["n"] += 1
+        with tracing.span(
+            "stage", "patch_verifier_iteration",
+            call_index=call_count["n"],
+            finding_title=finding.get("title", ""),
+            finding_path=finding.get("path", ""),
+        ) as span:
+            verdict = agent.verify_patch(finding, patch)
+            span.set(resolved=verdict.get("resolved"), method=verdict.get("method"))
+        return verdict
+    return patch_verifier_tool
+
+
+def exit_loop(tool_context: ToolContext) -> dict:
+    """Call this function ONLY when the most recent patch_verifier_tool
+    call(s) confirmed every patch in the current batch is resolved, signaling
+    remediation_loop to stop iterating instead of running to max_iterations."""
+    tool_context.actions.escalate = True
+    tool_context.actions.skip_summarization = True
+    return {}
+
+
 def make_context_analysis_tool(agent: CodeReviewAgent) -> Callable[..., dict]:
     def context_analysis_tool(files: list[dict]) -> dict:
         """Analyze the codebase to understand its purpose, framework, architecture,
@@ -1363,14 +1579,18 @@ def build_multi_agent_system(
 ) -> Agent:
     """Build a 5-layer multi-agent graph for the ADK playground.
 
-    Architecture (29 agents total)
-    --------------------------------
+    Architecture (37 LLM agents + 3 deterministic workflow orchestrators = 40 nodes total)
+    -----------------------------------------------------------------------------
     L0 — root (code_review_agent)
          One-shot tool + routes to L1 agents.
 
-    L1 — Strategic layer (8 agents):
+    L1 — Strategic layer (9 LLM agents):
          planner_agent, context_agent, scout_agent, pr_agent,
-         report_agent, dedup_agent, risk_scorer_agent, remediation_agent
+         report_agent, dedup_agent, risk_scorer_agent,
+         patch_generator_agent, patch_verifier_step
+         (the last two replace the old single-shot remediation_agent — see
+         "remediation_loop" below; the outward-facing name "remediation_agent"
+         is preserved, now as a LoopAgent wrapping both)
 
     L2 — Domain coordinators (3 agents):
          security_coordinator, quality_coordinator, intel_coordinator
@@ -1388,6 +1608,28 @@ def build_multi_agent_system(
          taint_validator_agent (under data_flow_agent)
          owasp_agent (under compliance_agent)
          cwe_agent (under compliance_agent)
+
+    Deterministic workflow additions (this session — see agent_spec.md):
+      security_full_scan — SequentialAgent(sub_agents=[
+          ParallelAgent(security_parallel_scan) -> security_aggregator_agent
+        ]). security_parallel_scan runs 6 CLONED specialist agents
+        (sast_agent_scan, injection_agent_scan, auth_agent_scan,
+        crypto_agent_scan, secrets_agent_scan, data_flow_agent_scan —
+        clones, not the same instances as the L3 specialists above, since
+        ADK requires a single-parent agent tree) concurrently, then
+        security_aggregator_agent consolidates their results by severity.
+        security_coordinator's existing single-specialist LLM-routing paths
+        are untouched; only "full/comprehensive security review" now routes
+        here instead of hoping the LLM sequentially calls all six itself.
+
+      remediation_agent — now a LoopAgent (named "remediation_agent" so
+        every existing caller — root, POST /remediate's direct Python call,
+        the Streamlit fix-generation button — still refers to the same
+        name/role) wrapping [patch_generator_agent, patch_verifier_step],
+        max_iterations=3. patch_verifier_step re-verifies each patch
+        (Semgrep re-scan, or an LLM-judged check for non-Semgrep findings)
+        and calls exit_loop once every patch verifies clean, so most patches
+        exit after 1 iteration instead of always running to 3.
     """
 
     pipeline = CodeReviewAgent(
@@ -1511,6 +1753,7 @@ def build_multi_agent_system(
             _ft(make_explain_finding_tool),
         ],
         sub_agents=[validator_agent],
+        output_key="sast_result",
     )
 
     injection_agent = Agent(
@@ -1537,6 +1780,7 @@ def build_multi_agent_system(
             _ft(make_fetch_repo_files_tool),
             _ft(make_injection_audit_tool),
         ],
+        output_key="injection_result",
     )
 
     auth_agent = Agent(
@@ -1564,6 +1808,7 @@ def build_multi_agent_system(
             _ft(make_fetch_repo_files_tool),
             _ft(make_auth_audit_tool),
         ],
+        output_key="auth_result",
     )
 
     crypto_agent = Agent(
@@ -1587,6 +1832,7 @@ def build_multi_agent_system(
             _ft(make_fetch_repo_files_tool),
             _ft(make_crypto_audit_tool),
         ],
+        output_key="crypto_result",
     )
 
     secrets_agent = Agent(
@@ -1617,6 +1863,7 @@ def build_multi_agent_system(
             _ft(make_secrets_audit_tool),
             _ft(make_search_code_tool),
         ],
+        output_key="secrets_result",
     )
 
     data_flow_agent = Agent(
@@ -1646,6 +1893,89 @@ def build_multi_agent_system(
             _ft(make_data_flow_tool),
         ],
         sub_agents=[taint_validator_agent],
+        output_key="data_flow_result",
+    )
+
+    # ── security_full_scan: deterministic "full/comprehensive review" path ──
+    # These six specialists are fully independent (each reads repo files and
+    # does its own audit; no specialist depends on another's output), which
+    # is exactly the case ParallelAgent exists for. This is an ADDITION, not
+    # a replacement: security_coordinator (below) keeps every existing
+    # sub_agent and single-specialist LLM-routing path untouched — only the
+    # "full/comprehensive security review" case now routes here instead of
+    # hoping the LLM remembers to call all six agents itself, one slow
+    # round-trip at a time, with no guarantee none get silently skipped.
+
+    security_aggregator_agent = Agent(
+        name="security_aggregator_agent",
+        model=DEFAULT_MODEL,
+        description=(
+            "Security Findings Aggregator: consolidates the six security "
+            "specialists' results (already collected in session state by "
+            "security_parallel_scan) by severity. No tools — pure synthesis."
+        ),
+        instruction=(
+            "You are the Security Findings Aggregator. All six security "
+            "specialists have already run in parallel and their results are "
+            "in session state below. Your job is deterministic consolidation "
+            "over ACTUALLY-COLLECTED results — not a re-analysis.\n\n"
+            "SAST result:\n{sast_result}\n\n"
+            "Injection result:\n{injection_result}\n\n"
+            "Auth result:\n{auth_result}\n\n"
+            "Crypto result:\n{crypto_result}\n\n"
+            "Secrets result:\n{secrets_result}\n\n"
+            "Data flow result:\n{data_flow_result}\n\n"
+            "TASK: Consolidate every finding from all six results above by "
+            "severity (CRITICAL → HIGH → MEDIUM → LOW). State explicitly "
+            "which of the six agents ran and how many findings each "
+            "produced, so it's visible if any agent found nothing (rather "
+            "than silently omitting it). Do not invent findings that aren't "
+            "present in the six results above.\n\n"
+            "Transfer back to security_coordinator when done."
+        ),
+    )
+
+    # ADK requires a single-parent agent tree (BaseAgent raises if a
+    # sub_agent already has a parent_agent set) -- sast_agent etc. above
+    # already belong to security_coordinator's sub_agents (below), which is
+    # what keeps their existing single-specialist LLM-routing paths
+    # ("check for SQL injection" -> injection_agent) working unchanged. So
+    # the parallel-scan path below uses .clone()'d copies with distinct
+    # names, not the same instances, to avoid a duplicate-parent conflict.
+    # The clones drop the optional validator/taint_validator delegation
+    # sub_agents (not needed for a deterministic full-scan pass) but keep
+    # every tool, instruction, and output_key identical to the originals.
+    sast_agent_scan = sast_agent.clone(update={"name": "sast_agent_scan", "sub_agents": []})
+    injection_agent_scan = injection_agent.clone(update={"name": "injection_agent_scan"})
+    auth_agent_scan = auth_agent.clone(update={"name": "auth_agent_scan"})
+    crypto_agent_scan = crypto_agent.clone(update={"name": "crypto_agent_scan"})
+    secrets_agent_scan = secrets_agent.clone(update={"name": "secrets_agent_scan"})
+    data_flow_agent_scan = data_flow_agent.clone(update={"name": "data_flow_agent_scan", "sub_agents": []})
+
+    security_full_scan = SequentialAgent(
+        name="security_full_scan",
+        description=(
+            "Deterministic full security review: runs all six security "
+            "specialists in parallel (ParallelAgent), then aggregates their "
+            "results (security_aggregator_agent) — replaces hoping the LLM "
+            "sequentially remembers to call all six."
+        ),
+        sub_agents=[
+            ParallelAgent(
+                name="security_parallel_scan",
+                description=(
+                    "Runs sast_agent, injection_agent, auth_agent, "
+                    "crypto_agent, secrets_agent, and data_flow_agent "
+                    "concurrently — they are fully independent, each reads "
+                    "repo files and audits on its own."
+                ),
+                sub_agents=[
+                    sast_agent_scan, injection_agent_scan, auth_agent_scan,
+                    crypto_agent_scan, secrets_agent_scan, data_flow_agent_scan,
+                ],
+            ),
+            security_aggregator_agent,
+        ],
     )
 
     # ── Under quality_coordinator ───────────────────────────────────────────
@@ -1841,7 +2171,8 @@ def build_multi_agent_system(
         model=DEFAULT_MODEL,
         description=(
             "Security Coordinator: orchestrates all 6 security specialist agents "
-            "(SAST, injection, auth, crypto, secrets, data flow) and aggregates results."
+            "(SAST, injection, auth, crypto, secrets, data flow) and aggregates results. "
+            "Full/comprehensive requests route deterministically through security_full_scan."
         ),
         instruction=(
             "You are the Security Coordinator. You manage six security specialist "
@@ -1854,19 +2185,24 @@ def build_multi_agent_system(
             "  • secrets_agent     — hardcoded API keys, passwords, private keys\n"
             "  • data_flow_agent   — taint analysis: input → dangerous sink\n\n"
             "ROUTING:\n"
-            "- 'Full security review' / 'comprehensive' → all six agents sequentially\n"
+            "- 'Full security review' / 'comprehensive' → transfer to security_full_scan. "
+            "It deterministically runs all six specialists in parallel and aggregates "
+            "their results itself — do NOT try to call all six agents yourself one at "
+            "a time; security_full_scan guarantees none get silently skipped.\n"
             "- 'Injection' / 'SQL injection' / 'XSS' → injection_agent\n"
             "- 'Auth' / 'IDOR' / 'access control' → auth_agent\n"
             "- 'Crypto' / 'encryption' → crypto_agent\n"
             "- 'Secrets' / 'credentials' → secrets_agent\n"
             "- 'Data flow' / 'taint' → data_flow_agent\n"
             "- General 'security review' → sast_agent first, then injection + auth\n\n"
-            "AGGREGATION: After specialists return, consolidate by severity. "
-            "State which agents ran and how many findings each produced. "
+            "AGGREGATION: For single-specialist requests, after the specialist returns, "
+            "present its findings directly. For security_full_scan, its own "
+            "security_aggregator_agent already consolidated by severity — relay that "
+            "consolidated result, don't re-derive it. "
             "Transfer back to planner_agent when done."
         ),
         sub_agents=[sast_agent, injection_agent, auth_agent, crypto_agent,
-                    secrets_agent, data_flow_agent],
+                    secrets_agent, data_flow_agent, security_full_scan],
     )
 
     quality_coordinator = Agent(
@@ -2109,15 +2445,25 @@ def build_multi_agent_system(
         tools=[_ft(make_risk_score_tool)],
     )
 
-    remediation_agent = Agent(
-        name="remediation_agent",
+    # ── remediation_loop: verify-and-refine, not single-shot ────────────────
+    # A single-shot patch generation call has no check that the patch it
+    # produced actually resolves the finding it targets. Unlike a case such
+    # as sast_agent -> validator_agent (a single-pass judgment call with no
+    # new information to loop on), each patch-generation attempt here CAN
+    # get new information each iteration -- whether the patched code still
+    # trips the same Semgrep rule/finding -- so verify-and-refine is the
+    # right shape, not re-asking the same question twice.
+
+    patch_generator_agent = Agent(
+        name="patch_generator_agent",
         model=DEFAULT_MODEL,
         description=(
-            "Remediation Agent: generates concrete, copy-pasteable code fix patches "
-            "for security findings — not vague advice, but real before/after code."
+            "Patch Generator: generates concrete, copy-pasteable code fix patches "
+            "for security findings — not vague advice, but real before/after code. "
+            "First step of remediation_loop's verify-and-refine cycle."
         ),
         instruction=(
-            "You are the Remediation Agent. Findings without fixes are just complaints. "
+            "You are the Patch Generator. Findings without fixes are just complaints. "
             "Your job: turn every security finding into actionable, copy-pasteable code.\n\n"
             "WORKFLOW:\n"
             "1. You receive a list of security findings AND the source files they "
@@ -2127,15 +2473,84 @@ def build_multi_agent_system(
             "   each finding: vulnerable code → fixed code, one-line explanation, "
             "   required library changes, and whether it's a breaking change.\n"
             "4. Present the patches in order of priority (CRITICAL first).\n\n"
+            "IF the state below contains verifier feedback from a PREVIOUS iteration "
+            "of this loop (not just 'No prior attempts.'), it means your last patch(es) "
+            "did NOT resolve the finding(s) they targeted. Read the feedback carefully "
+            "and generate a genuinely different fix that addresses WHY the previous "
+            "attempt failed — do not repeat the same patch.\n\n"
+            "Previous verifier feedback:\n{verifier_feedback}\n\n"
             "Patches must be syntactically correct Python. Address root causes, "
-            "not symptoms. Transfer back when done. Use trigger phrases: "
-            "'fix this', 'generate patches', 'how do I fix', 'remediation plan'."
+            "not symptoms. Use trigger phrases: 'fix this', 'generate patches', "
+            "'how do I fix', 'remediation plan'."
         ),
         tools=[
             _ft(make_fetch_repo_files_tool),
             _ft(make_remediation_tool),
         ],
+        output_key="generated_patches",
     )
+
+    patch_verifier_step = Agent(
+        name="patch_verifier_step",
+        model=DEFAULT_MODEL,
+        description=(
+            "Patch Verifier: checks whether patch_generator_agent's most recent "
+            "patches actually resolve the findings they target, by re-scanning the "
+            "patched code. Exits the loop early once every patch verifies clean."
+        ),
+        instruction=(
+            "You are the Patch Verifier. patch_generator_agent just produced patches "
+            "below — your job is to check whether each one ACTUALLY resolves the "
+            "finding it targets, not to trust the generator's own explanation.\n\n"
+            "Patches from patch_generator_agent:\n{generated_patches}\n\n"
+            "WORKFLOW:\n"
+            "1. For each patch above, call patch_verifier_tool with the original "
+            "   finding it targets and the patch dict (finding_index, path, before, "
+            "   after, explanation, ...).\n"
+            "2. If EVERY patch verifies resolved: call exit_loop — do not keep "
+            "   iterating past that point, and do not call remediation_tool "
+            "   yourself.\n"
+            "3. If ANY patch is still unresolved: do NOT call exit_loop. Instead, "
+            "   summarize concisely, per unresolved finding, why it failed (from "
+            "   patch_verifier_tool's 'reason' field) — this becomes the "
+            "   'verifier feedback' the next patch_generator_agent iteration reads "
+            "   to try something different. Already-resolved patches don't need to "
+            "   be mentioned again.\n\n"
+            "Be precise and factual — cite patch_verifier_tool's own verdict, "
+            "don't guess."
+        ),
+        tools=[
+            _ft(make_patch_verifier_tool),
+            FunctionTool(exit_loop),
+        ],
+        output_key="verifier_feedback",
+    )
+
+    def _seed_remediation_state(callback_context) -> None:
+        """Seed 'verifier_feedback' before the loop's first iteration so
+        patch_generator_agent's {verifier_feedback} placeholder always
+        resolves, even on iteration 1 when no verifier has run yet."""
+        if "verifier_feedback" not in callback_context.state:
+            callback_context.state["verifier_feedback"] = "No prior attempts."
+
+    remediation_loop = LoopAgent(
+        name="remediation_agent",
+        description=(
+            "Remediation Agent: generates concrete, copy-pasteable code fix patches "
+            "for security findings and verifies each one actually resolves the "
+            "finding it targets, regenerating up to 3 times when a patch doesn't "
+            "hold up — not vague advice, and not a single unverified guess."
+        ),
+        # Agent order is crucial: generate first, then verify/exit.
+        sub_agents=[patch_generator_agent, patch_verifier_step],
+        max_iterations=3,
+        before_agent_callback=_seed_remediation_state,
+    )
+    # Outward-facing name kept identical to before this change -- root's
+    # sub_agents list, transfer_to_agent routing, and anything reachable via
+    # the ADK Dev UI chat all still refer to "remediation_agent"; only its
+    # implementation changed from a single Agent to this LoopAgent.
+    remediation_agent = remediation_loop
 
     # ══════════════════════════════════════════════════════════════════════════
     # LAYER 0 — Root Orchestrator
@@ -2145,21 +2560,30 @@ def build_multi_agent_system(
         name="code_review_agent",
         model=DEFAULT_MODEL,
         description=(
-            "Master orchestrator of a 5-layer, 29-agent code security and quality "
-            "analysis system. Routes requests to the right specialist or coordinator."
+            "Master orchestrator of a 5-layer, 37-LLM-agent code security and quality "
+            "analysis system (plus 3 deterministic workflow orchestrators for full "
+            "security scans and remediation). Routes requests to the right specialist "
+            "or coordinator."
         ),
         instruction=(
             "You are the master orchestrator of a 5-layer multi-agent code review "
-            "and security analysis system with 29 specialized agents.\n\n"
+            "and security analysis system with 37 specialized LLM agents, plus "
+            "deterministic workflow orchestrators for two paths: a full security "
+            "scan (security_full_scan: runs 6 specialists in parallel, then "
+            "aggregates) and remediation (remediation_agent: generates a patch, "
+            "verifies it, and retries up to 3 times if it doesn't hold up).\n\n"
             "ARCHITECTURE OVERVIEW:\n"
             "  L0: you (root orchestrator)\n"
             "  L1: planner_agent | context_agent | scout_agent | pr_agent |\n"
             "      report_agent | dedup_agent | risk_scorer_agent | remediation_agent\n"
+            "      (remediation_agent is now a verify-and-refine loop internally)\n"
             "  L2: security_coordinator | quality_coordinator | intel_coordinator\n"
             "  L3: sast_agent | injection_agent | auth_agent | crypto_agent |\n"
             "      secrets_agent | data_flow_agent | quality_agent |\n"
             "      complexity_agent | test_agent | doc_agent |\n"
             "      dependency_agent | threat_model_agent | compliance_agent\n"
+            "      (security_coordinator also has security_full_scan for\n"
+            "      deterministic full-scan requests)\n"
             "  L4: validator_agent | taint_validator_agent | owasp_agent | cwe_agent\n\n"
             "YOUR DIRECT TOOL:\n"
             "- review_repo_tool: one-shot quick review. Use when the user wants "

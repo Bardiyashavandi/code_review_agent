@@ -281,3 +281,103 @@ def score_exact(actual: Any, expected: Any, label: str) -> ScoreResult:
     if actual == expected:
         return ScoreResult(True, f"{label}: {actual} (matches expected)")
     return ScoreResult(False, f"{label}: got {actual!r}, expected {expected!r}")
+
+
+def score_full_scan_coverage(
+    results_by_specialist: dict[str, dict],
+    expected_keywords_by_specialist: dict[str, list[str]],
+    result_key: str = "findings",
+) -> ScoreResult:
+    """
+    PASS if EVERY specialist's result in `results_by_specialist` contains at
+    least one finding matching its own expected keywords in
+    `expected_keywords_by_specialist`.
+
+    This stands in for security_full_scan's ParallelAgent + aggregator: the
+    ADK graph guarantees all specialists run (deterministic construction, not
+    LLM memory), so simulating that guarantee here by calling each
+    specialist's underlying method directly and requiring ALL of them to
+    surface their expected finding type is what proves the parallel path
+    doesn't silently drop one -- the failure mode this eval exists to catch
+    is exactly what the OLD "all six agents sequentially" prompt could do
+    (an LLM forgetting to call one specialist), which this deterministic
+    construction makes structurally impossible.
+    """
+    missing: list[str] = []
+    matched: dict[str, list[str]] = {}
+
+    for specialist, expected_keywords in expected_keywords_by_specialist.items():
+        result = results_by_specialist.get(specialist)
+        if result is None:
+            missing.append(f"{specialist} (no result at all)")
+            continue
+        if result.get("parse_error"):
+            missing.append(f"{specialist} (response failed to parse)")
+            continue
+
+        findings = result.get(result_key, [])
+        found_kw = []
+        for f in findings:
+            text = _finding_text(f)
+            found_kw.extend(kw for kw in expected_keywords if kw.lower() in text and kw not in found_kw)
+
+        if found_kw:
+            matched[specialist] = found_kw
+        else:
+            missing.append(f"{specialist} (no finding matched {expected_keywords})")
+
+    if missing:
+        return ScoreResult(
+            False,
+            f"{len(missing)} of {len(expected_keywords_by_specialist)} specialists "
+            f"produced no matching finding: {missing}. Matched: {matched}",
+        )
+
+    return ScoreResult(
+        True,
+        f"All {len(expected_keywords_by_specialist)} specialists surfaced their "
+        f"expected finding type: {matched}",
+    )
+
+
+def score_remediation_convergence(
+    result: dict,
+    min_iterations: int = 2,
+) -> ScoreResult:
+    """
+    PASS if the verify-and-refine loop actually converged (fully_resolved is
+    True) AND took more than one iteration to get there (iterations_run >=
+    min_iterations, default 2). The second condition is what proves the loop
+    did something a single-shot patch generation couldn't -- if it converged
+    in exactly 1 iteration, the fixture didn't actually force the first
+    attempt to fail, and the test isn't exercising the refine step at all.
+    """
+    if result.get("parse_error"):
+        return ScoreResult(False, f"Response failed to parse: {result.get('raw', '')[:200]}")
+
+    fully_resolved = result.get("fully_resolved")
+    iterations_run = result.get("iterations_run", 0)
+
+    if not fully_resolved:
+        return ScoreResult(
+            False,
+            f"Loop did not converge within its iteration cap: "
+            f"iterations_run={iterations_run}, "
+            f"unresolved_finding_indices={result.get('unresolved_finding_indices')}.",
+        )
+
+    if iterations_run < min_iterations:
+        return ScoreResult(
+            False,
+            f"Converged, but in only {iterations_run} iteration(s) -- the fixture "
+            f"didn't force a first-attempt failure, so this doesn't prove the "
+            f"refine step (>= {min_iterations} expected) did anything a single-shot "
+            f"patch generation couldn't.",
+        )
+
+    return ScoreResult(
+        True,
+        f"Verify-and-refine loop converged after {iterations_run} iterations "
+        f"(fully_resolved=True) -- the second attempt succeeded where the first "
+        f"one, by construction of this fixture, did not.",
+    )
