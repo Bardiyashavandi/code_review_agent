@@ -1,15 +1,27 @@
 """
-adk_demo.py
------------
+scripts/adk_demo.py
+--------------------
 Small standalone script for the video demo: shows the ADK agent deciding,
 on its own, to call review_repo_tool from a plain-language request.
 
-Run it directly:
-    python3 adk_demo.py
+Run it directly (from anywhere -- this adds the repo root to sys.path so
+`agent` resolves as a top-level module either way):
+    python3 scripts/adk_demo.py
 """
 
 import asyncio
 import os
+import sys
+from pathlib import Path
+
+# This script lives in scripts/, one level below the repo root where
+# agent.py and its sibling modules live as top-level modules (not a
+# package) -- add the repo root to sys.path so `from agent import ...`
+# below resolves the same way it would if this script were still at the
+# repo root itself.
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
 
 from dotenv import load_dotenv
 from google.adk.runners import InMemoryRunner

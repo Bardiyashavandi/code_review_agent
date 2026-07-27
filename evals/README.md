@@ -98,7 +98,7 @@ None of these come from a real past PR in this repo — this repo's own
 history doesn't contain real vulnerable code to mine (it's a security
 tool, not a vulnerable app), so all 14 fixtures are synthetic but modeled
 on real-world patterns. `fixtures/vulnerable/weak_crypto.py` is adapted
-from the sample already used in `demo_security_agents.py` for continuity
+from the sample already used in `scripts/demo_security_agents.py` for continuity
 with that existing manual-verification script.
 
 ## Scoring philosophy

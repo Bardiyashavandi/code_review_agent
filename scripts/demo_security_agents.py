@@ -1,7 +1,21 @@
-"""Test dependency CVE scanner and crypto auditor on the code_review_agent repo."""
+"""Test dependency CVE scanner and crypto auditor on the code_review_agent repo.
+
+Run directly (from anywhere): python3 scripts/demo_security_agents.py
+"""
 import os
+import sys
+from pathlib import Path
+
 from dotenv import load_dotenv
 load_dotenv()
+
+# This script lives in scripts/, one level below the repo root where
+# agent.py and its sibling modules live as top-level modules (not a
+# package) -- add the repo root to sys.path so the imports below resolve
+# the same way they would if this script were still at the repo root.
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
 
 from agent import CodeReviewAgent
 from dependency_scanner import scan_dependencies

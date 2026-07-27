@@ -346,7 +346,7 @@ remediation_agent = LoopAgent(sub_agents=[
 
 `POST /remediate` and the Streamlit fix-generation button call `CodeReviewAgent.generate_remediation_patches()` as a **direct Python method call** — this bypasses the ADK graph entirely, so `remediation_agent`'s `LoopAgent` behavior wouldn't reach those two surfaces on its own. `CodeReviewAgent.generate_remediation_patches_with_verification()` mirrors the same verify-and-refine shape (same `max_iterations=3` cap) for these non-ADK callers, and both endpoints now use it — every surface (ADK Dev UI chat, `/remediate`, Streamlit) gets the same verify-and-refine behavior, not just the one that happens to go through the agent graph.
 
-Full design writeup: [`agent_spec.md`](./agent_spec.md) §11–12.
+Full design writeup: [`specs/agent_spec.md`](./specs/agent_spec.md) §11–12.
 
 ---
 
@@ -890,15 +890,21 @@ code_review_agent/
 ├── Entry points
 │   ├── main.py                   # CLI: python3 main.py <url>
 │   ├── server.py                 # HTTP API: FastAPI, POST /analyze + /remediate
-│   ├── streamlit_app.py          # Browser UI: calls server.py over HTTP
-│   └── adk_demo.py               # Standalone ADK tool-calling demo
+│   └── streamlit_app.py          # Browser UI: calls server.py over HTTP
 │
 ├── Observability
 │   ├── tracing.py                # Span context manager → traces/trace.jsonl
 │   └── view_trace.py             # CLI viewer: tree / flat / list / RPD counter
 │
-├── Specs (written before code)
-│   └── *_spec.md                 # Interface, behavior, error hierarchy, test table
+├── scripts/                      # Standalone demo scripts (not imported by the
+│   ├── adk_demo.py               #   pipeline itself) -- each adds the repo root
+│   └── demo_security_agents.py   #   to sys.path so top-level imports still resolve
+│
+├── specs/                        # Written before code, per module
+│   ├── agent_spec.md             #   Interface, behavior, error hierarchy, test table
+│   ├── gemini_reviewer_spec.md
+│   ├── report_generator_spec.md
+│   └── semgrep_runner_spec.md
 │
 ├── Tests
 │   └── tests/                    # 245 tests, one file per module, all mocked
@@ -931,7 +937,7 @@ code_review_agent/
 
 ## What this demonstrates
 
-**Spec-driven development.** Every module started as a written spec (interface, behavior, error hierarchy, test table) before any implementation code. The `*_spec.md` files are the visible record of that.
+**Spec-driven development.** Every module started as a written spec (interface, behavior, error hierarchy, test table) before any implementation code. The [`specs/`](./specs) directory's `*_spec.md` files are the visible record of that.
 
 **Genuine multi-agent architecture.** Thirty-seven LLM agents across five layers — root orchestrator, strategic agents (planner, context analyzer, scout, PR reviewer, reporter, deduplicator, risk scorer, remediation), three domain coordinators (security, quality, intel), specialists (SAST, injection, auth, crypto, secrets, data flow, quality, complexity, test coverage, documentation, dependency CVE, threat model, compliance), and sub-specialists (findings validator, taint validator, OWASP mapper, CWE mapper). Each has a narrow role, focused instructions, and only the tools it actually needs. Agent-to-agent transfers are explicit and visible in the ADK playground. A dedicated `pr_agent` reviews only the changed files in a Pull Request and can post its findings as **inline comments directly on the GitHub PR**. The `dependency_agent` queries the free [OSV](https://osv.dev) database for known CVEs in pinned dependencies. The `data_flow_agent` traces untrusted input from entry points through to dangerous sinks, with the `taint_validator_agent` confirming path reachability. The `compliance_agent` delegates to `owasp_agent` and `cwe_agent` to map every finding to OWASP Top 10 2021 and CWE Top 25. The `risk_scorer_agent` quantifies findings with a CVSS-like composite score.
 

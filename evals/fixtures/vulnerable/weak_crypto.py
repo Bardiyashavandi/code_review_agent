@@ -1,5 +1,5 @@
 """Synthetic fixture: weak/misused cryptography.
-Adapted from the weak-crypto sample already used in demo_security_agents.py
+Adapted from the weak-crypto sample already used in scripts/demo_security_agents.py
 for continuity with existing manual verification in this repo."""
 
 import hashlib

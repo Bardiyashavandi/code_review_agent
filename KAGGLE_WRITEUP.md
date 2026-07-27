@@ -87,7 +87,7 @@ All three are now fixed, documented in the README, and covered by regression tes
 
 ## Spec-driven development
 
-Every module started as a written specification (interface, expected behavior, error hierarchy, and a test table) before a line of implementation code was written. The specs live alongside the code in the repository (`*_spec.md` files) as a visible record of that process.
+Every module started as a written specification (interface, expected behavior, error hierarchy, and a test table) before a line of implementation code was written. The specs live in the repository's `specs/` directory (`*_spec.md` files) as a visible record of that process.
 
 ## Tech stack
 

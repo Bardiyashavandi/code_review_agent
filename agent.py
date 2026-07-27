@@ -1609,7 +1609,7 @@ def build_multi_agent_system(
          owasp_agent (under compliance_agent)
          cwe_agent (under compliance_agent)
 
-    Deterministic workflow additions (this session — see agent_spec.md):
+    Deterministic workflow additions (this session — see specs/agent_spec.md):
       security_full_scan — SequentialAgent(sub_agents=[
           ParallelAgent(security_parallel_scan) -> security_aggregator_agent
         ]). security_parallel_scan runs 6 CLONED specialist agents
