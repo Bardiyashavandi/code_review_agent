@@ -34,11 +34,21 @@ Two modes:
   LLM at all, so they're a genuine, deterministic pass/fail regardless of
   --mode.
 
+  The 3 `trajectory` cases (evals/trajectory_cases.py) are structurally
+  different from every other category: they build and run the actual ADK
+  agent graph (agent.build_multi_agent_system) via InMemoryRunner and
+  assert on the real event trace (which agents ran, which tools were
+  called), rather than calling a CodeReviewAgent method directly. See
+  README.md's "Trajectory cases" section and trajectory_cases.py's module
+  docstring for the full rationale and what each --mode does for them.
+
 Usage:
     python3 runner.py                       # mock mode (default)
     python3 runner.py --mode live           # real eval, needs GEMINI_API_KEY
     python3 runner.py --mode live --category detection
     python3 runner.py --mode live --only det-01-sqli,fp-02-enum-table-name
+    python3 runner.py --category trajectory              # mock, harness-only
+    python3 runner.py --mode live --category trajectory  # needs GEMINI_API_KEY + GITHUB_TOKEN
 """
 
 from __future__ import annotations
@@ -61,6 +71,7 @@ sys.path.insert(0, str(_THIS_DIR))
 from cases import ALL_CASES, FIXTURES_DIR, EvalCase  # noqa: E402
 from cost_estimate_cases import run_cost_estimate_case_1, run_cost_estimate_case_2  # noqa: E402
 from scorers import ScoreResult  # noqa: E402
+from trajectory_cases import TRAJECTORY_CASES  # noqa: E402
 
 _RESET, _BOLD, _DIM = "\033[0m", "\033[1m", "\033[2m"
 _RED, _GREEN, _YELLOW, _CYAN = "\033[31m", "\033[32m", "\033[33m", "\033[36m"
@@ -124,6 +135,34 @@ def _run_llm_backed_case(case: EvalCase, mode: str) -> tuple[ScoreResult, float]
     return result, duration
 
 
+def _run_trajectory_cases(mode: str, only_ids: set[str] | None) -> list[dict]:
+    """Runs the 3 trajectory cases (evals/trajectory_cases.py). Structurally
+    separate from _run_llm_backed_case: these build and run the actual ADK
+    graph via InMemoryRunner (agent.build_multi_agent_system + event-trace
+    inspection), not a CodeReviewAgent method call, so they don't fit the
+    same "construct a CodeReviewAgent, call case.run(agent, fixtures_dir)"
+    shape every other case uses. See trajectory_cases.py's module docstring
+    for the full rationale."""
+    rows: list[dict] = []
+    for case in TRAJECTORY_CASES:
+        if only_ids is not None and case.id not in only_ids:
+            continue
+        start = time.monotonic()
+        try:
+            events = case.run(mode)
+            result = case.score(events)
+            status = "PASS" if result.passed else "FAIL"
+            detail = result.detail
+        except Exception as exc:  # noqa: BLE001 — surface any failure as a row, don't crash the suite
+            status, detail = "ERROR", f"{type(exc).__name__}: {exc}"
+        duration = time.monotonic() - start
+        rows.append({
+            "id": case.id, "category": "trajectory", "description": case.description,
+            "status": status, "detail": detail, "duration_s": round(duration, 2),
+        })
+    return rows
+
+
 def _run_cost_estimate_cases(tmp_dir: Path) -> list[tuple[str, str, ScoreResult, float]]:
     out = []
     for case_id, description, fn in [
@@ -150,7 +189,8 @@ def main() -> None:
     parser.add_argument("--mode", choices=["mock", "live"], default="mock")
     parser.add_argument("--category", default=None,
                          help="Only run cases in this category "
-                              "(detection|false_positive|dedup|risk_scoring|cost_estimate)")
+                              "(detection|false_positive|dedup|risk_scoring|prompt_injection|"
+                              "security_full_scan|remediation_loop|cost_estimate|trajectory)")
     parser.add_argument("--only", default=None, help="Comma-separated case IDs to run")
     parser.add_argument("--json-out", default=None, help="Write full results as JSON to this path")
     args = parser.parse_args()
@@ -203,6 +243,9 @@ def main() -> None:
                     "id": case_id, "category": "cost_estimate", "description": description,
                     "status": status, "detail": result.detail, "duration_s": round(duration, 2),
                 })
+
+    if args.category is None or args.category == "trajectory":
+        rows.extend(_run_trajectory_cases(args.mode, only_ids))
 
     _print_table(rows)
 

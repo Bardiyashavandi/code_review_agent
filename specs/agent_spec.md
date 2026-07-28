@@ -275,3 +275,43 @@ remediation_loop = LoopAgent(
 - [ ] `/remediate` and the Streamlit fix-generation button both benefit from verify-and-refine, not just the ADK Dev UI chat path
 - [ ] No new subprocess pattern introduced for patch verification (reuses `SemgrepRunner.scan`)
 - [ ] No new Gemini-calling mechanism introduced for the LLM-judged fallback (reuses `GeminiReviewer._call_model`)
+
+## 13. Trajectory verification of §11/§12 (`evals/trajectory_cases.py`)
+
+§11.3 and §12.4 above verify `security_full_scan` and `remediation_agent` are
+**constructed** correctly — right agent types, right `sub_agents`, right
+clones, right `output_key`s — by inspecting `build_multi_agent_system()`'s
+returned tree without running it. Neither proves the graph actually
+**behaves** that way when it runs: that all 6 parallel specialists really
+fire, or that `remediation_agent`'s loop really exits early / really reports
+honestly on exhaustion. `evals/trajectory_cases.py` closes that gap with 3
+cases that build the real ADK graph and run it via `google.adk.runners.
+InMemoryRunner`, inspecting the actual event trace.
+
+**Why this lives in `evals/`, not `tests/`:** these cases make real Gemini
+(and, for one case, real GitHub) calls in `--mode live`, same as the rest of
+`evals/`'s LLM-backed cases — that's an eval property (real judgment), not a
+unit-test property (fully offline, always deterministic). `--mode mock`
+exists purely as a harness self-test, same convention as every other
+category.
+
+**Why hand-rolled `InMemoryRunner` trace inspection instead of ADK's own
+`AgentEvaluator` / `*.evalset.json` / `adk eval`:** that framework expects a
+fixed on-disk module exposing `root_agent` and scores tool-call trajectory
+against a hand-authored expected sequence. This repo's agent is a factory
+(`build_multi_agent_system(github_token, gemini_api_key)`) needing runtime
+secrets, and these 3 cases specifically need to invoke a **sub-tree**
+(`security_full_scan` / `remediation_agent`) directly — bypassing root's own
+LLM-driven routing decision, which is a separate, already-covered concern —
+rather than the whole graph from a user-facing prompt. `InMemoryRunner` plus
+direct event-trace inspection fits that need without forcing it through
+evalset JSON this repo doesn't otherwise use. Full rationale, the exact 3
+cases, and the two-layer mocking design (`agent.GeminiReviewer` for pipeline
+judgment vs. `google.adk.models.google_llm.Gemini.generate_content_async`
+for the ADK graph's own model calls) are documented in
+`evals/trajectory_cases.py`'s module docstring and `evals/README.md`'s
+"Trajectory cases" section — not duplicated here to avoid the two
+descriptions drifting apart.
+
+Tests for the pure-Python trace-parsing/scoring logic backing these cases:
+`tests/test_trajectory_scorers.py`.
