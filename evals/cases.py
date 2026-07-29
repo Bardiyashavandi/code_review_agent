@@ -34,8 +34,9 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass, field
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Callable
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from scorers import (
     ScoreResult,
@@ -45,6 +46,7 @@ from scorers import (
     score_full_scan_coverage,
     score_injection_resistance,
     score_remediation_convergence,
+    score_retrieval_quality,
     score_risk_ordering,
 )
 
@@ -623,7 +625,89 @@ def _remediation_convergence_case():
 REMEDIATION_LOOP_CASES = [_remediation_convergence_case()]
 
 
+# ---------------------------------------------------------------------------
+# Category 9 — retrieval_quality: RAG comment retrieval accuracy (1 case)
+# ---------------------------------------------------------------------------
+#
+# embed_review_comments / retrieve_relevant_comments (gemini_reviewer.py) are
+# real embedding-backed judgment calls, same rationale as every other
+# LLM-backed category here: a mocked embedding response can't tell "did it
+# actually rank the relevant comment higher" apart from "did the harness
+# wire the mock correctly" (already covered by tests/test_gemini_reviewer.py's
+# TestEmbedReviewComments/TestRetrieveRelevantComments, which use hand-picked
+# vectors, not real semantic judgment). This case builds a comment_index with
+# one CLEARLY relevant comment (parameterize queries) and one CLEARLY
+# irrelevant one (a docstring nit on an unrelated file), retrieves against a
+# real SQL-injection fixture, and asserts the relevant comment surfaces in
+# the top_k while the irrelevant one does not.
+#
+# Unlike every other category, this doesn't call a CodeReviewAgent method at
+# all -- CodeReviewAgent has no wrapper for these two RAG methods (they're
+# only ever driven internally, from review()'s per-batch loop), so this
+# reaches into agent._reviewer directly, same as rem-01's approach above.
+# --mode mock scripts embed_content by matching on the embedded text itself
+# (this category never calls generate_content, so the runner's shared
+# mock_text mechanism doesn't apply here) -- skipped automatically in
+# --mode live, where real embeddings do the actual ranking.
+
+def _retrieval_quality_case():
+    relevant_comment = {
+        "path": "auth/db.py", "line": 4,
+        "body": "Always use parameterized queries here -- string-formatting "
+                "user input into SQL is how we got bitten by injection last time.",
+    }
+    irrelevant_comment = {
+        "path": "utils/formatting.py", "line": 12,
+        "body": "Please add a docstring explaining what this helper returns.",
+    }
+
+    def run(agent, fixtures_dir):
+        reviewer = agent._reviewer
+        client = reviewer._client
+
+        if isinstance(client, MagicMock):
+            # --mode mock only: real embedding vectors aren't available, so
+            # script embed_content deterministically by matching on the text
+            # being embedded (order-independent -- embed_review_comments and
+            # retrieve_relevant_comments each call it once per text).
+            def scripted_embed(*, model, contents, config):
+                text = contents.lower()
+                if "parameterized queries" in text:
+                    vector = [0.99, 0.14107]   # near the SQLi query below
+                elif "docstring" in text:
+                    vector = [0.0, 1.0]         # orthogonal -- unrelated
+                else:
+                    vector = [1.0, 0.0]         # the SQLi batch content itself (the query)
+                return SimpleNamespace(embeddings=[SimpleNamespace(values=vector)])
+            client.models.embed_content.side_effect = scripted_embed
+
+        comment_index = reviewer.embed_review_comments([relevant_comment, irrelevant_comment])
+        batch_content = _load_file("vulnerable/sqli.py").content
+        return reviewer.retrieve_relevant_comments(batch_content, comment_index, top_k=1)
+
+    def score(result):
+        return score_retrieval_quality(
+            result,
+            expected_present={"path": relevant_comment["path"], "body_kw": "parameterized"},
+            expected_absent={"path": irrelevant_comment["path"], "body_kw": "docstring"},
+        )
+
+    return EvalCase(
+        "rag-01-relevant-over-irrelevant", "retrieval_quality",
+        "Given a comment_index with one clearly-relevant past review comment "
+        "(parameterize queries) and one clearly-irrelevant one (a docstring nit "
+        "on an unrelated file), retrieve_relevant_comments against a real SQL "
+        "injection fixture must surface the relevant one in the top_k and leave "
+        "the irrelevant one out.",
+        run, score, mock_text="",  # unused -- this category scripts embed_content directly, not generate_content
+    )
+
+
+RETRIEVAL_QUALITY_CASES = [_retrieval_quality_case()]
+
+
 ALL_CASES: list[EvalCase] = (
     DETECTION_CASES + FALSE_POSITIVE_CASES + DEDUP_CASES + RISK_SCORING_CASES
     + PROMPT_INJECTION_CASES + SECURITY_FULL_SCAN_CASES + REMEDIATION_LOOP_CASES
+    + RETRIEVAL_QUALITY_CASES
 )

@@ -12,6 +12,8 @@ Run with:
 from __future__ import annotations
 
 import json
+import re
+from collections import Counter
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -20,6 +22,7 @@ from google.genai import errors as genai_errors
 
 from gemini_reviewer import (
     DEFAULT_MODEL,
+    DEFAULT_SEMANTIC_CACHE_THRESHOLD,
     FALLBACK_MODEL,
     MAX_RETRIES,
     RAG_DOCUMENT_TASK_TYPE,
@@ -33,6 +36,8 @@ from gemini_reviewer import (
     GeminiReviewer,
     ProjectContext,
     ReviewReport,
+    _cosine_similarity,
+    _rag_fingerprint,
 )
 
 # ---------------------------------------------------------------------------
@@ -635,7 +640,7 @@ class TestSemanticCache:
         reviewer, mock_client = make_reviewer()
         # Pre-populate the bucket directly so the lookup path is exercised
         # (rather than the "empty bucket, skip embedding" short-circuit).
-        reviewer._semantic_cache["sys"] = [(NEAR_DUPLICATE_VECTOR_A, "stale cached response")]
+        reviewer._semantic_cache[("sys", "")] = [(NEAR_DUPLICATE_VECTOR_A, "stale cached response")]
         mock_client.models.embed_content.side_effect = Exception("embedding service down")
         mock_client.models.generate_content.return_value = response_text(summary="real response")
 
@@ -679,6 +684,139 @@ class TestSemanticCache:
         mock_client.models.embed_content.return_value = embedding_response(moderate_vector)
         reviewer._call_model("prompt C, somewhat related", system_instruction="sys")
         assert mock_client.models.generate_content.call_count == 2  # hit, no new real call
+
+
+def _bow_vector(text: str, vocab: list[str]) -> list[float]:
+    """Bag-of-words vector for `text` over a fixed `vocab` -- a crude but
+    structurally realistic stand-in for a real text embedding, used only in
+    TestSemanticCacheRagGrounding below. No network call, no real Gemini
+    embedding available in this environment -- but cosine similarity's core
+    property (dominated by content two texts SHARE) holds for any reasonable
+    text embedding, dense or sparse, which is exactly the property that test
+    needs to demonstrate."""
+    counts = Counter(re.findall(r"\w+", text.lower()))
+    return [float(counts.get(w, 0)) for w in vocab]
+
+
+class TestSemanticCacheRagGrounding:
+    """
+    Day-3 task: investigates whether the semantic cache can produce a
+    spurious hit between two prompts that share the same code batch/
+    findings but were grounded by DIFFERENT RAG-retrieved past-review
+    comments (e.g. because comment_index changed between calls, or a
+    top-k tie broke differently). The reasoning to verify: RAG content is
+    cached per (repo, branch) for the process's lifetime (agent.py's
+    build_project_context), so within one process a given code batch
+    should retrieve the same top-3 comments every time -- but does the
+    cache actually GUARANTEE that, structurally, or does it just happen
+    to hold in the common case?
+
+    Finding: the guarantee did NOT hold. The semantic cache's bucket key
+    used to be `system_instruction` alone -- it never considered which
+    RAG comments (if any) were folded into the prompt. The first test
+    below demonstrates why that matters: the "## Relevant past review
+    feedback" section _build_prompt renders is typically a few short
+    lines next to an entire code batch, so swapping out the retrieved
+    comments barely moves the prompt's overall similarity. That's a real,
+    structural gap -- not a hypothetical -- so gemini_reviewer.py's bucket
+    key was changed to (system_instruction, rag_fingerprint), where
+    rag_fingerprint hashes the actual retrieved comments (see
+    _rag_fingerprint). The remaining tests prove that fix closes the gap
+    even in the worst case: identical embedding vectors.
+    """
+
+    def test_prompts_with_different_rag_grounding_can_still_look_near_identical(self):
+        reviewer, _mock_client = make_reviewer()
+        # A large-ish code batch, held IDENTICAL across both prompts, same
+        # as the same Semgrep findings -- only relevant_comments differs.
+        batch = [make_file("large_module.py", content="def f():\n    pass\n" * 200)]
+        findings = [make_finding("large_module.py")]
+
+        comments_a = [{"body": "always parameterize SQL queries", "path": "db.py", "line": 10}]
+        comments_b = [{"body": "add a docstring to this helper", "path": "utils.py", "line": 5}]
+
+        prompt_a = reviewer._build_prompt(batch, findings, relevant_comments=comments_a)
+        prompt_b = reviewer._build_prompt(batch, findings, relevant_comments=comments_b)
+
+        assert prompt_a != prompt_b  # genuinely different prompts, different RAG grounding
+
+        vocab = sorted(set(re.findall(r"\w+", (prompt_a + " " + prompt_b).lower())))
+        similarity = _cosine_similarity(_bow_vector(prompt_a, vocab), _bow_vector(prompt_b, vocab))
+
+        assert similarity >= DEFAULT_SEMANTIC_CACHE_THRESHOLD, (
+            f"Expected overall prompt similarity ({similarity:.4f}) to stay at/above "
+            f"the semantic cache threshold ({DEFAULT_SEMANTIC_CACHE_THRESHOLD}) despite "
+            f"genuinely different RAG grounding -- this is the real mechanism the "
+            f"(system_instruction, rag_fingerprint) bucket key exists to guard against."
+        )
+
+    def test_rag_fingerprint_differs_for_different_comment_sets(self):
+        comments_a = [{"body": "always parameterize SQL queries", "path": "db.py", "line": 10}]
+        comments_b = [{"body": "add a docstring to this helper", "path": "utils.py", "line": 5}]
+
+        assert _rag_fingerprint(comments_a) != _rag_fingerprint(comments_b)
+        assert _rag_fingerprint(comments_a) == _rag_fingerprint(list(comments_a))  # stable/repeatable
+        assert _rag_fingerprint(None) == ""
+        assert _rag_fingerprint([]) == ""
+
+    def test_different_rag_grounding_never_shares_a_cache_bucket_even_with_identical_vectors(self):
+        # Worst case: force the underlying embeddings to be IDENTICAL (as
+        # if a real embedding model really did consider these near-
+        # duplicates overall) -- the fix must still prevent a cross-hit,
+        # because the bucket key itself now differs.
+        reviewer, mock_client = make_reviewer()
+        mock_client.models.embed_content.return_value = embedding_response(NEAR_DUPLICATE_VECTOR_A)
+
+        comments_a = [{"body": "always parameterize SQL queries", "path": "db.py", "line": 10}]
+        comments_b = [{"body": "add a docstring to this helper", "path": "utils.py", "line": 5}]
+
+        mock_client.models.generate_content.return_value = response_text(summary="grounded by comment A")
+        reviewer._call_model("prompt grounded by A", system_instruction="sys", relevant_comments=comments_a)
+        assert mock_client.models.generate_content.call_count == 1
+
+        # A DIFFERENT prompt string (as it always is in practice -- the RAG
+        # comments are inlined into the prompt text by _build_prompt before
+        # _call_model is ever called, so different relevant_comments always
+        # means a different prompt argument too; this is a semantic-cache
+        # question, not an exact-match one), same system_instruction, same
+        # (mocked) embedding vector, but DIFFERENT RAG grounding -- must NOT
+        # reuse comment A's response.
+        mock_client.models.generate_content.return_value = response_text(summary="grounded by comment B")
+        reviewer._call_model("prompt grounded by B", system_instruction="sys", relevant_comments=comments_b)
+
+        assert mock_client.models.generate_content.call_count == 2  # no spurious cross-hit
+
+    def test_same_rag_grounding_still_shares_a_cache_bucket_as_before(self):
+        # The fix must not regress the common case Task 2's own reasoning
+        # describes: repeat calls with the SAME retrieved comments (typical
+        # within one process, per build_project_context's per-repo/branch
+        # caching) should still benefit from the semantic cache exactly as
+        # before this change.
+        reviewer, mock_client = make_reviewer()
+        mock_client.models.embed_content.return_value = embedding_response(NEAR_DUPLICATE_VECTOR_A)
+        comments = [{"body": "always parameterize SQL queries", "path": "db.py", "line": 10}]
+
+        mock_client.models.generate_content.return_value = response_text(summary="original")
+        reviewer._call_model("prompt A", system_instruction="sys", relevant_comments=comments)
+
+        mock_client.models.embed_content.return_value = embedding_response(NEAR_DUPLICATE_VECTOR_B)
+        reviewer._call_model("prompt A near-duplicate", system_instruction="sys", relevant_comments=comments)
+
+        assert mock_client.models.generate_content.call_count == 1  # semantic hit, as before
+
+    def test_no_rag_grounding_calls_are_unaffected_by_the_fix(self):
+        # Every _call_model call site except review()'s per-batch loop
+        # never passes relevant_comments at all -- confirms the default
+        # (None) behaves identically to before this change.
+        reviewer, mock_client = make_reviewer()
+        mock_client.models.embed_content.return_value = embedding_response(NEAR_DUPLICATE_VECTOR_A)
+        mock_client.models.generate_content.return_value = response_text(summary="first")
+        reviewer._call_model("prompt A", system_instruction="sys")
+
+        mock_client.models.embed_content.return_value = embedding_response(NEAR_DUPLICATE_VECTOR_B)
+        reviewer._call_model("prompt A near-duplicate", system_instruction="sys")
+
+        assert mock_client.models.generate_content.call_count == 1  # unaffected: still a semantic hit
 
 
 # ---------------------------------------------------------------------------
@@ -758,6 +896,46 @@ class TestEmbedReviewComments:
 
         assert len(indexed) == 1
         assert indexed[0][1]["body"] == "second comment"
+
+    def test_embedding_input_is_contextualized_with_path_and_line(self):
+        # Contextual Retrieval: the embedded TEXT should carry file/line
+        # context, not just the bare comment body -- a standalone body like
+        # "please add input validation here" is semantically generic and
+        # hard to retrieve accurately against on its own.
+        reviewer, mock_client = make_reviewer()
+        mock_client.models.embed_content.return_value = embedding_response(NEAR_DUPLICATE_VECTOR_A)
+        comments = [{"body": "please add input validation here", "path": "auth.py", "line": 42}]
+
+        reviewer.embed_review_comments(comments)
+
+        embedded_text = mock_client.models.embed_content.call_args.kwargs["contents"]
+        assert "auth.py" in embedded_text
+        assert "42" in embedded_text
+        assert "please add input validation here" in embedded_text
+
+    def test_embedding_input_falls_back_to_bare_body_without_a_path(self):
+        reviewer, mock_client = make_reviewer()
+        mock_client.models.embed_content.return_value = embedding_response(NEAR_DUPLICATE_VECTOR_A)
+        comments = [{"body": "please add input validation here", "path": "", "line": 0}]
+
+        reviewer.embed_review_comments(comments)
+
+        embedded_text = mock_client.models.embed_content.call_args.kwargs["contents"]
+        assert embedded_text == "please add input validation here"
+
+    def test_returned_comment_dict_is_unmodified_by_contextualization(self):
+        # The context prefix is embedding-input only -- _build_prompt still
+        # renders the ORIGINAL comment dict, so the final prompt shown to
+        # the model must be completely unaffected by this change.
+        reviewer, mock_client = make_reviewer()
+        mock_client.models.embed_content.return_value = embedding_response(NEAR_DUPLICATE_VECTOR_A)
+        comments = [{"body": "please add input validation here", "path": "auth.py", "line": 42}]
+
+        indexed = reviewer.embed_review_comments(comments)
+
+        _vector, stored_comment = indexed[0]
+        assert stored_comment == comments[0]
+        assert stored_comment["body"] == "please add input validation here"
 
 
 class TestRetrieveRelevantComments:

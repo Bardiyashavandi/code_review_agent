@@ -1097,6 +1097,62 @@ def _cosine_similarity(a: list[float], b: list[float]) -> float:
     return dot / (norm_a * norm_b)
 
 
+def _contextualize_comment_for_embedding(comment: dict) -> str:
+    """
+    Prepend the comment's file/line location before embedding it (Contextual
+    Retrieval — see https://www.anthropic.com/engineering/contextual-retrieval):
+    a standalone comment body like "please add input validation here" is
+    semantically generic and hard to retrieve accurately against; the same
+    comment tied to the file it was actually left on is far more
+    distinguishable at retrieval time.
+
+    Embedding-input only — the comment dict itself is stored and rendered
+    unchanged by embed_review_comments/_build_prompt, so this does not
+    change what the model ultimately sees in the final prompt, only what
+    text gets embedded to build the retrieval index.
+    """
+    body = comment.get("body", "")
+    path = comment.get("path", "")
+    line = comment.get("line", "")
+    if not path:
+        return body
+    location = f"{path}:{line}" if line else path
+    return f"In {location}: {body}"
+
+
+def _rag_fingerprint(relevant_comments: list[dict] | None) -> str:
+    """
+    Stable fingerprint of which RAG-retrieved past-review comments grounded
+    a prompt, used as part of the semantic cache's bucket key (see
+    GeminiReviewer._call_model / _store_semantic_entry).
+
+    Why this exists: the semantic cache's bucket key used to be
+    system_instruction alone. Two prompts for the same audit type, built
+    from the SAME code batch and Semgrep findings but grounded by
+    DIFFERENT retrieved comments (e.g. because comment_index changed, or a
+    top-k tie broke differently), can still embed as near-duplicates
+    overall — the "## Relevant past review feedback" section _build_prompt
+    renders is typically a few short lines next to an entire code batch, so
+    it barely moves the embedding of the prompt as a whole. Folding this
+    fingerprint into the bucket key means such prompts can never share a
+    semantic-cache entry regardless of how similar the rest of the prompt
+    is, while prompts with the SAME (or no) RAG grounding still share a
+    bucket exactly as before.
+
+    Returns "" for no comments (the common case — every _call_model call
+    site except review()'s per-batch loop has no RAG grounding at all, so
+    this is a no-op there), otherwise a short hash over each comment's
+    (path, line, body) in order.
+    """
+    if not relevant_comments:
+        return ""
+    key = "\x1f".join(
+        f"{c.get('path', '')}\x1e{c.get('line', '')}\x1e{c.get('body', '')}"
+        for c in relevant_comments
+    )
+    return hashlib.sha256(key.encode("utf-8")).hexdigest()[:16]
+
+
 # ---------------------------------------------------------------------------
 # Reviewer
 # ---------------------------------------------------------------------------
@@ -1154,14 +1210,25 @@ class GeminiReviewer:
         self._cache: dict[str, str] = {}
 
         # Process-lifetime, in-memory semantic cache. Keyed by
-        # system_instruction (so e.g. a crypto-audit prompt can never match
-        # an injection-audit prompt's entries), each bucket a list of
-        # (embedding_vector, response_text) pairs for prompts of that audit
-        # type seen so far. Checked only on an exact-match miss, and only if
-        # its bucket for this system_instruction is non-empty (no point
-        # paying for an embedding call when there's nothing yet to compare
-        # against).
-        self._semantic_cache: dict[str, list[tuple[list[float], str]]] = {}
+        # (system_instruction, rag_fingerprint) -- system_instruction so e.g.
+        # a crypto-audit prompt can never match an injection-audit prompt's
+        # entries, AND rag_fingerprint (see _rag_fingerprint) so two prompts
+        # for the SAME audit type but grounded by DIFFERENT RAG-retrieved
+        # past-review comments can never match each other either, even if
+        # their overall embeddings are near-identical (the RAG-grounding
+        # section is typically a small fraction of a full review prompt --
+        # a few short lines vs. an entire code batch -- so overall cosine
+        # similarity alone is not a reliable signal that the RAG grounding
+        # was also the same; see tests/test_gemini_reviewer.py::
+        # TestSemanticCacheRagGrounding for the concrete demonstration this
+        # guards against). rag_fingerprint is "" for every call that has no
+        # RAG grounding at all (i.e. every _call_model call site except
+        # review()'s per-batch loop), so this is a no-op for the common case.
+        # Each bucket is a list of (embedding_vector, response_text) pairs.
+        # Checked only on an exact-match miss, and only if its bucket is
+        # non-empty (no point paying for an embedding call when there's
+        # nothing yet to compare against).
+        self._semantic_cache: dict[tuple[str, str], list[tuple[list[float], str]]] = {}
 
     # ------------------------------------------------------------------
     # Public API
@@ -1221,7 +1288,7 @@ class GeminiReviewer:
                     )
 
             prompt = self._build_prompt(batch, batch_findings, conventions_text, relevant_comments)
-            raw_text = self._call_model(prompt, batch_index=i)
+            raw_text = self._call_model(prompt, batch_index=i, relevant_comments=relevant_comments)
             try:
                 issues, summary = self._parse_response(raw_text)
             except GeminiResponseValidationError as exc:
@@ -1807,18 +1874,27 @@ class GeminiReviewer:
         batch_index: int = 0,
         span_name: str = "gemini_call",
         model: str | None = None,
+        relevant_comments: list[dict] | None = None,
     ) -> str:
         """Call Gemini with caching, retry/backoff, and single-shot fallback.
         Returns raw response text.
+
+        `relevant_comments` is optional: pass the SAME RAG-retrieved past-
+        review comments (if any) that were folded into `prompt` via
+        `_build_prompt`, so the semantic cache's bucket key can include a
+        fingerprint of them (see _rag_fingerprint) and never spuriously
+        match a prompt grounded by different comments — every call site
+        except review()'s per-batch loop has no RAG grounding at all, so
+        the default (None) is correct for them.
 
         Flow:
           1. Exact-match cache lookup on hash(system_instruction + prompt).
              On hit, no network call is made at all — cheapest possible
              check, tried first.
           2. On an exact-match miss, if enable_semantic_cache and this
-             system_instruction's semantic bucket is non-empty: embed the
-             prompt and compare (cosine similarity) against every cached
-             entry for this exact system_instruction. On a hit at or above
+             (system_instruction, rag_fingerprint) bucket is non-empty:
+             embed the prompt and compare (cosine similarity) against every
+             cached entry in that exact bucket. On a hit at or above
              semantic_cache_threshold, no generation call is made either —
              only the one embedding call. The matched response is also
              written into the exact-match cache so a byte-identical repeat
@@ -1869,12 +1945,15 @@ class GeminiReviewer:
                 return cached
 
             # Semantic cache check. Only pays for an embedding call if
-            # there's an existing bucket for this exact system_instruction
-            # to compare against — nothing to gain from embedding the very
-            # first prompt of a given audit type.
+            # there's an existing bucket for this exact (system_instruction,
+            # rag_fingerprint) pair to compare against — nothing to gain
+            # from embedding the very first prompt of a given audit type
+            # (and RAG grounding, if any).
+            rag_fingerprint = _rag_fingerprint(relevant_comments)
+            bucket_key = (system_instruction, rag_fingerprint)
             query_vector: list[float] | None = None
             if self._enable_semantic_cache:
-                bucket = self._semantic_cache.get(system_instruction)
+                bucket = self._semantic_cache.get(bucket_key)
                 if bucket:
                     query_vector = self._embed(prompt)
                     if query_vector is not None:
@@ -1904,7 +1983,7 @@ class GeminiReviewer:
                 )
                 llm_span.set(model_used=effective_model, fallback_used=False)
                 self._cache[cache_key] = text
-                self._store_semantic_entry(system_instruction, prompt, text, query_vector)
+                self._store_semantic_entry(bucket_key, prompt, text, query_vector)
                 return text
 
             except GeminiAuthenticationError:
@@ -1929,7 +2008,7 @@ class GeminiReviewer:
                     )
                     llm_span.set(model_used=FALLBACK_MODEL)
                     self._cache[cache_key] = text
-                    self._store_semantic_entry(system_instruction, prompt, text, query_vector)
+                    self._store_semantic_entry(bucket_key, prompt, text, query_vector)
                     return text
 
                 except (GeminiRateLimitError, GeminiAPIError, GeminiAuthenticationError):
@@ -1993,17 +2072,25 @@ class GeminiReviewer:
         CodeReviewAgent.build_project_context in agent.py), not per-batch.
 
         Each comment is embedded independently with RAG_DOCUMENT_TASK_TYPE
-        (these are the "documents" a later query retrieves against).
-        Best-effort per comment: an embedding failure on one comment just
-        drops that comment from the index rather than aborting the whole
-        batch — a partially-indexed repo is still useful context.
+        (these are the "documents" a later query retrieves against). Before
+        embedding, the comment's file/line location is prepended to its body
+        (see _contextualize_comment_for_embedding — Contextual Retrieval:
+        a standalone comment body is semantically generic on its own, and
+        embeds far more distinguishably once tied to the file it was left
+        on). This only changes the EMBEDDING input — the stored/returned
+        comment dict is untouched, so _build_prompt's rendering of it is
+        unaffected. Best-effort per comment: an embedding failure on one
+        comment just drops that comment from the index rather than
+        aborting the whole batch — a partially-indexed repo is still
+        useful context.
         """
         indexed: list[tuple[list[float], dict]] = []
         for comment in comments:
             body = comment.get("body", "")
             if not body:
                 continue
-            vector = self._embed(body, task_type=RAG_DOCUMENT_TASK_TYPE)
+            embedding_text = _contextualize_comment_for_embedding(comment)
+            vector = self._embed(embedding_text, task_type=RAG_DOCUMENT_TASK_TYPE)
             if vector is None:
                 continue
             indexed.append((vector, comment))
@@ -2040,24 +2127,25 @@ class GeminiReviewer:
 
     def _store_semantic_entry(
         self,
-        system_instruction: str,
+        bucket_key: tuple[str, str],
         prompt: str,
         response_text: str,
         precomputed_vector: list[float] | None = None,
     ) -> None:
         """
-        Record (embedding, response) for this system_instruction's semantic
-        cache bucket, so a future near-duplicate prompt of the same audit
-        type can hit. Reuses `precomputed_vector` if the semantic-cache
-        check already embedded this exact prompt (avoids embedding it
-        twice). Best-effort: silently no-ops if embedding fails/is disabled.
+        Record (embedding, response) for this (system_instruction,
+        rag_fingerprint) semantic cache bucket, so a future near-duplicate
+        prompt of the same audit type AND the same RAG grounding (if any)
+        can hit. Reuses `precomputed_vector` if the semantic-cache check
+        already embedded this exact prompt (avoids embedding it twice).
+        Best-effort: silently no-ops if embedding fails/is disabled.
         """
         if not self._enable_semantic_cache:
             return
         vector = precomputed_vector if precomputed_vector is not None else self._embed(prompt)
         if vector is None:
             return
-        self._semantic_cache.setdefault(system_instruction, []).append((vector, response_text))
+        self._semantic_cache.setdefault(bucket_key, []).append((vector, response_text))
 
     def _attempt_with_retries(
         self,

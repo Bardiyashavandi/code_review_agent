@@ -381,3 +381,51 @@ def score_remediation_convergence(
         f"(fully_resolved=True) -- the second attempt succeeded where the first "
         f"one, by construction of this fixture, did not.",
     )
+
+
+def score_retrieval_quality(
+    result: list[dict],
+    expected_present: dict,
+    expected_absent: dict,
+) -> ScoreResult:
+    """
+    PASS if retrieve_relevant_comments' result (a list of comment dicts)
+    contains one matching `expected_present` (by `path` AND a keyword in
+    `body_kw`) and does NOT contain one matching `expected_absent`.
+
+    Each of `expected_present`/`expected_absent` is a {"path": ..., "body_kw": ...}
+    dict: `path` must equal the comment's path exactly, `body_kw` (if given)
+    must appear case-insensitively somewhere in the comment's body.
+    """
+    def _matches(comment: dict, spec: dict) -> bool:
+        path_ok = spec.get("path", "") == comment.get("path", "")
+        kw = spec.get("body_kw", "")
+        body_ok = kw.lower() in str(comment.get("body", "")).lower() if kw else True
+        return path_ok and body_ok
+
+    if not isinstance(result, list):
+        return ScoreResult(False, f"retrieve_relevant_comments did not return a list: {result!r}")
+
+    present_hit = any(_matches(c, expected_present) for c in result)
+    absent_hit = any(_matches(c, expected_absent) for c in result)
+
+    if not present_hit:
+        return ScoreResult(
+            False,
+            f"Expected relevant comment (path={expected_present.get('path')!r}, "
+            f"keyword={expected_present.get('body_kw')!r}) not found in the "
+            f"retrieved top_k. Returned: "
+            f"{[(c.get('path'), str(c.get('body', ''))[:40]) for c in result]}",
+        )
+    if absent_hit:
+        return ScoreResult(
+            False,
+            f"Irrelevant comment (path={expected_absent.get('path')!r}, "
+            f"keyword={expected_absent.get('body_kw')!r}) was incorrectly retrieved "
+            f"in the top_k alongside the relevant one.",
+        )
+    return ScoreResult(
+        True,
+        f"Relevant comment correctly retrieved; irrelevant comment correctly "
+        f"excluded from top_k={len(result)}.",
+    )

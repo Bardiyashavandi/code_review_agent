@@ -185,3 +185,68 @@ No other new dependencies. Uses Gemini's free tier — no billing setup required
 - [ ] Prompt explicitly defends against instructions embedded in reviewed code
 - [ ] A batch's parse failure never aborts the whole review
 - [ ] Issues are deterministically sorted by severity in the final report
+
+---
+
+## 11. RAG comment retrieval — Contextual Retrieval + semantic-cache interaction (addendum)
+
+This section documents a later, narrower pass over the RAG project-context
+feature (`embed_review_comments`/`retrieve_relevant_comments`, `_build_prompt`)
+and the semantic cache (`_call_model`) it interacts with. It does not
+supersede §1–§10 above, which predate both features entirely — see
+`agent_spec.md` §13 and `README.md`'s "RAG project context" section for
+where those features themselves are documented.
+
+### 11.1 Contextual Retrieval on comment embedding
+
+`embed_review_comments` previously embedded each comment's bare `body` text.
+A standalone comment like "please add input validation here" is
+semantically generic and hard to retrieve accurately against; the same
+comment tied to the file it was left on is far more distinguishable. Per
+[Anthropic's Contextual Retrieval](https://www.anthropic.com/engineering/contextual-retrieval),
+`_contextualize_comment_for_embedding(comment)` now prepends the comment's
+`path`/`line` before embedding (e.g. `"In auth/db.py:42: please add input
+validation here"`), falling back to the bare body if no `path` is present.
+This is embedding-input only — the stored/returned comment dict, and what
+`_build_prompt` renders into the final prompt, are both unchanged.
+
+### 11.2 Semantic cache × RAG grounding
+
+Investigated whether the semantic cache (bucket key: `system_instruction`
+alone, keyed off the whole prompt's embedding) could serve a response
+generated under different RAG grounding than a repeat call would retrieve
+today. Finding: yes — demonstrated in
+`tests/test_gemini_reviewer.py::TestSemanticCacheRagGrounding::
+test_prompts_with_different_rag_grounding_can_still_look_near_identical`.
+The "## Relevant past review feedback" section is typically a few short
+lines next to an entire code batch, so two prompts differing only in which
+comments were retrieved can still embed as near-duplicates overall. Fix:
+the bucket key is now `(system_instruction, rag_fingerprint)`, where
+`rag_fingerprint` (see `_rag_fingerprint`) hashes the actual retrieved
+comments — `""` when there's no RAG grounding at all (every `_call_model`
+call site except `review()`'s per-batch loop), so this is a no-op for the
+common case. `_call_model` and `_store_semantic_entry` both gained an
+optional `relevant_comments` parameter to compute this.
+
+### 11.3 Tests
+
+`tests/test_gemini_reviewer.py::TestEmbedReviewComments` (contextualization:
+path/line prepended, falls back without a path, stored comment dict
+unmodified) and `::TestSemanticCacheRagGrounding` (the gap demonstration, the
+fix closing it even with identical embedding vectors, and that same/no-RAG
+calls still share a bucket as before).
+
+### 11.4 Eval coverage
+
+`evals/` gained a `retrieval_quality` category (`rag-01-relevant-over-
+irrelevant`, see `evals/README.md`): given one clearly-relevant and one
+clearly-irrelevant past comment, `retrieve_relevant_comments` must rank the
+relevant one into the top_k against a real SQL-injection fixture.
+
+### 11.5 Acceptance Criteria
+
+- [ ] All tests in `tests/test_gemini_reviewer.py` (including the new classes above) pass with `pytest -v`
+- [ ] `_build_prompt`'s rendering of retrieved comments is byte-for-byte unchanged by the Contextual Retrieval change (embedding input only)
+- [ ] Two prompts grounded by different retrieved comments never share a semantic-cache entry, even when their embeddings are near-identical
+- [ ] Repeat calls with the same (or no) RAG grounding still hit the semantic cache exactly as before this change
+- [ ] `evals/runner.py --category retrieval_quality` passes in both `--mode mock` and `--mode live`

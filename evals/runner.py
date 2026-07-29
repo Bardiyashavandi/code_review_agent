@@ -190,7 +190,8 @@ def main() -> None:
     parser.add_argument("--category", default=None,
                          help="Only run cases in this category "
                               "(detection|false_positive|dedup|risk_scoring|prompt_injection|"
-                              "security_full_scan|remediation_loop|cost_estimate|trajectory)")
+                              "security_full_scan|remediation_loop|retrieval_quality|"
+                              "cost_estimate|trajectory)")
     parser.add_argument("--only", default=None, help="Comma-separated case IDs to run")
     parser.add_argument("--json-out", default=None, help="Write full results as JSON to this path")
     args = parser.parse_args()
