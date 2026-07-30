@@ -1,7 +1,7 @@
 # Eval suite
 
 Scenario-based, end-to-end evaluation of the code-review pipeline — not
-unit tests. The existing `tests/` suite (267 tests) mocks every Gemini
+unit tests. The existing `tests/` suite (275 tests) mocks every Gemini
 call and checks plumbing: batching, JSON parsing, retries, caching. It
 never checks whether the pipeline actually catches a real vulnerability,
 correctly clears a false positive, merges real duplicates, or ranks risk

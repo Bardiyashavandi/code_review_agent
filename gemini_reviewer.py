@@ -182,6 +182,109 @@ class _ReviewResponseSchema(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# Additional native response_schema models (passed into _call_model's
+# response_schema param -- constrains GENERATION itself, not post-hoc
+# validation like the two schemas above). Added for exactly 3 call sites
+# after auditing every _call_model caller in this file; everything else was
+# deliberately left alone. See gemini_reviewer_spec.md for the full writeup
+# of which sites got one and why -- short version:
+#
+#   - verify_patch_resolves_finding: {resolved, reason} is a trivially
+#     simple, fully self-contained 2-field shape (see
+#     PATCH_VERIFY_SYSTEM_INSTRUCTION) -- lowest possible risk.
+#   - generate_remediation_patches / generate_risk_scores: both produce a
+#     NEW object from scratch (patches reference the input findings only
+#     by finding_index, not by copying arbitrary upstream fields), fully
+#     spelled out in REMEDIATION_SYSTEM_INSTRUCTION / RISK_SCORE_SYSTEM_
+#     INSTRUCTION, and already relied upon downstream (agent.py's tool
+#     docstrings, evals/cases.py's rem-01 case) with exactly this shape --
+#     formalizing an existing implicit contract, not inventing a new one.
+#   - Every other call site (the 9 specialist audits, map_to_owasp/
+#     map_to_cwe, deduplicate_findings, threat model, complexity, test
+#     coverage, doc quality, context analysis) was deliberately left alone:
+#     either there's no existing schema and each specialist's finding shape
+#     is genuinely heterogeneous by design (injection findings have
+#     injection_type/vulnerable_code/attack_vector; crypto findings have
+#     pattern/current_code/why_dangerous; scorers.py's _finding_text
+#     helper exists specifically because there's no canonical finding
+#     schema across specialists), or the response wraps/merges those
+#     heterogeneous upstream findings (map_to_owasp, map_to_cwe,
+#     deduplicate_findings) and a strict schema risks silently truncating
+#     specialist-specific fields at GENERATION time rather than just
+#     failing validation after the fact -- a real behavior change, not a
+#     safety net. Speculatively schema-ing those now would be exactly the
+#     "invent a schema for loosely-structured output" this was scoped to
+#     avoid.
+
+class _PatchVerificationSchema(BaseModel):
+    """Schema for verify_patch_resolves_finding's raw Gemini JSON response.
+    "method" is deliberately NOT here -- it's added by Python after parsing
+    (always "llm" for this call site), never something the model is asked
+    to produce."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    resolved: bool
+    reason: str
+
+
+class _PatchSchema(BaseModel):
+    """Schema for one entry in generate_remediation_patches' "patches" list."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    finding_index: int
+    path: str
+    line: int
+    title: str
+    before: str
+    after: str
+    explanation: str
+    dependencies: list[str] = Field(default_factory=list)
+    breaking_change: bool
+    breaking_change_note: str | None = None
+
+
+class _RemediationResponseSchema(BaseModel):
+    """Schema for generate_remediation_patches' full raw Gemini JSON response."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    patches: list[_PatchSchema] = Field(default_factory=list)
+    summary: str
+
+
+class _ScoredFindingSchema(BaseModel):
+    """Schema for one entry in generate_risk_scores' "scored_findings" list."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    finding_index: int
+    title: str
+    path: str
+    impact_score: float
+    exploitability_score: float
+    scope_score: float
+    detectability_score: float
+    composite_score: float
+    risk_level: Literal["CRITICAL", "HIGH", "MEDIUM", "LOW"]
+    priority_rank: int
+    rationale: str
+
+
+class _RiskScoreResponseSchema(BaseModel):
+    """Schema for generate_risk_scores' full raw Gemini JSON response."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    scored_findings: list[_ScoredFindingSchema] = Field(default_factory=list)
+    overall_project_score: float
+    overall_risk_level: Literal["CRITICAL", "HIGH", "MEDIUM", "LOW"]
+    immediate_action_required: list[str] = Field(default_factory=list)
+    summary: str
+
+
+# ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
 
@@ -1288,7 +1391,10 @@ class GeminiReviewer:
                     )
 
             prompt = self._build_prompt(batch, batch_findings, conventions_text, relevant_comments)
-            raw_text = self._call_model(prompt, batch_index=i, relevant_comments=relevant_comments)
+            raw_text = self._call_model(
+                prompt, batch_index=i, relevant_comments=relevant_comments,
+                response_schema=_ReviewResponseSchema,
+            )
             try:
                 issues, summary = self._parse_response(raw_text)
             except GeminiResponseValidationError as exc:
@@ -1651,7 +1757,8 @@ class GeminiReviewer:
         )
         prompt = f"Score these {len(findings)} security findings by risk level:\n\n{findings_text}"
         raw = self._call_model(prompt, system_instruction=RISK_SCORE_SYSTEM_INSTRUCTION,
-                               json_mode=True, span_name="gemini_risk_score")
+                               json_mode=True, span_name="gemini_risk_score",
+                               response_schema=_RiskScoreResponseSchema)
         try:
             return json.loads(raw)
         except (json.JSONDecodeError, TypeError):
@@ -1698,7 +1805,8 @@ class GeminiReviewer:
             f"## Source context\n{file_text}"
         )
         raw = self._call_model(prompt, system_instruction=REMEDIATION_SYSTEM_INSTRUCTION,
-                               json_mode=True, span_name="gemini_remediation")
+                               json_mode=True, span_name="gemini_remediation",
+                               response_schema=_RemediationResponseSchema)
         try:
             return json.loads(raw)
         except (json.JSONDecodeError, TypeError):
@@ -1720,7 +1828,8 @@ class GeminiReviewer:
             "Does the patched code still exhibit this specific finding?"
         )
         raw = self._call_model(prompt, system_instruction=PATCH_VERIFY_SYSTEM_INSTRUCTION,
-                               json_mode=True, span_name="gemini_patch_verify")
+                               json_mode=True, span_name="gemini_patch_verify",
+                               response_schema=_PatchVerificationSchema)
         try:
             parsed = json.loads(raw)
             return {
@@ -1875,6 +1984,7 @@ class GeminiReviewer:
         span_name: str = "gemini_call",
         model: str | None = None,
         relevant_comments: list[dict] | None = None,
+        response_schema: type[BaseModel] | None = None,
     ) -> str:
         """Call Gemini with caching, retry/backoff, and single-shot fallback.
         Returns raw response text.
@@ -1886,6 +1996,20 @@ class GeminiReviewer:
         match a prompt grounded by different comments — every call site
         except review()'s per-batch loop has no RAG grounding at all, so
         the default (None) is correct for them.
+
+        `response_schema` is optional: a Pydantic BaseModel class (e.g.
+        _ReviewResponseSchema) passed straight through to Gemini's own
+        `response_schema` config, constraining GENERATION itself so
+        structurally malformed JSON can't come back at all — distinct from,
+        and additional to, this codebase's existing post-hoc Pydantic
+        validation (e.g. _parse_response's use of _ReviewResponseSchema),
+        which still runs unchanged and still catches valid-JSON-but-wrong-
+        content cases a schema can't (a hallucinated field value that
+        happens to be the right type). Only takes effect when json_mode is
+        also True (response_schema is meaningless without
+        response_mime_type="application/json"). Every call site that
+        doesn't pass one (the default, None) behaves exactly as before this
+        parameter existed.
 
         Flow:
           1. Exact-match cache lookup on hash(system_instruction + prompt).
@@ -1932,6 +2056,8 @@ class GeminiReviewer:
         config_kwargs = {"system_instruction": system_instruction}
         if json_mode:
             config_kwargs["response_mime_type"] = "application/json"
+            if response_schema is not None:
+                config_kwargs["response_schema"] = response_schema
 
         with tracing.span(
             "llm_call", span_name,

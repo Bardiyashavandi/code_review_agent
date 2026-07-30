@@ -250,3 +250,102 @@ relevant one into the top_k against a real SQL-injection fixture.
 - [ ] Two prompts grounded by different retrieved comments never share a semantic-cache entry, even when their embeddings are near-identical
 - [ ] Repeat calls with the same (or no) RAG grounding still hit the semantic cache exactly as before this change
 - [ ] `evals/runner.py --category retrieval_quality` passes in both `--mode mock` and `--mode live`
+
+---
+
+## 12. Native `response_schema` (structured output) — addendum
+
+Day-4 addition: `_call_model` gained an optional `response_schema` parameter,
+passed straight into `GenerateContentConfig` alongside `response_mime_type`
+so Gemini's Python SDK (`google-genai`) constrains **generation itself** —
+structurally malformed JSON becomes impossible for the calls that use it,
+rather than only being caught after the fact. This is additive defense in
+depth: every existing post-hoc Pydantic validation (`_parse_response`'s use
+of `_ReviewResponseSchema`) is unchanged and still runs, since a schema can
+constrain *shape* but not *content* — a hallucinated field value that
+happens to be the right type (e.g. a fabricated `path` string) passes a
+schema fine but is exactly what post-hoc validation exists to think harder
+about downstream.
+
+Confirmed locally before wiring anything in: `google-genai==2.9.0`'s schema
+transformer (`google.genai._transformers.t_schema`) correctly resolves
+Pydantic's `$defs`/`$ref` output for a nested `list[BaseModel]` field (an
+older, now-fixed SDK limitation — see [python-genai#60](https://github.com/googleapis/python-genai/issues/60)),
+so `_ReviewResponseSchema`'s existing `issues: list[_IssueSchema]` shape,
+`Literal` enum field, and `Optional[str]` field all transform without error.
+
+### 12.1 `_call_model` signature change
+
+`response_schema: type[BaseModel] | None = None` (default `None` — every
+existing call site that doesn't pass one behaves exactly as before this
+parameter existed). Only takes effect when `json_mode=True`; a caller
+passing both `response_schema` and `json_mode=False` gets neither
+`response_mime_type` nor `response_schema` set on the config (defensive;
+no current caller does this).
+
+### 12.2 Call sites audited, and what got a schema
+
+Every `_call_model` call site in this file was reviewed. Exactly 4 got
+`response_schema` (1 pre-existing schema wired in, 3 new ones added):
+
+| Call site | Schema | Why |
+|---|---|---|
+| `review()`'s per-batch loop | `_ReviewResponseSchema` (pre-existing) | Already the target of `_parse_response`'s post-hoc validation — this is the schema the task explicitly asked to wire in first. |
+| `verify_patch_resolves_finding` | `_PatchVerificationSchema` (new: `resolved: bool`, `reason: str`) | Trivially simple, fully self-contained 2-field shape spelled out verbatim in `PATCH_VERIFY_SYSTEM_INSTRUCTION`. Lowest-risk addition in the file. |
+| `generate_remediation_patches` | `_RemediationResponseSchema` (new, wraps `_PatchSchema`) | Produces a NEW object from scratch — patches reference input findings only by `finding_index`, never copy arbitrary upstream fields — fully specified in `REMEDIATION_SYSTEM_INSTRUCTION`, and already relied upon downstream with exactly this shape (`agent.py`'s `make_remediation_tool` docstring, `evals/cases.py`'s `rem-01` scripted patch dict). Formalizes an existing implicit contract rather than inventing a new one. |
+| `generate_risk_scores` | `_RiskScoreResponseSchema` (new, wraps `_ScoredFindingSchema`) | Same reasoning as remediation patches — `scored_findings` items are newly-computed scores referencing findings by `finding_index`/`title`/`path`, not a passthrough of arbitrary upstream fields, fully specified in `RISK_SCORE_SYSTEM_INSTRUCTION`, and already relied upon by `evals/scorers.py::score_risk_ordering` with exactly this shape. |
+
+### 12.3 Call sites deliberately left alone, and why
+
+Every other `_call_model` call site was left unchanged:
+
+- **The 9 specialist audit methods** (`generate_injection_audit`,
+  `generate_auth_audit`, `generate_secrets_audit`, `generate_data_flow_
+  analysis`, `generate_crypto_audit`, `generate_threat_model`,
+  `generate_complexity_report`, `generate_test_coverage_report`,
+  `generate_doc_quality_report`) **and `analyze_context`** — no existing
+  Pydantic schema, and each specialist's own "finding" shape is
+  heterogeneous BY DESIGN (injection findings carry `injection_type`/
+  `vulnerable_code`/`attack_vector`; crypto findings carry `pattern`/
+  `current_code`/`why_dangerous`; `evals/scorers.py`'s `_finding_text`
+  helper exists specifically because there's no canonical finding schema
+  across specialists). Their docstrings only loosely describe top-level
+  keys, never full per-field types. Inventing 9+ new schemas from scratch
+  for output that's genuinely loosely-structured is exactly what this task
+  was scoped to avoid.
+- **`map_to_owasp`, `map_to_cwe`, `deduplicate_findings`** — each has a
+  fully worked-out example JSON shape in its own system instruction, but
+  the finding-level items they operate on are a MERGE/mapping of
+  heterogeneous upstream findings (`deduplicated_findings` explicitly needs
+  to preserve `source_agents`/arbitrary original fields; `mappings` entries
+  reference findings by title, not by a fixed schema). A strict schema here
+  risks silently truncating specialist-specific fields at GENERATION time —
+  a real behavior change, not a safety net — so these were left alone
+  rather than risk that regression for a task scoped to be additive.
+
+### 12.4 Tests
+
+`tests/test_gemini_reviewer.py::TestResponseSchema` — `response_schema`
+passthrough when given, omission when not given, no-op when
+`json_mode=False`, and end-to-end wiring checks that each of the 4 call
+sites above actually passes its schema into `GenerateContentConfig` (plus
+one check that specialist-audit/dedup/owasp-mapping calls do NOT gain a
+`response_schema`).
+
+### 12.5 Why no live before/after eval case
+
+A genuine before/after comparison of malformed-JSON incidence needs live,
+repeated adversarial calls to be meaningful — this is inherently
+probabilistic (a single run proves little either way) and would double the
+API cost of any live eval run (once with the schema, once without, to have
+something to compare). Per this task's own explicit fallback, unit tests
+covering the passthrough/omission plumbing (12.4 above) were judged the
+more reliable, honest signal to automate here, rather than a flaky/
+expensive "looks better on this one run" eval case.
+
+### 12.6 Acceptance Criteria
+
+- [ ] All tests in `tests/test_gemini_reviewer.py` (including `TestResponseSchema`) pass with `pytest -v`
+- [ ] Every `_call_model` call site NOT listed in §12.2 passes no `response_schema` and behaves identically to before this change
+- [ ] `_parse_response`'s post-hoc Pydantic validation of `_ReviewResponseSchema` is unchanged and still runs on every batch
+- [ ] `evals/runner.py --mode live` (if `GEMINI_API_KEY` is available) shows no regression in `schema_errors`/`GeminiResponseValidationError` incidence across the detection/false_positive/dedup/risk_scoring/prompt_injection categories

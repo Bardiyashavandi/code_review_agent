@@ -38,6 +38,10 @@ from gemini_reviewer import (
     ReviewReport,
     _cosine_similarity,
     _rag_fingerprint,
+    _PatchVerificationSchema,
+    _RemediationResponseSchema,
+    _ReviewResponseSchema,
+    _RiskScoreResponseSchema,
 )
 
 # ---------------------------------------------------------------------------
@@ -817,6 +821,121 @@ class TestSemanticCacheRagGrounding:
         reviewer._call_model("prompt A near-duplicate", system_instruction="sys")
 
         assert mock_client.models.generate_content.call_count == 1  # unaffected: still a semantic hit
+
+
+class TestResponseSchema:
+    """
+    Day-4 task: _call_model gained an optional response_schema parameter,
+    passed straight through to GenerateContentConfig so Gemini's own
+    generation is constrained by the schema (native structured output),
+    additive to (never a replacement for) this file's existing post-hoc
+    Pydantic validation. These tests confirm the passthrough/omission
+    plumbing in _call_model itself; the three call sites that actually use
+    it (generate_remediation_patches, verify_patch_resolves_finding,
+    generate_risk_scores) plus review()'s existing _ReviewResponseSchema
+    usage are covered below and in TestReviewWithProjectContext/
+    TestGenerateRemediationPatchesWithVerification-adjacent tests.
+    """
+
+    def test_response_schema_passed_through_to_config_when_given(self):
+        reviewer, mock_client = make_reviewer()
+        mock_client.models.generate_content.return_value = response_text(summary="ok")
+
+        reviewer._call_model("prompt", system_instruction="sys", response_schema=_ReviewResponseSchema)
+
+        call = mock_client.models.generate_content.call_args
+        assert call.kwargs["config"].response_schema is _ReviewResponseSchema
+        assert call.kwargs["config"].response_mime_type == "application/json"
+
+    def test_response_schema_omitted_from_config_when_not_given(self):
+        # Every existing call site that doesn't pass response_schema must
+        # behave EXACTLY as before this parameter existed -- no
+        # response_schema key/attribute set at all, not even None-valued
+        # in a way that could change wire behavior.
+        reviewer, mock_client = make_reviewer()
+        mock_client.models.generate_content.return_value = response_text(summary="ok")
+
+        reviewer._call_model("prompt", system_instruction="sys")
+
+        call = mock_client.models.generate_content.call_args
+        assert call.kwargs["config"].response_schema is None
+        assert call.kwargs["config"].response_mime_type == "application/json"
+
+    def test_response_schema_ignored_when_json_mode_is_false(self):
+        # response_schema is meaningless without response_mime_type=
+        # "application/json" -- must not be set on the config if json_mode
+        # is False, even if a caller passed one (defensive; no current
+        # caller does this).
+        reviewer, mock_client = make_reviewer()
+        mock_client.models.generate_content.return_value = response_text(summary="ok")
+
+        reviewer._call_model(
+            "prompt", system_instruction="sys", json_mode=False,
+            response_schema=_ReviewResponseSchema,
+        )
+
+        call = mock_client.models.generate_content.call_args
+        assert call.kwargs["config"].response_schema is None
+        assert call.kwargs["config"].response_mime_type is None
+
+    def test_review_batch_call_uses_review_response_schema(self):
+        # End-to-end wiring check for Task 2: review()'s per-batch
+        # _call_model call passes _ReviewResponseSchema, the same schema
+        # _parse_response validates against post-hoc.
+        reviewer, mock_client = make_reviewer()
+        mock_client.models.generate_content.return_value = response_text(summary="ok")
+
+        reviewer.review([make_file("a.py")], make_scan_report())
+
+        call = mock_client.models.generate_content.call_args
+        assert call.kwargs["config"].response_schema is _ReviewResponseSchema
+
+    def test_remediation_patches_call_uses_remediation_schema(self):
+        reviewer, mock_client = make_reviewer()
+        mock_client.models.generate_content.return_value = response_text(summary="ok")
+        # generate_remediation_patches parses raw JSON via json.loads, not a
+        # ReviewIssue-shaped payload -- response_text()'s {"summary","issues"}
+        # shape is close enough for this call to succeed without erroring.
+
+        reviewer.generate_remediation_patches(
+            [{"path": "a.py", "line": 1, "title": "x", "severity": "HIGH"}],
+            [make_file("a.py")],
+        )
+
+        call = mock_client.models.generate_content.call_args
+        assert call.kwargs["config"].response_schema is _RemediationResponseSchema
+
+    def test_verify_patch_call_uses_patch_verification_schema(self):
+        reviewer, mock_client = make_reviewer()
+        mock_client.models.generate_content.return_value = response_text(summary="ok")
+
+        reviewer.verify_patch_resolves_finding({"title": "x", "severity": "HIGH"}, "fixed code")
+
+        call = mock_client.models.generate_content.call_args
+        assert call.kwargs["config"].response_schema is _PatchVerificationSchema
+
+    def test_risk_scores_call_uses_risk_score_schema(self):
+        reviewer, mock_client = make_reviewer()
+        mock_client.models.generate_content.return_value = response_text(summary="ok")
+
+        reviewer.generate_risk_scores([{"title": "x", "severity": "HIGH"}])
+
+        call = mock_client.models.generate_content.call_args
+        assert call.kwargs["config"].response_schema is _RiskScoreResponseSchema
+
+    def test_specialist_audit_calls_do_not_set_a_response_schema(self):
+        # Deliberately left alone (see gemini_reviewer.py's comment above
+        # _PatchVerificationSchema for the full audit/rationale) -- these
+        # must NOT silently gain a response_schema.
+        reviewer, mock_client = make_reviewer()
+        mock_client.models.generate_content.return_value = response_text(summary="ok")
+
+        reviewer.generate_injection_audit([make_file("a.py")])
+        reviewer.deduplicate_findings([{"title": "x", "path": "a.py", "severity": "HIGH"}])
+        reviewer.map_to_owasp([{"title": "x", "severity": "HIGH"}])
+
+        for call in mock_client.models.generate_content.call_args_list:
+            assert call.kwargs["config"].response_schema is None
 
 
 # ---------------------------------------------------------------------------
