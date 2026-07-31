@@ -32,6 +32,7 @@
 - [Multi-Agent Architecture](#multi-agent-architecture)
 - [Deterministic workflow paths](#deterministic-workflow-paths)
 - [Pipeline Internals](#pipeline-internals)
+- [Memory](#memory)
 - [What a run looks like](#what-a-run-looks-like)
 - [Quick Start](#quick-start)
 - [HTTP API](#http-api)
@@ -72,7 +73,7 @@ flowchart TD
         Context["🔭 context_agent\nframework · entry points · attack surface"]
         Scout["🔍 scout_agent\nmetadata · file list · search"]
         PR["🔀 pr_agent\nPR diff · Semgrep · post inline comments"]
-        Report["📄 report_agent\nexplain findings · save Markdown · open issue (opt-in)"]
+        Report["📄 report_agent\nexplain findings · save Markdown · open issue (opt-in)\nrecall memory of last review"]
         Dedup["🔁 dedup_agent\nmerge cross-agent duplicates"]
         Risk["📊 risk_scorer_agent\nCVSS-like composite scoring"]
         Remed["🔧 remediation_agent (LoopAgent)\ngenerate → verify → retry, max 3x"]
@@ -454,6 +455,26 @@ The standout addition this week: reviews can now cite a repo's *own* conventions
 
 ---
 
+## Memory
+
+Everything above (caching, RAG project context) is process-lifetime only — ask the agent to review the same repo twice, even seconds apart in the same process, and the *findings themselves* carry no memory: it can't tell you what's new, what's still broken, or what got fixed since last time. `review_memory.py` closes that gap with a small, disk-persistent store of past review findings, keyed by `(repo_url, branch)`, that survives a process restart.
+
+**What's remembered:** the full findings list from the most recent review of each `(repo_url, branch)`, plus a summary of that run's own new/still-open/resolved counts (so recalling it later never needs to recompute anything).
+
+**Where it's stored:** one plain JSON file, `.review_memory/findings.json` by default (`CodeReviewAgent(memory_path=...)` to override — tests always use an isolated temp path). Stdlib only (`json`/`hashlib`/`os`/`pathlib`) — no new dependency, no Google Cloud requirement. See [specs/memory_spec.md](./specs/memory_spec.md) for why this is a hand-rolled store rather than ADK's own `SessionService`/`MemoryService`: the one free `MemoryService` (`InMemoryMemoryService`) is explicitly non-persistent, and both persistent options require a billing-enabled Google Cloud project, which conflicts with this project's no-paid-services constraint.
+
+**How it works, every `review_repo()` call:**
+
+1. **Before reviewing:** look up whether this `(repo, branch)` has a prior stored snapshot.
+2. **After reviewing:** match each new finding against the prior snapshot on `(path, line, rule_id-or-title-hash)` and classify it `"new"` or `"still_open"` (set on `ReviewIssue.memory_status`); anything in the prior snapshot that no longer appears is `"resolved"` — a positive signal, surfaced as "N issues from the last review appear fixed."
+3. Persist this run's findings as the new snapshot for next time.
+
+**How it degrades:** a missing or corrupted memory file is treated exactly like a repo's first-ever review (`has_prior_history: False`, everything `"new"`) — never an exception, never a failed pipeline. A write failure (permissions, disk full) is logged and swallowed the same way; the review itself already succeeded and still returns its result.
+
+**Where it surfaces:** `PipelineResult.memory` (new/still_open/resolved counts + a few resolved examples), the `/analyze` HTTP response's `memory` field, the Streamlit results view, and a `recall_previous_findings_tool` ADK tool (wired onto `report_agent`) that answers "what changed since the last review of this repo" straight from storage — no new review, no GitHub/Gemini call.
+
+---
+
 ## What a run looks like
 
 ```
@@ -804,6 +825,7 @@ Every layer of the stack has explicit security decisions:
 | **Output schema** | Two layers, first constraining generation, second validating the result. First: for the calls that use it (the main review batch, remediation patches, patch verification, risk scoring), the Pydantic schema is also passed as Gemini's own `response_schema` config (`GenerateContentConfig`) — structurally malformed JSON can't come back from the model at all. Second, unchanged and still running on every batch regardless: Gemini's JSON response is validated against a strict Pydantic schema (`extra="forbid"`, enum-constrained severity, required fields) before becoming a finding — a schema can't catch a hallucinated-but-correctly-typed value, so a malformed *or* semantically-wrong response still fails loudly (`ReviewReport.schema_errors`) instead of being silently coerced or treated as "no issues found" |
 | **GitHub write actions** | Both `post_pr_review_tool` (PR comments) and `create_issue_tool` (repo issues) are opt-in only — never called automatically at the end of a review, only on explicit user request. `create_issue_tool` additionally won't open an issue at all unless at least one finding meets a severity bar (`min_severity`, default HIGH) — a repo issue is more visible/persistent than a PR comment, so the bar to create one is deliberately higher |
 | **Remediation cost control** | `POST /remediate` is opt-in only, same philosophy as the GitHub write actions above — never triggered automatically by `/analyze`. No server-side allow-list of "fixable" finding categories either: that judgment is left to the caller (e.g. the Streamlit checkboxes), since generating patches is one batched Gemini call regardless of how many findings are included, so call-count isn't the cost lever — whether the endpoint runs at all is |
+| **Guardrail on write actions** | `guardrail.py`'s `check_content()` scans generated content immediately before it's returned/posted from all three write paths — `post_pr_review_tool`, `create_issue_tool`, and remediation patches — for (a) a real-looking hardcoded secret (regexes translated directly from `SECRETS_AUDIT_SYSTEM_INSTRUCTION`'s own pattern list, redacted in the error message) and (b) prompt-injection-leakage phrasing (the same signature `TestPromptSafety`/`inj-01-embedded-system-override` already treat as this failure mode). A block never crashes the pipeline: `post_pr_review_tool`/`create_issue_tool` return `{"blocked": true, "reason", "violations"}` instead of writing anything, and a blocked remediation patch is dropped into `blocked_patches` while other clean patches in the same batch still return. Hand-rolled, not Guardrails AI — see [specs/guardrail_spec.md](./specs/guardrail_spec.md) for the real dependency-conflict evidence (`litellm`, `langchain-core`, and their own `opentelemetry` pins on top of `google-adk`'s) behind that call |
 | **Credentials** | API keys load from environment variables only; `test_secrets_never_logged` asserts no key ever appears in a log line or exception message |
 | **Output rendering** | Model output is never evaluated as code or interpolated unsafely into the Streamlit UI — tested with an injected `__import__` payload |
 
@@ -815,7 +837,7 @@ Every layer of the stack has explicit security decisions:
 pytest -v
 ```
 
-275 tests across all modules. Every external dependency — GitHub API, Semgrep subprocess, Gemini SDK (including `embed_content`) — is mocked, so the full suite runs in a few seconds with no network access or credentials required. These tests check plumbing: batching, JSON parsing, retries, exact-match and semantic caching (hits, misses, per-`(system_instruction, rag_fingerprint)` bucket scoping, threshold behavior, embedding-failure fallback), RAG comment retrieval/contextualization, native `response_schema` passthrough/omission, error handling, size caps, schema validation. They do not check whether the pipeline's judgment is actually good — that's what the eval suite below is for.
+332 tests across all modules. Every external dependency — GitHub API, Semgrep subprocess, Gemini SDK (including `embed_content`) — is mocked, so the full suite runs in a few seconds with no network access or credentials required. These tests check plumbing: batching, JSON parsing, retries, exact-match and semantic caching (hits, misses, per-`(system_instruction, rag_fingerprint)` bucket scoping, threshold behavior, embedding-failure fallback), RAG comment retrieval/contextualization, native `response_schema` passthrough/omission, error handling, size caps, schema validation, persistent findings memory (round-trip storage, corrupted-file degradation, new/still_open/resolved diff classification), and the guardrail's secret/injection-leakage detection and block/pass wiring into the three write paths. They do not check whether the pipeline's judgment is actually good — that's what the eval suite below is for.
 
 `tests/test_server.py` additionally tests `/remediate` at the HTTP route level with FastAPI's `TestClient` — request validation, status codes, file-filtering, and malformed-patch handling — rather than only the pure aggregation functions `tests/test_server_traces.py` covers for `/traces`. `TestClient(app)` is constructed without entering it as a context manager, so the real `lifespan` (which needs a working Semgrep binary and real credentials) never runs; `app.state.agent` is swapped for a mock instead.
 
@@ -903,7 +925,9 @@ code_review_agent/
 │   ├── semgrep_runner.py         # Stage 2: run Semgrep, parse findings
 │   ├── gemini_reviewer.py        # Stage 4: LLM review via Gemini 3.1 Flash Lite
 │   │                             #   + exact/semantic cache + RAG retrieval
-│   └── report_generator.py       # Render PipelineResult → Markdown
+│   ├── report_generator.py       # Render PipelineResult → Markdown
+│   ├── review_memory.py          # Persistent per-(repo, branch) findings memory
+│   └── guardrail.py              # Pre-write-action secret/injection-leakage check
 │
 ├── Orchestration
 │   └── agent.py                  # CodeReviewAgent + 5-layer, 37-LLM-agent ADK graph
@@ -937,10 +961,12 @@ code_review_agent/
 │   ├── agent_spec.md             #   Interface, behavior, error hierarchy, test table
 │   ├── gemini_reviewer_spec.md
 │   ├── report_generator_spec.md
-│   └── semgrep_runner_spec.md
+│   ├── semgrep_runner_spec.md
+│   ├── memory_spec.md
+│   └── guardrail_spec.md
 │
 ├── Tests
-│   └── tests/                    # 275 tests, one file per module, all mocked
+│   └── tests/                    # 332 tests, one file per module, all mocked
 │                                  #   test_server.py additionally exercises
 │                                  #   /remediate via FastAPI's TestClient
 │
@@ -969,6 +995,7 @@ code_review_agent/
 - The ADK SDK installed here (`google-adk==2.3.0`) already logs `ParallelAgent`/`SequentialAgent`/`LoopAgent` as deprecated in favor of a newer graph-workflow API (`Workflow`) — still fully functional, not yet removed, and the primitives this session's two conversions explicitly asked for. Migrating to the newer API is a separate future task, not done here to keep this change scoped to the two conversions requested.
 - Free-tier Gemini keys cap total requests per day. `--max-files` defaults to `10` and batches include a short inter-batch delay specifically to stretch that quota. The RPD counter in `view_trace.py` only counts calls that actually reached the Gemini API — cache hits are excluded.
 - `server.py` runs locally only — cloud deployment would require a billing-enabled project, which conflicts with this project's no-paid-services constraint.
+- **Resolved this session:** until now, reviewing the same repo twice — even seconds apart in the same process — looked identical both times: no memory of prior findings, no way to tell what was new, still open, or fixed. A persistent per-`(repo, branch)` findings store (`review_memory.py`) now closes this gap — see [Memory](#memory). Note this is distinct from the caching layers noted above, which remain deliberately process-lifetime-only: caching is a performance optimization (skip redoing identical work), memory is about the findings themselves (what changed since last time) — conflating the two would have meant persisting a much larger, staler cache for no real benefit.
 
 ---
 

@@ -359,6 +359,30 @@ def _render_results(data: dict, repo_url: str, branch: str) -> None:
         stage = err.get("stage", "unknown").capitalize()
         st.warning(f"**{stage} stage warning:** {err.get('message', '')}")
 
+    # --- Memory: what changed since the last review of this (repo, branch) ---
+    # See specs/memory_spec.md. `memory` is None only if the memory layer
+    # itself failed (best-effort, never blocks a review) -- degrade
+    # silently, same as review_repo() itself does.
+    memory = data.get("memory")
+    if memory is not None:
+        if memory.get("has_prior_history"):
+            m1, m2, m3 = st.columns(3)
+            m1.metric("New since last review", memory.get("new_count", 0))
+            m2.metric("Still open", memory.get("still_open_count", 0))
+            m3.metric("Resolved since last review", memory.get("resolved_count", 0))
+            resolved = memory.get("resolved") or []
+            if resolved:
+                examples = "; ".join(
+                    f"{r.get('path', '')}:{r.get('line', '')} — {r.get('title', '')}"
+                    for r in resolved[:5]
+                )
+                st.success(
+                    f"✅ {memory.get('resolved_count', 0)} issue(s) from the last review "
+                    f"of this repo/branch appear fixed: {examples}"
+                )
+        else:
+            st.caption("🧠 First review of this repo/branch — no prior findings to compare against.")
+
     # --- Gemini summary ---
     st.subheader("Summary")
     st.info(review.get("summary") or "No summary returned.")

@@ -56,6 +56,8 @@ from gemini_reviewer import (
     ReviewReport,
 )
 from github_fetcher import FetchResult, FileResult, GitHubFetcher
+from guardrail import GuardrailViolation, check_content
+from review_memory import DEFAULT_MEMORY_PATH, MemorySummary, ReviewMemoryStore
 from semgrep_runner import Finding, ScanReport, SemgrepRunner, SemgrepRunnerError
 
 logger = logging.getLogger(__name__)
@@ -76,6 +78,31 @@ class AgentError(Exception):
         self.message = message
 
 
+class GuardrailBlockedError(AgentError):
+    """Raised internally when check_content() blocks generated content
+    headed for a write action (PR comment, GitHub issue, or a remediation
+    patch). Always caught at the call site that raised it — see
+    post_pr_review_tool, create_issue_tool, and
+    generate_remediation_patches_with_verification — and turned into a
+    loud-but-non-fatal response, never left to propagate into the ADK graph
+    or crash the pipeline. See specs/guardrail_spec.md."""
+
+    def __init__(self, stage: str, violations: list[GuardrailViolation]):
+        self.stage = stage
+        self.violations = violations
+        detail = "; ".join(f"{v.category}: {v.detail}" for v in violations)
+        super().__init__(f"Guardrail blocked {stage}: {detail}")
+
+
+def _guardrail_check(text: str, stage: str) -> None:
+    """Run check_content() over already-rendered outbound text; raise
+    GuardrailBlockedError if it's blocked. Callers catch this at the one
+    write action it guards -- never let it escape further than that."""
+    result = check_content(text)
+    if result.blocked:
+        raise GuardrailBlockedError(stage, result.violations)
+
+
 # ---------------------------------------------------------------------------
 # Data models
 # ---------------------------------------------------------------------------
@@ -94,6 +121,10 @@ class PipelineResult:
     review_report: ReviewReport
     stage_errors: list[StageError] = field(default_factory=list)
     duration_s: float = 0.0
+    # None if the memory layer itself failed (best-effort -- see
+    # ReviewMemoryStore) or was never reached (a fatal fetch-stage error
+    # short-circuits before the review stage runs at all).
+    memory: MemorySummary | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -124,6 +155,7 @@ class CodeReviewAgent:
         github_token: str,
         gemini_api_key: str,
         semgrep_config: str = DEFAULT_SEMGREP_CONFIG,
+        memory_path: str = DEFAULT_MEMORY_PATH,
     ) -> None:
         if not github_token or not github_token.strip():
             raise ValueError("github_token must not be empty")
@@ -133,6 +165,13 @@ class CodeReviewAgent:
         self._fetcher = GitHubFetcher(token=github_token)
         self._semgrep = SemgrepRunner(config=semgrep_config)
         self._reviewer = GeminiReviewer(api_key=gemini_api_key)
+
+        # Persistent, disk-backed memory of past review findings per
+        # (repo_url, branch) -- distinct from _project_context_cache below,
+        # which is in-memory/process-lifetime only. See
+        # specs/memory_spec.md for why this is a plain independent store
+        # rather than ADK's own SessionService/MemoryService.
+        self._memory = ReviewMemoryStore(memory_path)
 
         # Process-lifetime, in-memory cache of built ProjectContexts, keyed
         # by (repo_url, branch). Building one costs a handful of GitHub
@@ -281,6 +320,44 @@ class CodeReviewAgent:
                     duration_s=0.0,
                 )
 
+            # --- Memory: best-effort, never blocks a review ------------------
+            # Compares this run's findings against the last stored snapshot for
+            # (url, branch), annotates each issue's memory_status, and persists
+            # this run as the new snapshot for next time. See
+            # specs/memory_spec.md. Deliberately outside the review try/except
+            # above: a memory-layer failure must never look like a review
+            # failure, so it gets its own try/except and degrades to
+            # memory=None / memory_status=None on any error.
+            memory_summary: MemorySummary | None = None
+            try:
+                with tracing.span("stage", "memory", repo_url=url, branch=branch) as memory_span:
+                    prior_findings = self._memory.load_snapshot(url, branch)
+                    issue_dicts = [
+                        {
+                            "path": issue.path, "line": issue.line, "severity": issue.severity,
+                            "title": issue.title, "description": issue.description,
+                            "suggested_fix": issue.suggested_fix, "rule_id": issue.rule_id,
+                        }
+                        for issue in review_report.issues
+                    ]
+                    memory_diff = self._memory.diff(issue_dicts, prior_findings)
+                    for issue, status in zip(review_report.issues, memory_diff.statuses):
+                        issue.memory_status = status
+                    self._memory.save_snapshot(url, branch, issue_dicts, memory_diff)
+                    memory_summary = MemorySummary.from_diff(memory_diff)
+                    memory_span.set(
+                        has_prior_history=memory_diff.has_prior_history,
+                        new_count=memory_diff.new_count,
+                        still_open_count=memory_diff.still_open_count,
+                        resolved_count=memory_diff.resolved_count,
+                    )
+            except Exception as exc:  # noqa: BLE001 — memory is best-effort, never fails a review
+                logger.warning(
+                    "Memory stage failed for %s@%s (%s); continuing without "
+                    "memory annotations for this run.", url, branch, exc,
+                )
+                memory_summary = None
+
             duration = time.monotonic() - start
             logger.info(
                 "Pipeline complete for %s in %.2fs (%d stage errors)",
@@ -303,9 +380,35 @@ class CodeReviewAgent:
                 review_report=review_report,
                 stage_errors=stage_errors,
                 duration_s=duration,
+                memory=memory_summary,
             )
 
         return result
+
+    def recall_previous_findings(self, repo_url: str, branch: str = DEFAULT_BRANCH) -> dict:
+        """Look up the last stored review_repo() result for (repo_url,
+        branch) without running a new review. Reads the diff summary
+        review_repo() already computed and persisted last time it ran for
+        this (repo, branch) -- nothing is recomputed, no GitHub/Gemini call
+        is made. Returns {"has_history": False, "message": ...} if this
+        (repo, branch) has never been reviewed, or its memory file is
+        missing/corrupted (best-effort, same degrade-to-no-history rule as
+        review_repo() itself). See specs/memory_spec.md."""
+        last_diff = self._memory.load_last_diff(repo_url, branch)
+        if last_diff is None:
+            return {
+                "has_history": False,
+                "message": f"No prior review found for {repo_url}@{branch}.",
+            }
+        return {
+            "has_history": True,
+            "reviewed_at": last_diff.get("reviewed_at"),
+            "total_findings": last_diff.get("total_findings", 0),
+            "new_since_previous": last_diff.get("new_since_previous", 0),
+            "still_open": last_diff.get("still_open", 0),
+            "resolved_since_previous": last_diff.get("resolved_since_previous", 0),
+            "resolved_examples": last_diff.get("resolved_examples", []),
+        }
 
     # --- Granular, single-stage entry points -----------------------------
     # These exist so the ADK agent can be given separate fetch/scan/review
@@ -581,6 +684,40 @@ class CodeReviewAgent:
                 patches_by_index[original_idx] = rp
 
         result["patches"] = [patches_by_index[i] for i in sorted(patches_by_index, key=lambda x: (x is None, x))]
+
+        # --- Guardrail: check each patch before it's returned -----------
+        # A patch is user-facing output that could get copy-pasted straight
+        # into code -- check it the same way post_pr_review_tool/
+        # create_issue_tool check their own outbound content (see
+        # specs/guardrail_spec.md). A blocked patch is dropped from
+        # `patches` and recorded in `blocked_patches` (same "loud and
+        # visible, never silently dropped" convention as schema_errors) --
+        # one bad patch never takes down the other, clean patches in the
+        # same remediation run.
+        clean_patches: list[dict] = []
+        blocked_patches: list[dict] = []
+        for patch in result["patches"]:
+            patch_text = "\n".join(
+                str(patch.get(field, "")) for field in ("before", "after", "explanation")
+            )
+            guard = check_content(patch_text)
+            if guard.blocked:
+                reason = "; ".join(f"{v.category}: {v.detail}" for v in guard.violations)
+                logger.warning(
+                    "Guardrail blocked a remediation patch for finding_index=%s (%s)",
+                    patch.get("finding_index"), reason,
+                )
+                blocked_patches.append({
+                    "finding_index": patch.get("finding_index"),
+                    "path": patch.get("path", ""),
+                    "reason": reason,
+                })
+            else:
+                clean_patches.append(patch)
+        result["patches"] = clean_patches
+        if blocked_patches:
+            result["blocked_patches"] = blocked_patches
+
         result["iterations_run"] = iterations_run
         result["fully_resolved"] = fully_resolved
         if not fully_resolved:
@@ -862,6 +999,26 @@ def make_get_repo_metadata_tool(agent: CodeReviewAgent) -> Callable[..., dict]:
     return get_repo_metadata_tool
 
 
+def make_recall_previous_findings_tool(agent: CodeReviewAgent) -> Callable[..., dict]:
+    """Build a standalone ADK tool, bound to a CodeReviewAgent instance, that
+    answers "what changed since the last review of this repo" from stored
+    memory alone -- no new review is run, no GitHub/Gemini call is made."""
+
+    def recall_previous_findings_tool(repo_url: str, branch: str = DEFAULT_BRANCH) -> dict:
+        """Look up what the last review of this repo/branch found, without
+        running a new review. Returns whether there's any prior history for
+        this (repo_url, branch), and if so: how many findings were new since
+        the review before that, how many were still open, how many were
+        resolved (present last time, gone now), and a few resolved examples.
+        Use this when the user asks what changed since a repo's last review,
+        instead of calling review_repo_tool again."""
+        if not isinstance(repo_url, str) or not repo_url.strip():
+            raise ValueError("repo_url must be a non-empty string")
+        return agent.recall_previous_findings(repo_url, branch=branch)
+
+    return recall_previous_findings_tool
+
+
 def make_search_code_tool(agent: CodeReviewAgent) -> Callable[..., dict]:
     """Build a standalone code-search ADK tool bound to a CodeReviewAgent instance."""
 
@@ -994,11 +1151,31 @@ def make_create_issue_tool(agent: CodeReviewAgent) -> Callable[..., dict]:
                 is made at all (nothing worth flagging).
 
         Returns {"created": false, "reason": ...} if the threshold wasn't
-        met, or {"created": true, "issue_number", "html_url"} on success."""
+        met, or {"created": true, "issue_number", "html_url"} on success.
+        Returns {"created": false, "blocked": true, "reason", "violations"}
+        if the guardrail blocked the content instead -- see
+        specs/guardrail_spec.md."""
         if not isinstance(repo_url, str) or not repo_url.strip():
             raise ValueError("repo_url must be a non-empty string")
         if not isinstance(issues, list):
             raise ValueError("issues must be a list of dicts")
+
+        combined_text = "\n".join(
+            [summary]
+            + [
+                f"{i.get('title', '')} {i.get('description', '')} {i.get('suggested_fix', '')}"
+                for i in issues if isinstance(i, dict)
+            ]
+        )
+        try:
+            _guardrail_check(combined_text, "create_issue")
+        except GuardrailBlockedError as exc:
+            return {
+                "created": False,
+                "blocked": True,
+                "reason": str(exc),
+                "violations": [{"category": v.category, "detail": v.detail} for v in exc.violations],
+            }
 
         result = agent._fetcher.create_review_issue(repo_url, issues, summary, min_severity)
         if result is None:
@@ -1562,11 +1739,33 @@ def make_post_pr_review_tool(agent: CodeReviewAgent) -> Callable[..., dict]:
         Returns {review_id, html_url, state, comments_posted, fallback}.
         If inline comments fail because the lines are not in the diff, the tool
         automatically falls back to posting a single general PR comment instead.
-        Always call this as the last step of a PR review workflow."""
+        Always call this as the last step of a PR review workflow.
+
+        Returns {"posted": false, "blocked": true, "reason", "violations"}
+        instead, without posting anything, if the guardrail blocks the
+        content -- see specs/guardrail_spec.md."""
         if not isinstance(pr_url, str) or not pr_url.strip():
             raise ValueError("pr_url must be a non-empty string")
         if not isinstance(issues, list):
             raise ValueError("issues must be a list of dicts")
+
+        combined_text = "\n".join(
+            [summary]
+            + [
+                f"{i.get('title', '')} {i.get('description', '')} {i.get('suggested_fix', '')}"
+                for i in issues if isinstance(i, dict)
+            ]
+        )
+        try:
+            _guardrail_check(combined_text, "post_pr_review")
+        except GuardrailBlockedError as exc:
+            return {
+                "posted": False,
+                "blocked": True,
+                "reason": str(exc),
+                "violations": [{"category": v.category, "detail": v.detail} for v in exc.violations],
+            }
+
         return agent._fetcher.post_pr_review(pr_url, issues, summary, event)
 
     return post_pr_review_tool
@@ -2387,13 +2586,17 @@ def build_multi_agent_system(
             "NEVER call it automatically just because a review finished. It also only "
             "actually opens an issue if at least one finding is HIGH/CRITICAL severity "
             "(configurable via min_severity) — tell the user if it declined to fire "
-            "for that reason.\n\n"
+            "for that reason.\n"
+            "- recall_previous_findings_tool: answers 'what changed since the last "
+            "review of this repo' from stored memory alone — use this instead of "
+            "re-running a review when the user asks about changes since last time.\n\n"
             "If no review has been done yet, tell the user to run a review first."
         ),
         tools=[
             _ft(make_explain_finding_tool),
             _ft(make_generate_report_file_tool),
             _ft(make_create_issue_tool),
+            _ft(make_recall_previous_findings_tool),
         ],
     )
 

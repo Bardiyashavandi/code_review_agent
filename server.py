@@ -178,6 +178,7 @@ class IssueOut(BaseModel):
     description: str
     suggested_fix: str
     rule_id: str | None = None
+    memory_status: str | None = None
 
 
 class FindingOut(BaseModel):
@@ -211,6 +212,17 @@ class StageErrorOut(BaseModel):
     message: str
 
 
+class MemoryOut(BaseModel):
+    """Per-(repo_url, branch) findings memory summary -- see
+    specs/memory_spec.md. has_prior_history=False on a repo/branch's
+    first-ever review; new/still_open/resolved counts are 0 in that case."""
+    has_prior_history: bool = False
+    new_count: int = 0
+    still_open_count: int = 0
+    resolved_count: int = 0
+    resolved: list[dict] = []
+
+
 class AnalyzeResponse(BaseModel):
     repo_url: str
     duration_s: float
@@ -219,6 +231,7 @@ class AnalyzeResponse(BaseModel):
     review: ReviewOut
     scan: ScanOut
     stage_errors: list[StageErrorOut]
+    memory: MemoryOut | None = None
 
 
 class PatchOut(BaseModel):
@@ -236,12 +249,22 @@ class PatchOut(BaseModel):
     verification_reason: str | None = None
 
 
+class BlockedPatchOut(BaseModel):
+    """A patch the guardrail dropped before it was returned -- see
+    specs/guardrail_spec.md. Never silently dropped: recorded here the same
+    way a malformed patch is recorded in schema_errors."""
+    finding_index: int | None = None
+    path: str = ""
+    reason: str = ""
+
+
 class RemediateResponse(BaseModel):
     patches: list[PatchOut] = []
     summary: str = ""
     parse_error: bool = False
     missing_paths: list[str] = []
     schema_errors: list[str] = []
+    blocked_patches: list[BlockedPatchOut] = []
     iterations_run: int = 0
     fully_resolved: bool = True
     unresolved_finding_indices: list[int] = []
@@ -632,10 +655,22 @@ async def analyze(req: AnalyzeRequest) -> AnalyzeResponse:
                     description=i.description,
                     suggested_fix=i.suggested_fix,
                     rule_id=i.rule_id,
+                    memory_status=i.memory_status,
                 )
                 for i in result.review_report.issues
             ],
             schema_errors=result.review_report.schema_errors,
+        ),
+        memory=(
+            MemoryOut(
+                has_prior_history=result.memory.has_prior_history,
+                new_count=result.memory.new_count,
+                still_open_count=result.memory.still_open_count,
+                resolved_count=result.memory.resolved_count,
+                resolved=result.memory.resolved,
+            )
+            if result.memory is not None
+            else None
         ),
         scan=ScanOut(
             scanned=result.scan_report.scanned,
@@ -701,11 +736,16 @@ def _build_remediate_response(raw_result: dict) -> RemediateResponse:
         except ValidationError as exc:
             schema_errors.append(f"patch {i}: {exc}")
 
+    blocked_patches = [
+        BlockedPatchOut(**bp) for bp in raw_result.get("blocked_patches", []) if isinstance(bp, dict)
+    ]
+
     return RemediateResponse(
         patches=patches,
         summary=raw_result.get("summary", ""),
         parse_error=False,
         schema_errors=schema_errors,
+        blocked_patches=blocked_patches,
         iterations_run=raw_result.get("iterations_run", 0),
         fully_resolved=raw_result.get("fully_resolved", True),
         unresolved_finding_indices=raw_result.get("unresolved_finding_indices", []),

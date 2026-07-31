@@ -92,6 +92,13 @@ class ReviewIssue:
     description: str
     suggested_fix: str
     rule_id: str | None = None
+    # Set by CodeReviewAgent.review_repo() after diffing against
+    # review_memory's stored snapshot for this (repo, branch): "new" |
+    # "still_open", or None if memory wasn't available for this run (the
+    # memory layer failed, or this ReviewIssue was constructed outside
+    # review_repo(), e.g. directly by generate_review_tool). See
+    # specs/memory_spec.md.
+    memory_status: str | None = None
 
 
 @dataclass
