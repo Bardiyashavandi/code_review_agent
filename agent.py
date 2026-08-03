@@ -57,6 +57,7 @@ from gemini_reviewer import (
 )
 from github_fetcher import FetchResult, FileResult, GitHubFetcher
 from guardrail import GuardrailViolation, check_content
+from injection_scanner import InjectionMatch, scan_files_for_injection, scan_text_for_injection
 from review_memory import DEFAULT_MEMORY_PATH, MemorySummary, ReviewMemoryStore
 from semgrep_runner import Finding, ScanReport, SemgrepRunner, SemgrepRunnerError
 
@@ -125,6 +126,14 @@ class PipelineResult:
     # ReviewMemoryStore) or was never reached (a fatal fetch-stage error
     # short-circuits before the review stage runs at all).
     memory: MemorySummary | None = None
+    # Layer B of the prompt-injection defense (see specs/injection_defense_spec.md
+    # and injection_scanner.py) -- heuristic matches found in fetched file
+    # content and/or project-convention text (README/CONTRIBUTING/etc.),
+    # BEFORE any of it reached GeminiReviewer. Empty list, not None, when the
+    # scan ran and found nothing -- this is a best-effort visibility layer,
+    # not a required stage, so it degrades to [] rather than blocking or
+    # failing a review on scan errors.
+    injection_findings: list[InjectionMatch] = field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -297,6 +306,35 @@ class CodeReviewAgent:
                     sources=project_context.sources,
                 )
 
+            # --- Injection scan: Layer B, best-effort, never blocks a review ---
+            # Runs BEFORE fetch_result.files reaches GeminiReviewer -- flags
+            # only, never strips/blocks anything (Layer A -- the untrusted-data
+            # framing + <file_content> delimiters in gemini_reviewer.py's
+            # prompts -- is what actually prevents compliance). Also scans
+            # project_context.conventions_text (README/CONTRIBUTING/lint
+            # config), since those never appear in fetch_result.files -- they
+            # come from a separate fetch_convention_files() call -- but are
+            # exactly the kind of file a real attempt would target. See
+            # specs/injection_defense_spec.md.
+            injection_findings: list[InjectionMatch] = []
+            try:
+                with tracing.span("stage", "injection_scan", files_in=len(fetch_result.files)) as scan_span:
+                    injection_findings = scan_files_for_injection(fetch_result.files)
+                    if project_context.conventions_text:
+                        injection_findings.extend(
+                            scan_text_for_injection(
+                                "project conventions (README/CONTRIBUTING/lint config)",
+                                project_context.conventions_text,
+                            )
+                        )
+                    scan_span.set(matches=len(injection_findings))
+            except Exception as exc:  # noqa: BLE001 — a visibility layer must never block a review
+                logger.warning(
+                    "Injection scan failed for %s (%s); continuing without "
+                    "injection-attempt visibility for this run.", url, exc,
+                )
+                injection_findings = []
+
             # --- Review: non-fatal on failure --------------------------------
             try:
                 with tracing.span("stage", "review", files_in=len(fetch_result.files)) as review_span:
@@ -381,6 +419,7 @@ class CodeReviewAgent:
                 stage_errors=stage_errors,
                 duration_s=duration,
                 memory=memory_summary,
+                injection_findings=injection_findings,
             )
 
         return result

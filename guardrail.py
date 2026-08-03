@@ -56,9 +56,16 @@ _SECRET_PATTERNS: list[tuple[str, re.Pattern]] = [
 # treats as this failure mode's fingerprint (TestPromptSafety, inj-01's
 # forbidden_phrases). Deliberately scoped to these families only — see
 # specs/guardrail_spec.md §4.2 / §9.
+#
+# Public (not underscore-prefixed): injection_scanner.py imports this same
+# list to scan INBOUND repo content for injection attempts, the mirror image
+# of what this module checks (OUTBOUND model output for leakage) — see
+# specs/injection_defense_spec.md. Shared so the two directions of "what does
+# an injection attempt/leak look like" don't drift into two separately
+# maintained lists.
 # ---------------------------------------------------------------------------
 
-_INJECTION_PHRASE_PATTERNS: list[tuple[str, re.Pattern]] = [
+INJECTION_PHRASE_PATTERNS: list[tuple[str, re.Pattern]] = [
     ("instruction_override", re.compile(r"(?i)ignore (all )?(previous|prior|above) instructions")),
     ("instruction_override", re.compile(r"(?i)disregard (the )?(above|previous)")),
     ("instruction_override", re.compile(r"(?i)new instructions\s*:")),
@@ -108,7 +115,7 @@ def check_content(text: str) -> GuardrailResult:
                 )
             )
 
-    for name, pattern in _INJECTION_PHRASE_PATTERNS:
+    for name, pattern in INJECTION_PHRASE_PATTERNS:
         match = pattern.search(text)
         if match:
             violations.append(

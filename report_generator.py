@@ -57,6 +57,27 @@ def generate_markdown_report(result) -> str:
             lines.append(f"- **{_escape(err.stage)}**: {_escape(err.message)}")
         lines.append("")
 
+    # Layer B of the prompt-injection defense (see specs/injection_defense_spec.md,
+    # injection_scanner.py) -- a heuristic pre-scan of fetched content run
+    # BEFORE it ever reached GeminiReviewer. Omitted entirely when empty, so
+    # a clean repo's report isn't cluttered with an empty section header.
+    injection_findings = getattr(result, "injection_findings", None) or []
+    if injection_findings:
+        lines.append("## Potential Prompt Injection Detected")
+        lines.append("")
+        lines.append(
+            "The scan below runs on fetched content before it reaches the "
+            "reviewer and only flags suspicious patterns — it never blocks "
+            "or strips anything. This is a visibility backstop; the model "
+            "itself is separately instructed to ignore any such embedded "
+            "instructions and report them as findings rather than comply."
+        )
+        lines.append("")
+        for match in injection_findings:
+            location = f"{_escape(match.path)}:{match.line}"
+            lines.append(f"- **{_escape(match.category)}** ({location}): `{_escape(match.snippet)}`")
+        lines.append("")
+
     lines.append("## Issues")
     lines.append("")
 
