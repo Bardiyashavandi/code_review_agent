@@ -1122,7 +1122,13 @@ def make_generate_report_file_tool(agent: CodeReviewAgent) -> Callable[..., dict
     ) -> dict:
         """Render an already-produced review (files + issues + summary) as a
         Markdown report and save it to disk at output_path. Use this when the
-        user wants a saved file, not just a chat summary."""
+        user wants a saved file, not just a chat summary.
+
+        output_path must resolve inside the designated report output
+        directory (report_generator.DEFAULT_OUTPUT_DIR, "reports/"); a
+        relative path like "review_report.md" or "findings/security.md" is
+        resolved relative to that directory. Absolute paths and "../"
+        traversal attempts are rejected, not redirected."""
         if not isinstance(files, list) or not files:
             raise ValueError("files must be a non-empty list of {path, content} objects")
         if not isinstance(issues, list):
@@ -1149,9 +1155,17 @@ def make_generate_report_file_tool(agent: CodeReviewAgent) -> Callable[..., dict
             for fnd in (findings or [])
         ]
 
+        # output_path is model-controlled input in this (ADK chat) call path --
+        # confine it inside the designated report output directory before it
+        # ever reaches the filesystem. Raises report_generator.ReportPathError
+        # (a ValueError subclass) on any absolute path or ../ traversal
+        # attempt; propagates as a clear tool error rather than silently
+        # redirecting. See report_generator.confine_report_path().
+        confined_path = report_generator.confine_report_path(output_path)
+
         path = agent.save_report(
             repo_url=repo_url, files=file_results, findings=finding_objs,
-            issues=issue_objs, summary=summary, model=model, output_path=output_path,
+            issues=issue_objs, summary=summary, model=model, output_path=confined_path,
         )
         return {"output_path": path}
 
@@ -1234,16 +1248,21 @@ def build_adk_agent(
     github_token: str,
     gemini_api_key: str,
     semgrep_config: str = DEFAULT_SEMGREP_CONFIG,
+    allow_write: bool = False,
 ) -> Agent:
     """Construct the Google ADK Agent definition wrapping the review pipeline.
 
     Exposes a one-shot tool (review_repo_tool), three granular pipeline-stage
     tools (fetch_repo_files_tool, scan_code_tool, generate_review_tool), and
-    four standalone capability tools (get_repo_metadata_tool,
-    search_code_in_files_tool, explain_finding_tool,
-    generate_report_file_tool) — eight tools total — so the model can run the
+    standalone capability tools (get_repo_metadata_tool,
+    search_code_in_files_tool, explain_finding_tool) so the model can run the
     whole pipeline in one call, plan a multi-step sequence itself, or reach
     for a narrower capability outside the review pipeline entirely.
+
+    allow_write: off by default. generate_report_file_tool (the only
+    write-capable tool this agent exposes) is only attached when True, and
+    even then is gated by ADK's native require_confirmation=True -- see
+    build_multi_agent_system's allow_write docstring for the full mechanism.
     """
     code_review_agent = CodeReviewAgent(
         github_token=github_token,
@@ -1308,10 +1327,15 @@ def build_adk_agent(
             "If the user asks you to go deeper on one specific issue you already "
             "reported (e.g. 'explain issue #3'), use explain_finding_tool instead "
             "of re-running the whole review.\n\n"
-            "If the user wants the review saved as a file rather than just "
-            "summarized in chat, use generate_report_file_tool with the files, "
-            "issues, and summary you already have.\n\n"
-            "Always summarize the resulting issues for the user, prioritized by "
+            + (
+                "If the user wants the review saved as a file rather than just "
+                "summarized in chat, use generate_report_file_tool with the files, "
+                "issues, and summary you already have.\n\n"
+                if allow_write else
+                "Write tools are disabled in this deployment — you cannot save "
+                "report files. If asked, say so and offer a chat summary instead.\n\n"
+            )
+            + "Always summarize the resulting issues for the user, prioritized by "
             "severity, and mention any stage_errors plainly if present."
         ),
         tools=[
@@ -1322,7 +1346,7 @@ def build_adk_agent(
             FunctionTool(get_repo_metadata_tool),
             FunctionTool(search_code_in_files_tool),
             FunctionTool(explain_finding_tool),
-            FunctionTool(generate_report_file_tool),
+            *([FunctionTool(generate_report_file_tool, require_confirmation=True)] if allow_write else []),
         ],
     )
 
@@ -1769,6 +1793,13 @@ def make_post_pr_review_tool(agent: CodeReviewAgent) -> Callable[..., dict]:
     ) -> dict:
         """Post review findings as inline comments on a GitHub Pull Request.
 
+        Opt-in only: call this when the user explicitly asks to post a review
+        (e.g. "post this to the PR", "leave review comments", "submit this as
+        a review"). Do NOT call this automatically at the end of a PR review —
+        posting comments is visible to everyone with access to the PR and can
+        trigger notifications, so it should only ever happen on explicit
+        request. A finished review should be summarized in chat by default.
+
         pr_url: the PR URL (https://github.com/owner/repo/pull/123).
         issues: list of findings from generate_review_tool, each with
                 {path, line, severity, title, description, suggested_fix}.
@@ -1778,7 +1809,6 @@ def make_post_pr_review_tool(agent: CodeReviewAgent) -> Callable[..., dict]:
         Returns {review_id, html_url, state, comments_posted, fallback}.
         If inline comments fail because the lines are not in the diff, the tool
         automatically falls back to posting a single general PR comment instead.
-        Always call this as the last step of a PR review workflow.
 
         Returns {"posted": false, "blocked": true, "reason", "violations"}
         instead, without posting anything, if the guardrail blocks the
@@ -1814,8 +1844,20 @@ def build_multi_agent_system(
     github_token: str,
     gemini_api_key: str,
     semgrep_config: str = DEFAULT_SEMGREP_CONFIG,
+    allow_write: bool = False,
 ) -> Agent:
     """Build a 5-layer multi-agent graph for the ADK playground.
+
+    allow_write: off by default. When False, the three write-capable tools
+    (post_pr_review_tool, create_issue_tool, generate_report_file_tool) are
+    not attached to pr_agent/report_agent at all -- the model cannot see or
+    call them, full stop. When True, they're attached but still individually
+    gated by ADK's native require_confirmation=True (see _ft() below): even
+    an explicit user request only *requests* the write -- it still has to be
+    separately confirmed before the write tool's underlying function actually
+    runs. Controlled at the root_agent level via the
+    CODE_REVIEW_AGENT_ALLOW_WRITE env var (see bottom of this file). See
+    specs/write_action_gate_spec.md.
 
     Architecture (37 LLM agents + 3 deterministic workflow orchestrators = 40 nodes total)
     -----------------------------------------------------------------------------
@@ -1876,8 +1918,22 @@ def build_multi_agent_system(
         semgrep_config=semgrep_config,
     )
 
-    def _ft(factory) -> FunctionTool:
-        return FunctionTool(factory(pipeline))
+    def _ft(factory, require_confirmation: bool = False) -> FunctionTool:
+        """Wrap a `make_*_tool(pipeline)` factory's function in a FunctionTool.
+
+        require_confirmation=True uses ADK 2.3's native tool-confirmation gate
+        (google.adk.tools.function_tool.FunctionTool's own require_confirmation
+        param): the wrapped function is never invoked on a call that lacks a
+        confirmed ToolConfirmation on tool_context -- ADK returns a
+        "requires confirmation" error and records the pending confirmation
+        instead. This is enforced inside ADK's own FunctionTool.run_async,
+        before self.func is called at all, so it's a real block, not an
+        instruction the model could ignore. Used for the three write-capable
+        tools (post_pr_review_tool, create_issue_tool,
+        generate_report_file_tool); every other tool here is read-only and
+        leaves this at its default False. See specs/write_action_gate_spec.md.
+        """
+        return FunctionTool(factory(pipeline), require_confirmation=require_confirmation)
 
     # ══════════════════════════════════════════════════════════════════════════
     # LAYER 4 — Sub-specialists (no sub_agents, innermost leaves)
@@ -2594,8 +2650,19 @@ def build_multi_agent_system(
             "2. scan_code_tool — Semgrep on changed files.\n"
             "3. generate_review_tool — LLM review.\n"
             "4. (optional) validate_findings_tool — false-positive filter.\n"
-            "5. (optional) post_pr_review_tool — post inline GitHub comments.\n\n"
-            "State which PR, how many files changed, and total issues. "
+            + (
+                "5. post_pr_review_tool: post inline GitHub PR review comments. "
+                "OPT-IN ONLY — call this ONLY when the user explicitly asks you "
+                "to post a review (e.g. 'post this to the PR', 'leave review "
+                "comments'). NEVER call it automatically as part of a normal "
+                "review workflow — a finished review is summarized in chat by "
+                "default, not posted.\n\n"
+                if allow_write else
+                "Write tools are disabled in this deployment — you cannot post "
+                "PR review comments. If asked, say so and offer a chat summary "
+                "instead.\n\n"
+            )
+            + "State which PR, how many files changed, and total issues. "
             "Prioritize CRITICAL → HIGH → MEDIUM → LOW."
         ),
         tools=[
@@ -2603,7 +2670,7 @@ def build_multi_agent_system(
             _ft(make_scan_code_tool),
             _ft(make_generate_review_tool),
             _ft(make_validate_findings_tool),
-            _ft(make_post_pr_review_tool),
+            *([_ft(make_post_pr_review_tool, require_confirmation=True)] if allow_write else []),
         ],
     )
 
@@ -2618,23 +2685,29 @@ def build_multi_agent_system(
             "You are the Report Writer. You work with already-produced findings.\n\n"
             "TOOLS:\n"
             "- explain_finding_tool: focused 3-6 sentence explanation of one issue.\n"
-            "- generate_report_file_tool: render findings as Markdown and save.\n"
-            "- create_issue_tool: open a GitHub issue summarizing findings. OPT-IN "
-            "ONLY — call this ONLY when the user explicitly asks to file the results "
-            "as a GitHub issue (e.g. 'open an issue for this', 'file this on GitHub'). "
-            "NEVER call it automatically just because a review finished. It also only "
-            "actually opens an issue if at least one finding is HIGH/CRITICAL severity "
-            "(configurable via min_severity) — tell the user if it declined to fire "
-            "for that reason.\n"
-            "- recall_previous_findings_tool: answers 'what changed since the last "
+            + (
+                "- generate_report_file_tool: render findings as Markdown and save.\n"
+                "- create_issue_tool: open a GitHub issue summarizing findings. OPT-IN "
+                "ONLY — call this ONLY when the user explicitly asks to file the results "
+                "as a GitHub issue (e.g. 'open an issue for this', 'file this on GitHub'). "
+                "NEVER call it automatically just because a review finished. It also only "
+                "actually opens an issue if at least one finding is HIGH/CRITICAL severity "
+                "(configurable via min_severity) — tell the user if it declined to fire "
+                "for that reason.\n"
+                if allow_write else
+                "Write tools are disabled in this deployment — you cannot save report "
+                "files or open GitHub issues. If asked, say so and offer a chat summary "
+                "instead.\n"
+            )
+            + "- recall_previous_findings_tool: answers 'what changed since the last "
             "review of this repo' from stored memory alone — use this instead of "
             "re-running a review when the user asks about changes since last time.\n\n"
             "If no review has been done yet, tell the user to run a review first."
         ),
         tools=[
             _ft(make_explain_finding_tool),
-            _ft(make_generate_report_file_tool),
-            _ft(make_create_issue_tool),
+            *([_ft(make_generate_report_file_tool, require_confirmation=True)] if allow_write else []),
+            *([_ft(make_create_issue_tool, require_confirmation=True)] if allow_write else []),
             _ft(make_recall_previous_findings_tool),
         ],
     )
@@ -2867,6 +2940,14 @@ load_dotenv(override=True)
 github_token = os.environ.get("GITHUB_TOKEN", "")
 gemini_api_key = os.environ.get("GEMINI_API_KEY", "")
 
+# Off by default: write-capable tools (post_pr_review_tool, create_issue_tool,
+# generate_report_file_tool) are only attached to the ADK chat agent's graph
+# at all when this is explicitly set truthy. See build_multi_agent_system's
+# allow_write docstring and specs/write_action_gate_spec.md.
+allow_write = os.environ.get("CODE_REVIEW_AGENT_ALLOW_WRITE", "").strip().lower() in (
+    "1", "true", "yes", "on",
+)
+
 # ADK's own Agent/Gemini model call (used for the playground chat itself,
 # separate from GeminiReviewer's own genai.Client) authenticates via
 # GOOGLE_API_KEY, not GEMINI_API_KEY -- without this, "Hi" gets no response
@@ -2882,6 +2963,7 @@ try:
     root_agent = build_multi_agent_system(
         github_token=github_token,
         gemini_api_key=gemini_api_key,
+        allow_write=allow_write,
     )
 except Exception as _build_exc:  # noqa: BLE001
     logger.warning(

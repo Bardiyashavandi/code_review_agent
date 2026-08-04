@@ -12,6 +12,7 @@ Run with:
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -22,6 +23,8 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from google.adk.agents import LoopAgent, ParallelAgent, SequentialAgent
+from google.adk.tools import FunctionTool
+from google.adk.tools.tool_confirmation import ToolConfirmation
 
 import agent as agent_module
 from agent import (
@@ -608,10 +611,15 @@ class TestSaveReport:
         text = open(output_path, encoding="utf-8").read()
         assert "All good." in text
 
-    def test_generate_report_file_tool_returns_json_serializable_dict(self, tmp_path):
+    def test_generate_report_file_tool_returns_json_serializable_dict(self, tmp_path, monkeypatch):
+        # generate_report_file_tool is the model-controlled (ADK chat) call
+        # path -- output_path is confined inside report_generator's
+        # DEFAULT_OUTPUT_DIR ("reports/"), resolved relative to cwd. chdir
+        # into tmp_path so the confined "reports/" lands there, not in the
+        # real repo. See report_generator.confine_report_path().
+        monkeypatch.chdir(tmp_path)
         agent, *_ = make_agent()
         tool = make_generate_report_file_tool(agent)
-        output_path = str(tmp_path / "report.md")
 
         output = tool(
             repo_url="https://github.com/o/r",
@@ -619,11 +627,13 @@ class TestSaveReport:
             issues=[{"path": "a.py", "line": 1, "severity": "LOW", "title": "t", "description": "d", "suggested_fix": "f"}],
             summary="ok",
             model="gemini-3.1-flash-lite",
-            output_path=output_path,
+            output_path="report.md",
         )
 
         json.dumps(output)
-        assert output["output_path"] == output_path
+        expected = str((tmp_path / "reports" / "report.md").resolve())
+        assert output["output_path"] == expected
+        assert os.path.exists(expected)
 
     def test_generate_report_file_tool_rejects_empty_files(self):
         agent, *_ = make_agent()
@@ -631,6 +641,36 @@ class TestSaveReport:
 
         with pytest.raises(ValueError, match="files"):
             tool(repo_url="https://github.com/o/r", files=[], issues=[])
+
+    def test_generate_report_file_tool_rejects_absolute_path_outside_reports_dir(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        agent, *_ = make_agent()
+        tool = make_generate_report_file_tool(agent)
+        outside = str(tmp_path / "elsewhere" / "report.md")
+
+        with pytest.raises(agent_module.report_generator.ReportPathError):
+            tool(
+                repo_url="https://github.com/o/r",
+                files=[{"path": "a.py", "content": "x = 1\n"}],
+                issues=[],
+                output_path=outside,
+            )
+        # Rejected before any file is written.
+        assert not os.path.exists(outside)
+
+    def test_generate_report_file_tool_rejects_path_traversal(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        agent, *_ = make_agent()
+        tool = make_generate_report_file_tool(agent)
+
+        with pytest.raises(agent_module.report_generator.ReportPathError):
+            tool(
+                repo_url="https://github.com/o/r",
+                files=[{"path": "a.py", "content": "x = 1\n"}],
+                issues=[],
+                output_path="../../etc/passwd",
+            )
+        assert not (tmp_path.parent.parent / "etc" / "passwd").exists()
 
 
 # ---------------------------------------------------------------------------
@@ -988,12 +1028,13 @@ def _find_agent(root, name):
     return None
 
 
-def _build_root():
+def _build_root(allow_write=False):
     """Build the full ADK agent graph with all underlying clients mocked,
     the same pattern make_agent() uses for CodeReviewAgent directly."""
     with patch("agent.GitHubFetcher"), patch("agent.SemgrepRunner"), patch("agent.GeminiReviewer"):
         return agent_module.build_multi_agent_system(
-            github_token="ghp_faketoken", gemini_api_key="gem_fakekey"
+            github_token="ghp_faketoken", gemini_api_key="gem_fakekey",
+            allow_write=allow_write,
         )
 
 
@@ -1288,3 +1329,170 @@ class TestPatchVerifierTool:
         with pytest.raises(ValueError):
             tool(finding="not a dict", patch={})
             assert "gem_fakekey" not in record.getMessage()
+
+
+# ---------------------------------------------------------------------------
+# 7. Write-action gate (Change 2 of the write-action security hardening --
+#    see specs/write_action_gate_spec.md): the three write-capable tools
+#    (post_pr_review_tool, create_issue_tool, generate_report_file_tool) are
+#    off by default and, when enabled, individually hard-gated by ADK's
+#    native FunctionTool(require_confirmation=True).
+# ---------------------------------------------------------------------------
+
+_WRITE_TOOL_NAMES = {"post_pr_review_tool", "create_issue_tool", "generate_report_file_tool"}
+
+
+class TestWriteActionGateWiring:
+    """Static checks on the built agent graph: are the write tools attached,
+    and are the ones that are attached actually marked require_confirmation?
+    """
+
+    def test_write_tools_absent_by_default(self):
+        root = _build_root()  # allow_write=False (the default)
+        pr_agent = _find_agent(root, "pr_agent")
+        report_agent = _find_agent(root, "report_agent")
+
+        pr_tool_names = {t.name for t in pr_agent.tools}
+        report_tool_names = {t.name for t in report_agent.tools}
+
+        assert not (_WRITE_TOOL_NAMES & pr_tool_names)
+        assert not (_WRITE_TOOL_NAMES & report_tool_names)
+        # Read-only tools on the same agents are unaffected.
+        assert "fetch_pr_files_tool" in pr_tool_names
+        assert "explain_finding_tool" in report_tool_names
+        assert "recall_previous_findings_tool" in report_tool_names
+
+    def test_write_tools_present_and_confirmation_gated_when_allowed(self):
+        root = _build_root(allow_write=True)
+        pr_agent = _find_agent(root, "pr_agent")
+        report_agent = _find_agent(root, "report_agent")
+
+        pr_tools = {t.name: t for t in pr_agent.tools}
+        report_tools = {t.name: t for t in report_agent.tools}
+
+        assert _WRITE_TOOL_NAMES <= (set(pr_tools) | set(report_tools))
+        assert pr_tools["post_pr_review_tool"]._require_confirmation is True
+        assert report_tools["generate_report_file_tool"]._require_confirmation is True
+        assert report_tools["create_issue_tool"]._require_confirmation is True
+
+        # Read-only tools stay ungated even when write tools are allowed.
+        assert report_tools["explain_finding_tool"]._require_confirmation is False
+        assert report_tools["recall_previous_findings_tool"]._require_confirmation is False
+
+    def test_build_adk_agent_gates_generate_report_file_tool_the_same_way(self):
+        with patch("agent.GitHubFetcher"), patch("agent.SemgrepRunner"), patch("agent.GeminiReviewer"):
+            off = agent_module.build_adk_agent(github_token="ghp_x", gemini_api_key="gem_x")
+            on = agent_module.build_adk_agent(github_token="ghp_x", gemini_api_key="gem_x", allow_write=True)
+
+        assert "generate_report_file_tool" not in {t.name for t in off.tools}
+        on_tools = {t.name: t for t in on.tools}
+        assert on_tools["generate_report_file_tool"]._require_confirmation is True
+
+
+class _FakeActions:
+    def __init__(self):
+        self.requested_tool_confirmations = {}
+        self.skip_summarization = None
+
+
+class _FakeToolContext:
+    """Minimal stand-in for google.adk's real ToolContext, exercising only
+    the surface FunctionTool.run_async actually touches when
+    require_confirmation=True: .function_call_id, .tool_confirmation,
+    .request_confirmation(), .actions."""
+
+    function_call_id = "fc1"
+
+    def __init__(self, confirmation: ToolConfirmation | None = None):
+        self._tool_confirmation = confirmation
+        self.actions = _FakeActions()
+
+    @property
+    def tool_confirmation(self):
+        return self._tool_confirmation
+
+    def request_confirmation(self, hint=None, payload=None):
+        self.actions.requested_tool_confirmations[self.function_call_id] = ToolConfirmation(
+            hint=hint, payload=payload
+        )
+
+
+class TestConfirmationHardBlock:
+    """Proves the gate is enforced by ADK itself before the wrapped function
+    ever runs -- not an instruction the model could choose to ignore. Mirrors
+    the exact FunctionTool.run_async behavior verified manually against
+    google-adk 2.3.0 during Change 2's design investigation."""
+
+    def test_unconfirmed_call_never_reaches_github(self):
+        agent, fetcher, *_ = make_agent()
+        tool = FunctionTool(make_create_issue_tool(agent), require_confirmation=True)
+        ctx = _FakeToolContext(confirmation=None)
+
+        result = asyncio.run(
+            tool.run_async(
+                args={"repo_url": "https://github.com/o/r", "issues": [
+                    {"path": "a.py", "line": 1, "severity": "HIGH", "title": "t",
+                     "description": "d", "suggested_fix": "f"},
+                ]},
+                tool_context=ctx,
+            )
+        )
+
+        assert "error" in result
+        fetcher.create_review_issue.assert_not_called()
+        assert ctx.actions.requested_tool_confirmations  # confirmation was requested
+
+    def test_explicitly_rejected_call_never_reaches_github(self):
+        agent, fetcher, *_ = make_agent()
+        tool = FunctionTool(make_create_issue_tool(agent), require_confirmation=True)
+        ctx = _FakeToolContext(confirmation=ToolConfirmation(confirmed=False))
+
+        result = asyncio.run(
+            tool.run_async(
+                args={"repo_url": "https://github.com/o/r", "issues": []},
+                tool_context=ctx,
+            )
+        )
+
+        assert "error" in result
+        fetcher.create_review_issue.assert_not_called()
+
+    def test_confirmed_call_reaches_github(self):
+        agent, fetcher, *_ = make_agent()
+        fetcher.create_review_issue.return_value = {"issue_number": 1, "html_url": "https://x"}
+        tool = FunctionTool(make_create_issue_tool(agent), require_confirmation=True)
+        ctx = _FakeToolContext(confirmation=ToolConfirmation(confirmed=True))
+
+        result = asyncio.run(
+            tool.run_async(
+                args={
+                    "repo_url": "https://github.com/o/r",
+                    "issues": [{"path": "a.py", "line": 1, "severity": "CRITICAL",
+                                "title": "t", "description": "d", "suggested_fix": "f"}],
+                },
+                tool_context=ctx,
+            )
+        )
+
+        assert result.get("created") is True
+        fetcher.create_review_issue.assert_called_once()
+
+    def test_unconfirmed_call_never_writes_a_report_file(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        agent, *_ = make_agent()
+        tool = FunctionTool(make_generate_report_file_tool(agent), require_confirmation=True)
+        ctx = _FakeToolContext(confirmation=None)
+
+        result = asyncio.run(
+            tool.run_async(
+                args={
+                    "repo_url": "https://github.com/o/r",
+                    "files": [{"path": "a.py", "content": "x = 1\n"}],
+                    "issues": [],
+                },
+                tool_context=ctx,
+            )
+        )
+
+        assert "error" in result
+        assert not (tmp_path / "reports").exists()

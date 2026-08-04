@@ -14,10 +14,67 @@ from __future__ import annotations
 
 import os
 from datetime import datetime, timezone
+from pathlib import Path
 
 UTC = timezone.utc  # datetime.UTC was added in Python 3.11; timezone.utc works on 3.9+
 
 SEVERITY_ORDER = ("CRITICAL", "HIGH", "MEDIUM", "LOW")
+
+# ---------------------------------------------------------------------------
+# Path confinement for model-controlled output paths
+# ---------------------------------------------------------------------------
+#
+# write_report()'s own default usage and main.py's CLI --out flag are
+# deliberately NOT restricted by this -- both are operated by a trusted
+# local human who can already write anywhere their own filesystem
+# permissions allow, and main.py's --out is a documented, intentional
+# "write wherever I point you" feature, not a vulnerability.
+#
+# confine_report_path() exists specifically for agent.py's
+# generate_report_file_tool, the one call site where output_path is
+# model-controlled (ADK chat mode) and therefore untrusted. See
+# specs/write_action_gate_spec.md.
+
+DEFAULT_OUTPUT_DIR = "reports"
+
+
+class ReportPathError(ValueError):
+    """Raised when a requested report output path resolves outside the
+    designated output directory. A ValueError subclass so existing
+    tool-input-validation conventions (e.g. "repo_url must be a non-empty
+    string") still apply, but distinguishable by callers that want to
+    handle this case specifically."""
+
+
+def confine_report_path(output_path: str, base_dir: str = DEFAULT_OUTPUT_DIR) -> str:
+    """Resolve `output_path` against `base_dir` and confirm the result
+    stays inside it. Rejects (raises ReportPathError) any path that would
+    escape `base_dir` -- an absolute path, a `../` traversal, or any
+    combination thereof -- rather than silently redirecting it somewhere
+    "safe". Returns the resolved absolute path (inside base_dir) on
+    success, as a string, ready to pass to write_report().
+
+    A relative `output_path` (the expected case, e.g. "review_report.md"
+    or "findings/security.md") is resolved *relative to base_dir*, not the
+    process's current working directory -- so "review_report.md" always
+    means "<base_dir>/review_report.md", never wherever the process
+    happens to be running from.
+    """
+    base = Path(base_dir).resolve()
+
+    raw = Path(output_path)
+    candidate = raw.resolve() if raw.is_absolute() else (base / raw).resolve()
+
+    try:
+        candidate.relative_to(base)
+    except ValueError:
+        raise ReportPathError(
+            f"output_path {output_path!r} resolves to {candidate}, which is "
+            f"outside the designated report output directory ({base}). "
+            "Rejected, not redirected -- pass a path inside that directory."
+        )
+
+    return str(candidate)
 
 
 def _escape(text) -> str:
