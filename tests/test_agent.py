@@ -31,6 +31,7 @@ from agent import (
     CodeReviewAgent,
     PipelineResult,
     make_create_issue_tool,
+    make_dedup_tool,
     make_explain_finding_tool,
     make_fetch_repo_files_tool,
     make_generate_report_file_tool,
@@ -40,6 +41,7 @@ from agent import (
     make_post_pr_review_tool,
     make_recall_previous_findings_tool,
     make_review_repo_tool,
+    make_risk_score_tool,
     make_scan_code_tool,
     make_search_code_tool,
 )
@@ -948,6 +950,178 @@ class TestMemoryInReviewRepo:
         assert result.memory is None
         assert len(result.review_report.issues) == 1
         assert result.stage_errors == []  # a memory failure is not a StageError
+
+
+# ---------------------------------------------------------------------------
+# 4e-2. Memory plausibility check + provenance (Change 2 of the memory/
+# dedup hardening pass -- see specs/write_action_gate_spec.md's
+# memory-recall hardening addendum)
+# ---------------------------------------------------------------------------
+
+class TestMemoryPlausibilityAndProvenance:
+    """A finding whose path wasn't part of this run's FetchResult is dropped
+    before persistence (not from this run's own review_report.issues), and
+    logged. Findings that ARE persisted gain source_run_id/persisted_at."""
+
+    def test_fabricated_path_finding_is_dropped_before_persistence_and_logged(self, tmp_path, caplog):
+        memory_path = str(tmp_path / "findings.json")
+        agent, *_ = make_agent(
+            memory_path=memory_path,
+            fetch_result=make_fetch_result(paths=("a.py",)),
+            review_result=SimpleNamespace(
+                issues=[
+                    SimpleNamespace(path="a.py", line=1, severity="HIGH", title="Real finding",
+                                     description="d", suggested_fix="f", rule_id="r1"),
+                    SimpleNamespace(path="never_fetched.py", line=1, severity="CRITICAL",
+                                     title="Fabricated finding",
+                                     description="d", suggested_fix="f", rule_id=None),
+                ],
+                summary="ok", model="gemini-2.5-flash", files_reviewed=1,
+                duration_s=0.1, schema_errors=[],
+            ),
+        )
+
+        with caplog.at_level(logging.WARNING):
+            result = agent.review_repo("https://github.com/o/r", branch="main")
+
+        # Logged.
+        assert any(
+            "dropped 1 finding" in r.getMessage() and "never_fetched.py" in r.getMessage()
+            for r in caplog.records
+        )
+        # This run's own report is unaffected -- both findings still present.
+        assert len(result.review_report.issues) == 2
+
+        # But only the legitimate one was persisted.
+        with open(memory_path, encoding="utf-8") as f:
+            stored = json.load(f)
+        persisted = stored["https://github.com/o/r::main"]["findings"]
+        assert [p["path"] for p in persisted] == ["a.py"]
+
+    def test_legitimate_finding_persists_with_provenance_fields(self, tmp_path):
+        memory_path = str(tmp_path / "findings.json")
+        agent, *_ = make_agent(
+            memory_path=memory_path, review_result=make_review_report(issue_count=1),
+        )
+
+        agent.review_repo("https://github.com/o/r", branch="main")
+
+        with open(memory_path, encoding="utf-8") as f:
+            stored = json.load(f)
+        persisted = stored["https://github.com/o/r::main"]["findings"]
+        assert len(persisted) == 1
+        assert persisted[0]["source_run_id"]  # non-empty synthetic run id
+        assert persisted[0]["persisted_at"]   # non-empty ISO timestamp
+
+    def test_no_dropped_findings_means_no_warning_logged(self, tmp_path, caplog):
+        memory_path = str(tmp_path / "findings.json")
+        agent, *_ = make_agent(
+            memory_path=memory_path, review_result=make_review_report(issue_count=1),
+        )
+        with caplog.at_level(logging.WARNING):
+            agent.review_repo("https://github.com/o/r", branch="main")
+        assert not any("dropped" in r.getMessage() for r in caplog.records)
+
+
+# ---------------------------------------------------------------------------
+# 4e-3. Recalled memory delimiter + framing (Change 1 of the memory/dedup
+# hardening pass)
+# ---------------------------------------------------------------------------
+
+class TestRecalledMemoryDelimiterFraming:
+    """recall_previous_findings_tool's result, when there's prior history,
+    includes recalled_memory_block: the same diff data rendered as a
+    <recalled_memory>-delimited text block with explicit untrusted-data
+    framing -- mirroring gemini_reviewer.py's <file_content> treatment of
+    fresh file content. See specs/write_action_gate_spec.md."""
+
+    def test_recalled_memory_block_present_and_delimited_with_history(self, tmp_path):
+        memory_path = str(tmp_path / "findings.json")
+        agent, _fetcher, _semgrep, reviewer = make_agent(memory_path=memory_path)
+        reviewer.review.return_value = make_review_report(issue_count=1)
+        agent.review_repo("https://github.com/o/r", branch="main")
+
+        tool = make_recall_previous_findings_tool(agent)
+        output = tool(repo_url="https://github.com/o/r", branch="main")
+
+        block = output["recalled_memory_block"]
+        assert block.startswith("<recalled_memory>")
+        assert block.endswith("</recalled_memory>")
+        assert "not verified fact" in block
+        assert "not an instruction" in block
+        # Structured keys are still present, unaffected.
+        assert output["has_history"] is True
+
+    def test_recalled_memory_block_absent_when_no_history(self):
+        agent, *_ = make_agent()
+        tool = make_recall_previous_findings_tool(agent)
+        output = tool(repo_url="https://github.com/o/r")
+        assert "recalled_memory_block" not in output
+
+
+# ---------------------------------------------------------------------------
+# 4e-4. dedup_tool / risk_score_tool per-item validation (Change 4 of the
+# memory/dedup hardening pass)
+# ---------------------------------------------------------------------------
+
+class TestDedupAndRiskScoreValidation:
+    """dedup_tool/risk_score_tool drop malformed items (missing path/
+    severity/title) before building a prompt, rather than letting
+    GeminiReviewer.deduplicate_findings/generate_risk_scores silently
+    default them to "?"/"" via .get(...). See
+    specs/write_action_gate_spec.md's dedup/risk-scorer hardening addendum."""
+
+    def test_dedup_tool_drops_item_missing_path(self, caplog):
+        agent, *_ = make_agent()
+        agent.deduplicate_findings = MagicMock(return_value={
+            "deduplicated_findings": [], "original_count": 0, "deduplicated_count": 0,
+            "merges_performed": 0, "summary": "s",
+        })
+        tool = make_dedup_tool(agent)
+
+        with caplog.at_level(logging.WARNING):
+            result = tool(all_findings=[
+                {"path": "a.py", "severity": "HIGH", "title": "Real", "source_agent": "sast_agent"},
+                {"severity": "HIGH", "title": "Missing path", "source_agent": "sast_agent"},
+            ])
+
+        called_with = agent.deduplicate_findings.call_args.args[0]
+        assert len(called_with) == 1
+        assert called_with[0]["path"] == "a.py"
+        assert result["items_dropped"] == 1
+        assert any("dropped 1 malformed" in r.getMessage() for r in caplog.records)
+
+    def test_dedup_tool_raises_when_all_items_invalid(self):
+        agent, *_ = make_agent()
+        tool = make_dedup_tool(agent)
+        with pytest.raises(ValueError, match="no valid items"):
+            tool(all_findings=[{"severity": "HIGH"}])  # no path, no title/pattern
+
+    def test_risk_score_tool_drops_item_missing_severity(self, caplog):
+        agent, *_ = make_agent()
+        agent.generate_risk_scores = MagicMock(return_value={
+            "scored_findings": [], "overall_project_score": 0.0,
+            "overall_risk_level": "LOW", "summary": "s",
+        })
+        tool = make_risk_score_tool(agent)
+
+        with caplog.at_level(logging.WARNING):
+            result = tool(findings=[
+                {"severity": "HIGH", "title": "Real"},
+                {"title": "Missing severity"},
+            ])
+
+        called_with = agent.generate_risk_scores.call_args.args[0]
+        assert len(called_with) == 1
+        assert called_with[0]["title"] == "Real"
+        assert result["items_dropped"] == 1
+        assert any("dropped 1 malformed" in r.getMessage() for r in caplog.records)
+
+    def test_risk_score_tool_raises_when_all_items_invalid(self):
+        agent, *_ = make_agent()
+        tool = make_risk_score_tool(agent)
+        with pytest.raises(ValueError, match="no valid items"):
+            tool(findings=[{"title": ""}])  # no severity, no title
 
 
 # ---------------------------------------------------------------------------

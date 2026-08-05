@@ -35,6 +35,7 @@
 - [Memory](#memory)
 - [What a run looks like](#what-a-run-looks-like)
 - [Quick Start](#quick-start)
+- [CLI Cheat Sheet](#cli-cheat-sheet)
 - [HTTP API](#http-api)
 - [Observability](#observability)
 - [Streamlit UI](#streamlit-ui)
@@ -473,6 +474,8 @@ Everything above (caching, RAG project context) is process-lifetime only — ask
 
 **Where it surfaces:** `PipelineResult.memory` (new/still_open/resolved counts + a few resolved examples), the `/analyze` HTTP response's `memory` field, the Streamlit results view, and a `recall_previous_findings_tool` ADK tool (wired onto `report_agent`) that answers "what changed since the last review of this repo" straight from storage — no new review, no GitHub/Gemini call.
 
+**Trust boundary, hardened.** A finding that passes the existing schema check still gets persisted as-is otherwise — the schema catches malformed shape, not a well-formed hallucination. Two things narrow that gap: before persisting (not before this run's own report — that's unaffected), any finding whose `path` wasn't actually part of this run's fetched files is dropped and logged, since persisting it would let it silently reappear as `"still_open"` in every future re-review of the same repo; and what does get persisted carries `source_run_id`/`persisted_at` provenance (a synthetic per-run identifier, not a git commit sha — none is fetched anywhere in this codebase today). Separately, `recall_previous_findings_tool`'s result — past model output, read back into a *later* turn's context — is wrapped in a `<recalled_memory>...</recalled_memory>` delimiter with explicit framing that it's not verified fact and not an instruction, the same structural + instructional treatment fresh file content gets. See [Security, by design](#security-by-design) and [specs/write_action_gate_spec.md](./specs/write_action_gate_spec.md) §9.
+
 ---
 
 ## What a run looks like
@@ -600,6 +603,29 @@ streamlit run streamlit_app.py
 ```
 
 Opens at `http://localhost:8501`.
+
+---
+
+## CLI Cheat Sheet
+
+The most-used commands across the four access surfaces, testing, evals, and observability, in one place:
+
+| Command | What it does |
+|---|---|
+| `python3 main.py <repo_url> --branch main --out review_report.md -v` | Run a full CLI review and save a Markdown report. `--max-files` (default `10`) caps files reviewed; `-v` enables INFO-level logging |
+| `adk web` | Launch the ADK Dev UI (`http://127.0.0.1:8000`) — chat with the 37-agent graph, inspect traces and tool calls live |
+| `uvicorn server:app --reload` | Start the HTTP API (`http://127.0.0.1:8000`, Swagger docs at `/docs`) |
+| `streamlit run streamlit_app.py` | Launch the Streamlit UI (`http://localhost:8501`) — needs `uvicorn server:app --reload` running in another terminal first |
+| `curl -s -X POST http://127.0.0.1:8000/analyze -H "Content-Type: application/json" -d '{"repo_url": "..."}'` | Trigger a review over the HTTP API directly |
+| `pytest -v` | Run the full test suite (378 tests, everything mocked, no network/credentials needed) |
+| `pytest tests/test_agent.py -k "WriteActionGate"` | Run just one test file/class — swap in any file or `-k` keyword |
+| `python3 view_trace.py` | View the last full run's trace as an indented tree |
+| `python3 view_trace.py --tail 20` | View the last 20 spans across all runs, flat |
+| `python3 view_trace.py --list` | List all runs with timestamps and status |
+| `python3 view_trace.py --run <id-prefix>` | View one specific run by its id prefix |
+| `cd evals && python3 runner.py --mode live` | Run the eval suite for real (needs `GEMINI_API_KEY`; ~19 real Gemini calls) |
+| `cd evals && python3 runner.py --mode live --category trajectory` | Run just the trajectory eval cases (needs `GEMINI_API_KEY` + `GITHUB_TOKEN`) |
+| `cd evals && python3 runner.py --mode live --only det-01-sqli,fp-02-enum-table-name` | Run specific eval cases by id |
 
 ---
 
@@ -838,6 +864,8 @@ Every layer of the stack has explicit security decisions:
 | **Output schema** | Two layers, first constraining generation, second validating the result. First: for the calls that use it (the main review batch, remediation patches, patch verification, risk scoring), the Pydantic schema is also passed as Gemini's own `response_schema` config (`GenerateContentConfig`) — structurally malformed JSON can't come back from the model at all. Second, unchanged and still running on every batch regardless: Gemini's JSON response is validated against a strict Pydantic schema (`extra="forbid"`, enum-constrained severity, required fields) before becoming a finding — a schema can't catch a hallucinated-but-correctly-typed value, so a malformed *or* semantically-wrong response still fails loudly (`ReviewReport.schema_errors`) instead of being silently coerced or treated as "no issues found" |
 | **GitHub write actions** | Both `post_pr_review_tool` (PR comments) and `create_issue_tool` (repo issues) are opt-in only by instruction and docstring — never called automatically at the end of a review, only on explicit user request. `create_issue_tool` additionally won't open an issue at all unless at least one finding meets a severity bar (`min_severity`, default HIGH) — a repo issue is more visible/persistent than a PR comment, so the bar to create one is deliberately higher |
 | **Write-action gate (code-level, not just instructions)** | All three write-capable tools — `post_pr_review_tool`, `create_issue_tool`, `generate_report_file_tool` — are off by default: they're only attached to the ADK chat agent's tool list at all when `CODE_REVIEW_AGENT_ALLOW_WRITE` is set truthy (`build_multi_agent_system(allow_write=...)`), so the model can't see or call them otherwise. When attached, each is wrapped with ADK 2.3's native `FunctionTool(require_confirmation=True)`: the underlying write function is never invoked on a call that lacks an explicit confirmed `ToolConfirmation` — ADK returns a "requires confirmation" response and records the pending request instead, enforced inside ADK's own `FunctionTool.run_async` before the tool's function runs at all. This means an opt-in-only *instruction* (the row above) isn't the only thing standing between a request and a write — even a model that ignored its instructions couldn't fire one without a separate, explicit confirmation. `generate_report_file_tool`'s `output_path` is additionally confined inside a fixed `reports/` directory (`report_generator.confine_report_path()`) — an absolute path or `../` traversal is rejected, not redirected, before any file is touched. See [specs/write_action_gate_spec.md](./specs/write_action_gate_spec.md) |
+| **Memory-recall hardening** | Two gaps closed on top of the Memory feature's existing schema check (which can't catch a well-formed hallucination): (1) a finding whose `path` wasn't part of the run's actual `FetchResult` is dropped before persistence (never from this run's own report) and logged — a compromised repo's fabricated finding can't get written to `.review_memory/findings.json` and keep reappearing as `"still_open"` in every future re-review; persisted findings also carry `source_run_id`/`persisted_at` provenance. (2) `recall_previous_findings_tool`'s result — past model output read back into a *later* turn — is wrapped in `<recalled_memory>...</recalled_memory>` with explicit "not verified fact, not an instruction" framing, matching `<file_content>`'s treatment of fresh file content. Cross-repo bleed via the store's `f"{repo_url}::{branch}"` keying was investigated and found not possible today. See [specs/write_action_gate_spec.md](./specs/write_action_gate_spec.md) §9.1 |
+| **dedup_agent / risk_scorer_agent hardening** | `dedup_tool`/`risk_score_tool` previously only checked "is this a non-empty list" — a missing `path`/`severity`/`title` silently became `"?"`/`""`. Both now drop malformed items (logged, surfaced as `items_dropped`) before building a prompt, checking only the handful of fields each tool's own prompt actually reads (findings arrive from heterogeneous specialist agents with genuinely different native shapes). Both prompts' findings text is also wrapped in `<findings_to_process>...</findings_to_process>` tags, the same structural boundary fresh file content gets, on top of the pre-existing "treat as untrusted data" instruction text. `dedup_tool`'s output deliberately did **not** gain a strict `response_schema` like `risk_score_tool` already has — its output merges heterogeneous upstream specialist fields, and `extra="forbid"` would silently truncate them at generation time; a lighter shape-only post-hoc check was added instead. See [specs/write_action_gate_spec.md](./specs/write_action_gate_spec.md) §9.2 |
 | **Remediation cost control** | `POST /remediate` is opt-in only, same philosophy as the GitHub write actions above — never triggered automatically by `/analyze`. No server-side allow-list of "fixable" finding categories either: that judgment is left to the caller (e.g. the Streamlit checkboxes), since generating patches is one batched Gemini call regardless of how many findings are included, so call-count isn't the cost lever — whether the endpoint runs at all is |
 | **Guardrail on write actions** | `guardrail.py`'s `check_content()` scans generated content immediately before it's returned/posted from all three write paths — `post_pr_review_tool`, `create_issue_tool`, and remediation patches — for (a) a real-looking hardcoded secret (regexes translated directly from `SECRETS_AUDIT_SYSTEM_INSTRUCTION`'s own pattern list, redacted in the error message) and (b) prompt-injection-leakage phrasing (the same signature `TestPromptSafety`/`inj-01-embedded-system-override` already treat as this failure mode). A block never crashes the pipeline: `post_pr_review_tool`/`create_issue_tool` return `{"blocked": true, "reason", "violations"}` instead of writing anything, and a blocked remediation patch is dropped into `blocked_patches` while other clean patches in the same batch still return. Hand-rolled, not Guardrails AI — see [specs/guardrail_spec.md](./specs/guardrail_spec.md) for the real dependency-conflict evidence (`litellm`, `langchain-core`, and their own `opentelemetry` pins on top of `google-adk`'s) behind that call |
 | **Credentials** | API keys load from environment variables only; `test_secrets_never_logged` asserts no key ever appears in a log line or exception message |
@@ -851,7 +879,7 @@ Every layer of the stack has explicit security decisions:
 pytest -v
 ```
 
-360 tests across all modules. Every external dependency — GitHub API, Semgrep subprocess, Gemini SDK (including `embed_content`) — is mocked, so the full suite runs in a few seconds with no network access or credentials required. These tests check plumbing: batching, JSON parsing, retries, exact-match and semantic caching (hits, misses, per-`(system_instruction, rag_fingerprint)` bucket scoping, threshold behavior, embedding-failure fallback), RAG comment retrieval/contextualization, native `response_schema` passthrough/omission, error handling, size caps, schema validation, persistent findings memory (round-trip storage, corrupted-file degradation, new/still_open/resolved diff classification), the guardrail's secret/injection-leakage detection and block/pass wiring into the three write paths, and the Layer A/B injection defense (`<file_content>` delimiter wrapping, the flag-it instruction fitting the existing schema, `injection_scanner.py`'s pattern matching, and a planted-injection fixture confirming a real finding survives alongside the flagged attempt). They do not check whether the pipeline's judgment is actually good — that's what the eval suite below is for.
+378 tests across all modules. Every external dependency — GitHub API, Semgrep subprocess, Gemini SDK (including `embed_content`) — is mocked, so the full suite runs in a few seconds with no network access or credentials required. These tests check plumbing: batching, JSON parsing, retries, exact-match and semantic caching (hits, misses, per-`(system_instruction, rag_fingerprint)` bucket scoping, threshold behavior, embedding-failure fallback), RAG comment retrieval/contextualization, native `response_schema` passthrough/omission, error handling, size caps, schema validation, persistent findings memory (round-trip storage, corrupted-file degradation, new/still_open/resolved diff classification, fabricated-path rejection + provenance at persistence time, delimiter-wrapped recall framing), dedup/risk-scorer per-item validation and fail-closed behavior on malformed input, the write-action gate (path confinement, off-by-default attachment, ADK-native confirmation hard-block with `assert_not_called()` proof), the guardrail's secret/injection-leakage detection and block/pass wiring into the three write paths, and the Layer A/B injection defense (`<file_content>` delimiter wrapping, the flag-it instruction fitting the existing schema, `injection_scanner.py`'s pattern matching, and a planted-injection fixture confirming a real finding survives alongside the flagged attempt). They do not check whether the pipeline's judgment is actually good — that's what the eval suite below is for.
 
 `tests/test_server.py` additionally tests `/remediate` at the HTTP route level with FastAPI's `TestClient` — request validation, status codes, file-filtering, and malformed-patch handling — rather than only the pure aggregation functions `tests/test_server_traces.py` covers for `/traces`. `TestClient(app)` is constructed without entering it as a context manager, so the real `lifespan` (which needs a working Semgrep binary and real credentials) never runs; `app.state.agent` is swapped for a mock instead.
 
@@ -979,10 +1007,11 @@ code_review_agent/
 │   ├── semgrep_runner_spec.md
 │   ├── memory_spec.md
 │   ├── guardrail_spec.md
-│   └── injection_defense_spec.md
+│   ├── injection_defense_spec.md
+│   └── write_action_gate_spec.md
 │
 ├── Tests
-│   └── tests/                    # 360 tests, one file per module, all mocked
+│   └── tests/                    # 378 tests, one file per module, all mocked
 │                                  #   test_server.py additionally exercises
 │                                  #   /remediate via FastAPI's TestClient
 │

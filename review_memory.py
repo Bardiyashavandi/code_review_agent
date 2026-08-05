@@ -159,7 +159,22 @@ class ReviewMemoryStore:
         """Persist `findings` as the latest snapshot for (repo_url, branch),
         alongside a summary of `diff` (so recall_previous_findings_tool can
         answer from storage alone, no recomputation). Best-effort: logs and
-        returns on any failure, never raises."""
+        returns on any failure, never raises.
+
+        `findings` dicts are stored exactly as given -- this module stays
+        deliberately unaware of any domain types (FetchResult, etc.) or of
+        what plausibility/provenance checks a caller may have already run.
+        agent.py's review_repo() (see specs/write_action_gate_spec.md's
+        memory-recall hardening addendum) drops findings whose path wasn't
+        part of the run's fetched files *before* calling this, and attaches
+        two provenance keys to each finding it does pass in: source_run_id
+        (a synthetic per-review_repo()-call identifier -- not a git commit
+        sha, since none is fetched anywhere in this codebase today) and
+        persisted_at (this write's timestamp). Neither key is required or
+        interpreted here, or by diff()/_finding_identity()/_match_key()
+        below, which only ever read path/line/rule_id/title -- they exist so
+        a future staleness check (e.g. "drop anything not reconfirmed in N
+        runs") has something to key off without another migration."""
         try:
             data: dict = {}
             if self._path.exists():
