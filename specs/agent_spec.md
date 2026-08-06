@@ -315,3 +315,93 @@ descriptions drifting apart.
 
 Tests for the pure-Python trace-parsing/scoring logic backing these cases:
 `tests/test_trajectory_scorers.py`.
+
+## 14. Grounded-fetch hardening for security specialist audit tools
+
+### 14.1 Incident
+
+A live `adk web` run against a real external repo (`review <repo_url>`,
+routed through `security_full_scan`) produced a CRITICAL/HIGH-severity
+report — RCE via `os.system(cmd)`, path traversal, SQL injection via
+f-strings, a hardcoded `SECRET_KEY`, an unprotected `/admin` route,
+reflected XSS — that was then used to open a real GitHub issue on that
+repo (`create_issue_tool`, approved via the write-action gate). None of it
+was real. The target repo has no `app.py` or `main.py` at all; every
+finding referenced files and code that don't exist anywhere in the
+repository, the local codebase, or any test fixture (confirmed by
+fetching the actual repo tree and grepping this codebase for the
+fabricated snippets — zero matches either way). The issue was later
+deleted.
+
+Root cause, confirmed via the session's `.adk/session.db` event log: on a
+retry immediately following a cancelled first attempt and repeated Gemini
+429s, 4 of the 6 parallel security specialists (`injection_agent_scan`,
+`auth_agent_scan`, `secrets_agent_scan`, `data_flow_agent_scan`) skipped
+their `fetch_repo_files_tool` call entirely and called their audit tool
+directly with a fabricated Flask app in the `files` argument. Only
+`sast_agent_scan` fetched real files that run. Nothing prevented this:
+`injection_audit_tool` / `auth_audit_tool` / `secrets_audit_tool` /
+`data_flow_tool` / `crypto_audit_tool` (§11.2's `*_scan` clones and their
+L3 originals) all took `files: list[dict]` as a plain LLM-supplied
+argument — the only link to a real fetch was a docstring sentence ("from
+fetch_repo_files_tool"), not an enforced one. `security_aggregator_agent`
+and `report_agent` downstream had no way to distinguish grounded output
+from fabricated output; both just formatted whatever they were given.
+
+This is a different failure mode from Wednesday/Thursday's hardening
+(§§ untrusted-input-from-other-agents, blind-trust-between-handoffs): this
+was the model fabricating its OWN tool-call input from training-data
+patterns, not a downstream agent trusting a poisoned upstream value.
+Delimiter-wrapping (this week's other fix) does nothing here — there was
+no real specialist output to wrap in the first place.
+
+### 14.2 Fix
+
+`injection_audit_tool`, `auth_audit_tool`, `secrets_audit_tool`,
+`data_flow_tool`, and `crypto_audit_tool` no longer accept `files`. Each
+now takes `repo_url: str, branch: str = DEFAULT_BRANCH` and fetches the
+repository itself (`agent.fetch_files(repo_url, branch=branch)`) before
+calling the same underlying `agent.generate_*_audit(...)` method as
+before. This makes fabricating findings structurally impossible rather
+than instruction-discouraged — there is no parameter left for a model to
+put invented file content into. `injection_agent`, `auth_agent`,
+`crypto_agent`, and `data_flow_agent`'s instructions and `tools` lists
+were updated to match (their standalone `fetch_repo_files_tool` call is
+gone — the audit tool now does it in one step). `secrets_agent` keeps
+`fetch_repo_files_tool` in its tool list because `search_code_in_files_tool`
+(its supplementary grep pass) still needs an already-fetched `files` list;
+`secrets_audit_tool` itself is grounded the same way as the other four.
+
+As a side effect, this also reduces token usage per specialist: file
+content used to flow through the model twice — once in
+`fetch_repo_files_tool`'s response, once retyped into the audit tool's
+`files` argument — and now flows through Python only, which helps (but
+does not eliminate) the free-tier rate-limit pressure that this incident
+happened under.
+
+**Deliberately out of scope:** `scan_code_tool` and `generate_review_tool`
+(used by `sast_agent` and other, more broadly-shared call sites) accept
+the same style of `files: list[dict]` argument and carry the same class of
+risk in principle. They were not changed here — `sast_agent` fetched
+correctly in the incident, they're shared across more agents than the
+five above, and Semgrep's `scan_code_tool` path is deterministic
+rule-matching rather than LLM synthesis (lower-severity risk if fed bad
+input). This is a real residual gap, not a claim that the whole tool
+surface is now hardened — noted here rather than silently left
+undocumented.
+
+### 14.3 Tests (`tests/test_agent.py::TestGroundedFetchAuditTools`)
+
+| Test ID | Scenario | Expected |
+|---------|----------|----------|
+| `test_tool_fetches_real_files_and_forwards_them_to_the_audit_call` (parametrized over all 5 tools) | Call tool with only `repo_url` | `GitHubFetcher.fetch_python_files` is actually called; the exact files it returned are what's passed to `generate_*_audit` |
+| `test_tool_rejects_empty_repo_url` (parametrized) | Call with `""` | `ValueError` mentioning `repo_url` |
+| `test_tool_signature_no_longer_accepts_a_files_argument` (parametrized) | Inspect signature; call with `files=...` | `files` not in the tool's parameters, `repo_url` is; calling with `files=` raises `TypeError` — the actual incident vector is gone, not just discouraged |
+
+### 14.4 Acceptance Criteria
+
+- [x] `injection_audit_tool`, `auth_audit_tool`, `secrets_audit_tool`, `data_flow_tool`, `crypto_audit_tool` take `repo_url`, not `files`
+- [x] Each fetches its own files via `agent.fetch_files` rather than trusting a model-supplied argument
+- [x] `tests/test_agent.py::TestGroundedFetchAuditTools` proves both the new behavior and that the old `files=` vector raises `TypeError`
+- [x] Full `pytest` suite passes (409 passed, up from 393)
+- [x] `scan_code_tool` / `generate_review_tool`'s same-class residual risk is documented, not silently left unmentioned

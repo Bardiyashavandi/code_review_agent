@@ -13,6 +13,7 @@ Run with:
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import logging
 import os
@@ -33,14 +34,18 @@ import agent as agent_module
 from agent import (
     CodeReviewAgent,
     PipelineResult,
+    make_auth_audit_tool,
     make_create_issue_tool,
+    make_crypto_audit_tool,
     make_cwe_mapping_tool,
+    make_data_flow_tool,
     make_dedup_tool,
     make_explain_finding_tool,
     make_fetch_repo_files_tool,
     make_generate_report_file_tool,
     make_generate_review_tool,
     make_get_repo_metadata_tool,
+    make_injection_audit_tool,
     make_owasp_mapping_tool,
     make_patch_verifier_tool,
     make_post_pr_review_tool,
@@ -49,6 +54,7 @@ from agent import (
     make_risk_score_tool,
     make_scan_code_tool,
     make_search_code_tool,
+    make_secrets_audit_tool,
     make_validate_findings_tool,
 )
 from gemini_reviewer import RAG_MAX_CONVENTIONS_CHARS, GeminiRateLimitError
@@ -479,6 +485,71 @@ class TestGranularAdkTools:
 
         with pytest.raises(ValueError, match="files"):
             tool([])
+
+
+# ---------------------------------------------------------------------------
+# 4b-2. Grounded-fetch security audit tools (injection/auth/secrets/
+# data_flow/crypto) — see the "Grounded-fetch hardening" comment block
+# above make_injection_audit_tool() in agent.py for the incident that
+# prompted this. These tools used to accept `files: list[dict]` as a plain
+# LLM-supplied argument; a live run under rate-limit pressure showed 4 of
+# 6 security specialists skip the fetch step and fabricate file content
+# outright, which then went out in a real (later deleted) GitHub issue.
+# They now take `repo_url` and fetch the files themselves, so there is no
+# `files` parameter left for a model to fabricate content into — these
+# tests assert both the new grounded behavior AND that the old vector is
+# gone (TypeError on a `files=` kwarg, not just "still trusts it").
+# ---------------------------------------------------------------------------
+
+class TestGroundedFetchAuditTools:
+
+    _TOOL_FACTORIES = {
+        "injection": (make_injection_audit_tool, "generate_injection_audit"),
+        "auth": (make_auth_audit_tool, "generate_auth_audit"),
+        "secrets": (make_secrets_audit_tool, "generate_secrets_audit"),
+        "data_flow": (make_data_flow_tool, "generate_data_flow_analysis"),
+        "crypto": (make_crypto_audit_tool, "generate_crypto_audit"),
+    }
+
+    @pytest.mark.parametrize("name", ["injection", "auth", "secrets", "data_flow", "crypto"])
+    def test_tool_fetches_real_files_and_forwards_them_to_the_audit_call(self, name):
+        factory, reviewer_method = self._TOOL_FACTORIES[name]
+        fetch_result = make_fetch_result(paths=("app.py",))
+        agent, mock_fetcher, _, mock_reviewer = make_agent(fetch_result=fetch_result)
+        getattr(mock_reviewer, reviewer_method).return_value = {"findings": [], "summary": "ok"}
+        tool = factory(agent)
+
+        output = tool("https://github.com/owner/repo")
+
+        json.dumps(output)
+        mock_fetcher.fetch_python_files.assert_called_once()
+        called_files = getattr(mock_reviewer, reviewer_method).call_args[0][0]
+        assert [f.path for f in called_files] == ["app.py"]
+
+    @pytest.mark.parametrize("name", ["injection", "auth", "secrets", "data_flow", "crypto"])
+    def test_tool_rejects_empty_repo_url(self, name):
+        factory, _ = self._TOOL_FACTORIES[name]
+        agent, *_ = make_agent()
+        tool = factory(agent)
+
+        with pytest.raises(ValueError, match="repo_url"):
+            tool("")
+
+    @pytest.mark.parametrize("name", ["injection", "auth", "secrets", "data_flow", "crypto"])
+    def test_tool_signature_no_longer_accepts_a_files_argument(self, name):
+        # Regression test for the actual incident: a `files` kwarg used to
+        # let the model hand the tool fabricated file content directly.
+        # That parameter must no longer exist at all.
+        factory, _ = self._TOOL_FACTORIES[name]
+        agent, *_ = make_agent()
+        tool = factory(agent)
+
+        params = inspect.signature(tool).parameters
+        assert "files" not in params
+        assert "repo_url" in params
+
+        with pytest.raises(TypeError):
+            tool(files=[{"path": "app.py", "content": "SECRET_KEY = 'fabricated'"}])
 
 
 # ---------------------------------------------------------------------------

@@ -1899,10 +1899,15 @@ def make_dependency_scan_tool(agent: CodeReviewAgent) -> Callable[..., dict]:
 def make_crypto_audit_tool(agent: CodeReviewAgent) -> Callable[..., dict]:
     """Build a cryptography audit tool."""
 
-    def crypto_audit_tool(files: list[dict]) -> dict:
-        """Audit source files for weak, broken, or misused cryptography.
+    # Self-fetching (repo_url in, not files in) -- see the "Grounded-fetch
+    # hardening" comment block above make_injection_audit_tool() for why.
+    def crypto_audit_tool(repo_url: str, branch: str = DEFAULT_BRANCH) -> dict:
+        """Fetch a GitHub repository's Python files and audit them for weak,
+        broken, or misused cryptography.
 
-        files: list of {path, content} dicts from fetch_repo_files_tool.
+        repo_url: the GitHub repository URL to fetch and audit. This tool
+        fetches the files itself -- it does not accept file content as an
+        argument, so results are always grounded in the real repository.
 
         Detects: MD5/SHA1 password hashing, Python random for secrets,
         ECB cipher mode, hardcoded/weak IVs, disabled TLS verification,
@@ -1910,16 +1915,11 @@ def make_crypto_audit_tool(agent: CodeReviewAgent) -> Callable[..., dict]:
         derivation.
 
         Returns {findings: [{path, line, severity, pattern, current_code,
-        why_dangerous, correct_alternative, attacker_effort}], summary}.
-        Call fetch_repo_files_tool first, then pass the files here."""
-        if not isinstance(files, list) or not files:
-            raise ValueError("files must be a non-empty list")
-        file_objs = [
-            FileResult(path=f["path"], content=f.get("content", ""),
-                       sha="", size=len(f.get("content", "")), url="")
-            for f in files
-        ]
-        return agent.generate_crypto_audit(file_objs)
+        why_dangerous, correct_alternative, attacker_effort}], summary}."""
+        if not isinstance(repo_url, str) or not repo_url.strip():
+            raise ValueError("repo_url must be a non-empty string")
+        fetch_result = agent.fetch_files(repo_url, branch=branch)
+        return agent.generate_crypto_audit(fetch_result.files)
 
     return crypto_audit_tool
 
@@ -1960,65 +1960,103 @@ def make_threat_model_tool(agent: CodeReviewAgent) -> Callable[..., dict]:
     return threat_model_tool
 
 
+# ── Grounded-fetch hardening ─────────────────────────────────────────────
+# These specialist audit tools (injection/auth/secrets/data_flow/crypto)
+# used to take `files: list[dict]` as a plain LLM-supplied argument, with
+# the only guarantee those files were real being a docstring sentence
+# ("from fetch_repo_files_tool"). Nothing enforced that the model actually
+# called fetch_repo_files_tool first and passed its real output through --
+# and in a live run under 429 rate-limit pressure, 4 of 6 security
+# specialists skipped the fetch step entirely and called their audit tool
+# directly with a plausible-looking but entirely fabricated Flask app
+# (hardcoded SECRET_KEY, os.system(cmd), string-built SQL, unprotected
+# /admin route) that matched no file in the actual repo, the codebase, or
+# any local fixture. The aggregator and report_agent had no way to tell
+# the findings weren't grounded, and it went out in a real GitHub issue.
+# See specs/agent_spec.md addendum for the incident writeup.
+#
+# The fix: these tools now take `repo_url` (a short string, not multi-KB
+# file content) and fetch the files themselves, deterministically, inside
+# Python -- never trusting the model to faithfully transcribe content it
+# already saw. This makes fabricating findings structurally impossible
+# rather than instruction-discouraged, and also cuts token usage (one
+# fetch per specialist instead of the model re-typing full file contents
+# into a second tool call).
 def make_injection_audit_tool(agent: CodeReviewAgent) -> Callable[..., dict]:
-    def injection_audit_tool(files: list[dict]) -> dict:
-        """Audit source files for injection vulnerabilities: SQL injection, command injection,
-        SSTI, XSS, SSRF, path traversal, LDAP, XXE, and header injection.
-        files: list of {path, content} from fetch_repo_files_tool.
+    def injection_audit_tool(repo_url: str, branch: str = DEFAULT_BRANCH) -> dict:
+        """Fetch a GitHub repository's Python files and audit them for injection
+        vulnerabilities: SQL injection, command injection, SSTI, XSS, SSRF,
+        path traversal, LDAP, XXE, and header injection.
+
+        repo_url: the GitHub repository URL to fetch and audit. This tool
+        fetches the files itself -- it does not accept file content as an
+        argument, so results are always grounded in the real repository.
+
         Returns {findings: [{path, line, severity, injection_type, vulnerable_code,
         attack_vector, attack_chain, impact, fix}], summary}."""
-        if not isinstance(files, list) or not files:
-            raise ValueError("files must be a non-empty list")
-        file_objs = [FileResult(path=f["path"], content=f.get("content",""),
-                                sha="", size=len(f.get("content","")), url="") for f in files]
-        return agent.generate_injection_audit(file_objs)
+        if not isinstance(repo_url, str) or not repo_url.strip():
+            raise ValueError("repo_url must be a non-empty string")
+        fetch_result = agent.fetch_files(repo_url, branch=branch)
+        return agent.generate_injection_audit(fetch_result.files)
     return injection_audit_tool
 
 
 def make_auth_audit_tool(agent: CodeReviewAgent) -> Callable[..., dict]:
-    def auth_audit_tool(files: list[dict]) -> dict:
-        """Audit source files for authentication and authorization vulnerabilities:
-        IDOR, broken auth, privilege escalation, missing access controls, JWT issues.
-        files: list of {path, content} from fetch_repo_files_tool.
+    def auth_audit_tool(repo_url: str, branch: str = DEFAULT_BRANCH) -> dict:
+        """Fetch a GitHub repository's Python files and audit them for
+        authentication and authorization vulnerabilities: IDOR, broken auth,
+        privilege escalation, missing access controls, JWT issues.
+
+        repo_url: the GitHub repository URL to fetch and audit. This tool
+        fetches the files itself -- it does not accept file content as an
+        argument, so results are always grounded in the real repository.
+
         Returns {findings: [{path, line, severity, category, vulnerable_code,
         scenario, impact, fix}], summary}."""
-        if not isinstance(files, list) or not files:
-            raise ValueError("files must be a non-empty list")
-        file_objs = [FileResult(path=f["path"], content=f.get("content",""),
-                                sha="", size=len(f.get("content","")), url="") for f in files]
-        return agent.generate_auth_audit(file_objs)
+        if not isinstance(repo_url, str) or not repo_url.strip():
+            raise ValueError("repo_url must be a non-empty string")
+        fetch_result = agent.fetch_files(repo_url, branch=branch)
+        return agent.generate_auth_audit(fetch_result.files)
     return auth_audit_tool
 
 
 def make_secrets_audit_tool(agent: CodeReviewAgent) -> Callable[..., dict]:
-    def secrets_audit_tool(files: list[dict]) -> dict:
-        """Scan source files for hardcoded secrets: API keys, passwords, private keys,
-        JWT signing secrets, database credentials, OAuth client secrets.
-        files: list of {path, content} from fetch_repo_files_tool.
+    def secrets_audit_tool(repo_url: str, branch: str = DEFAULT_BRANCH) -> dict:
+        """Fetch a GitHub repository's Python files and scan them for hardcoded
+        secrets: API keys, passwords, private keys, JWT signing secrets,
+        database credentials, OAuth client secrets.
+
+        repo_url: the GitHub repository URL to fetch and audit. This tool
+        fetches the files itself -- it does not accept file content as an
+        argument, so results are always grounded in the real repository.
+
         Returns {findings: [{path, line, severity, secret_type, description,
         redacted_value, risk, fix}], summary}."""
-        if not isinstance(files, list) or not files:
-            raise ValueError("files must be a non-empty list")
-        file_objs = [FileResult(path=f["path"], content=f.get("content",""),
-                                sha="", size=len(f.get("content","")), url="") for f in files]
-        return agent.generate_secrets_audit(file_objs)
+        if not isinstance(repo_url, str) or not repo_url.strip():
+            raise ValueError("repo_url must be a non-empty string")
+        fetch_result = agent.fetch_files(repo_url, branch=branch)
+        return agent.generate_secrets_audit(fetch_result.files)
     return secrets_audit_tool
 
 
 def make_data_flow_tool(agent: CodeReviewAgent) -> Callable[..., dict]:
-    def data_flow_tool(files: list[dict]) -> dict:
-        """Perform taint analysis on source files: trace untrusted user input from
-        sources (HTTP params, CLI args, file input) through the application to
-        dangerous sinks (DB queries, shell commands, template rendering, SSRF).
-        files: list of {path, content} from fetch_repo_files_tool.
+    def data_flow_tool(repo_url: str, branch: str = DEFAULT_BRANCH) -> dict:
+        """Fetch a GitHub repository's Python files and perform taint analysis:
+        trace untrusted user input from sources (HTTP params, CLI args, file
+        input) through the application to dangerous sinks (DB queries, shell
+        commands, template rendering, SSRF).
+
+        repo_url: the GitHub repository URL to fetch and audit. This tool
+        fetches the files itself -- it does not accept file content as an
+        argument, so results are always grounded in the real repository.
+
         Returns {tainted_paths: [{path, source_line, sink_line, source, sink,
         sink_type, intermediate_steps, sanitizers_present, sanitization_adequate,
         severity, exploit}], safe_paths, summary}."""
-        if not isinstance(files, list) or not files:
-            raise ValueError("files must be a non-empty list")
-        file_objs = [FileResult(path=f["path"], content=f.get("content",""),
-                                sha="", size=len(f.get("content","")), url="") for f in files]
-        return agent.generate_data_flow_analysis(file_objs)
+        if not isinstance(repo_url, str) or not repo_url.strip():
+            raise ValueError("repo_url must be a non-empty string")
+        fetch_result = agent.fetch_files(repo_url, branch=branch)
+        return agent.generate_data_flow_analysis(fetch_result.files)
     return data_flow_tool
 
 
@@ -2544,16 +2582,18 @@ def build_multi_agent_system(
             "vulnerabilities — tracing every path where untrusted data enters a "
             "dangerous sink.\n\n"
             "WORKFLOW:\n"
-            "1. fetch_repo_files_tool — pull Python files.\n"
-            "2. injection_audit_tool — deep injection analysis: SQL, command, SSTI, "
-            "   XSS, SSRF, path traversal, LDAP, XXE, header injection.\n\n"
+            "1. injection_audit_tool — pass the repo_url from the user's request "
+            "   directly. It fetches the files itself and runs deep injection "
+            "   analysis in one grounded step: SQL, command, SSTI, XSS, SSRF, "
+            "   path traversal, LDAP, XXE, header injection. Never invent file "
+            "   content yourself — this tool only accepts a repo_url, precisely "
+            "   so results can't be based on anything but the real repository.\n\n"
             "For each finding: show the attack_vector (what an attacker sends), "
             "the attack_chain (step-by-step from input to exploit), the impact, "
             "and the exact fix. Be concrete — name the payload, name the sink.\n\n"
             "Transfer back to security_coordinator when done."
         ),
         tools=[
-            _ft(make_fetch_repo_files_tool),
             _ft(make_injection_audit_tool),
         ],
         output_key="injection_result",
@@ -2571,9 +2611,13 @@ def build_multi_agent_system(
             "exclusively on identity: who is allowed to do what, and what happens "
             "when those checks are missing or bypassable.\n\n"
             "WORKFLOW:\n"
-            "1. fetch_repo_files_tool — pull Python files.\n"
-            "2. auth_audit_tool — deep auth/authz analysis: IDOR, broken auth, "
-            "   privilege escalation, missing access controls, JWT, OAuth.\n\n"
+            "1. auth_audit_tool — pass the repo_url from the user's request "
+            "   directly. It fetches the files itself and runs deep auth/authz "
+            "   analysis in one grounded step: IDOR, broken auth, privilege "
+            "   escalation, missing access controls, JWT, OAuth. Never invent "
+            "   file content yourself — this tool only accepts a repo_url, "
+            "   precisely so results can't be based on anything but the real "
+            "   repository.\n\n"
             "For each finding: describe the concrete attack scenario (what does "
             "a logged-in attacker with basic access do?), the impact (access "
             "other users' data / escalate to admin / account takeover), and "
@@ -2581,7 +2625,6 @@ def build_multi_agent_system(
             "Transfer back to security_coordinator when done."
         ),
         tools=[
-            _ft(make_fetch_repo_files_tool),
             _ft(make_auth_audit_tool),
         ],
         output_key="auth_result",
@@ -2598,14 +2641,16 @@ def build_multi_agent_system(
             "You are the Cryptography Auditor. You find cryptographic mistakes "
             "that look correct to most developers but are actually exploitable.\n\n"
             "WORKFLOW:\n"
-            "1. fetch_repo_files_tool — fetch the source files.\n"
-            "2. crypto_audit_tool — pass the files for cryptographic analysis.\n\n"
+            "1. crypto_audit_tool — pass the repo_url from the user's request "
+            "   directly. It fetches the files itself and runs cryptographic "
+            "   analysis in one grounded step. Never invent file content "
+            "   yourself — this tool only accepts a repo_url, precisely so "
+            "   results can't be based on anything but the real repository.\n\n"
             "For each finding: explain WHY it is dangerous (concrete attack, not just "
             "'it is weak'), the attacker effort, and the exact safe replacement.\n\n"
             "Transfer back to security_coordinator when done."
         ),
         tools=[
-            _ft(make_fetch_repo_files_tool),
             _ft(make_crypto_audit_tool),
         ],
         output_key="crypto_result",
@@ -2623,11 +2668,16 @@ def build_multi_agent_system(
             "accidentally committed to source code — the kind of thing that leads to "
             "breach headlines.\n\n"
             "WORKFLOW:\n"
-            "1. fetch_repo_files_tool — fetch the source files.\n"
-            "2. secrets_audit_tool — scan for hardcoded secrets: API keys, passwords, "
-            "   private keys, JWT signing secrets, DB credentials, OAuth secrets.\n"
-            "3. search_code_in_files_tool — additionally grep for common patterns "
-            "   like 'password', 'secret', 'api_key', 'token', 'AKIA' to catch "
+            "1. secrets_audit_tool — pass the repo_url from the user's request "
+            "   directly. It fetches the files itself and scans for hardcoded "
+            "   secrets in one grounded step: API keys, passwords, private keys, "
+            "   JWT signing secrets, DB credentials, OAuth secrets. Never invent "
+            "   file content yourself — this tool only accepts a repo_url, "
+            "   precisely so results can't be based on anything but the real "
+            "   repository.\n"
+            "2. fetch_repo_files_tool then search_code_in_files_tool — "
+            "   additionally grep the same repo for common patterns like "
+            "   'password', 'secret', 'api_key', 'token', 'AKIA' to catch "
             "   anything the LLM might miss.\n\n"
             "For each finding: describe what the secret unlocks and the blast radius "
             "if an attacker finds it. NEVER print the full secret value — redact to "
@@ -2654,10 +2704,13 @@ def build_multi_agent_system(
             "path where untrusted input moves through the application without adequate "
             "sanitization.\n\n"
             "WORKFLOW:\n"
-            "1. fetch_repo_files_tool — fetch the source files.\n"
-            "2. data_flow_tool — full taint analysis: source → intermediate steps → "
-            "   sink, with sanitizer adequacy assessment.\n"
-            "3. (optional) transfer to taint_validator_agent to confirm reachability "
+            "1. data_flow_tool — pass the repo_url from the user's request "
+            "   directly. It fetches the files itself and runs full taint "
+            "   analysis in one grounded step: source → intermediate steps → "
+            "   sink, with sanitizer adequacy assessment. Never invent file "
+            "   content yourself — this tool only accepts a repo_url, precisely "
+            "   so results can't be based on anything but the real repository.\n"
+            "2. (optional) transfer to taint_validator_agent to confirm reachability "
             "   of the highest-severity paths.\n\n"
             "For each tainted path: show the full chain from where user data enters "
             "to where it reaches a dangerous operation, the missing sanitizer, "
@@ -2665,7 +2718,6 @@ def build_multi_agent_system(
             "Transfer back to security_coordinator when done."
         ),
         tools=[
-            _ft(make_fetch_repo_files_tool),
             _ft(make_data_flow_tool),
         ],
         sub_agents=[taint_validator_agent],
