@@ -405,3 +405,76 @@ undocumented.
 - [x] `tests/test_agent.py::TestGroundedFetchAuditTools` proves both the new behavior and that the old `files=` vector raises `TypeError`
 - [x] Full `pytest` suite passes (409 passed, up from 393)
 - [x] `scan_code_tool` / `generate_review_tool`'s same-class residual risk is documented, not silently left unmentioned
+
+## 15. 429 retry-with-backoff for the ADK agent graph
+
+### 15.1 Problem
+
+The quota pressure behind §14's incident kept recurring after the fix
+above: `security_full_scan`'s 6-way parallel fan-out (plus L4
+sub-delegates like `validator_agent`/`taint_validator_agent`) can burst
+past the free tier's per-minute caps within a single scan — observed
+directly against `gemini-3.1-flash-lite`: 15 requests/minute
+(`GenerateRequestsPerMinutePerProjectPerModel-FreeTier`) and 250,000 input
+tokens/minute (`GenerateContentInputTokensPerModelPerMinute-FreeTier`),
+both distinct from the daily RPD cap `main.py`'s CLI path already paces
+around. A 429 hitting any one of the parallel specialists propagated
+straight up through `ParallelAgent`'s `asyncio.TaskGroup` as an unhandled
+`ExceptionGroup`, killing the entire scan — the user had to notice, wait,
+and manually resend.
+
+**Why `gemini_reviewer.py`'s existing retry/backoff (`_call_model()`,
+`MAX_RETRIES=3`) doesn't cover this:** that mechanism is only reachable via
+`CodeReviewAgent`'s own methods, called from the CLI/`server.py`/Streamlit
+path. Every `Agent(model=...)` in this file previously took a bare model
+name string, which ADK resolves to its own internal `google.adk.models.
+Gemini` model wrapper — a Gemini call made from inside the ADK agent
+graph (i.e. every `adk web` chat call) never goes through
+`gemini_reviewer.py` at all. This is the same gap the "Not yet handled"
+bullet in README's Known limitations already named for fallback/caching/
+routing; retry-with-backoff was the same class of gap.
+
+### 15.2 Fix
+
+ADK's `Gemini` model class has a documented, first-class field for
+exactly this: `retry_options: Optional[types.HttpRetryOptions]`, which
+retries at the HTTP layer inside `google-genai`'s own client — before an
+exception ever reaches ADK or this project's code. `_gemini_model()` (a
+small factory near `DEFAULT_MODEL`) returns a fresh `Gemini(model=
+DEFAULT_MODEL, retry_options=HttpRetryOptions(attempts=6, initial_delay=
+2.0, max_delay=30.0, exp_base=2.0))` instance; every `Agent(model=...)`
+call in `build_multi_agent_system()`/`build_adk_agent()` now passes
+`model=_gemini_model()` instead of the bare `DEFAULT_MODEL` string. A
+fresh instance per agent, not one shared object, matching ADK's own
+documented `Agent(model=Gemini(...))` pattern and avoiding any shared-
+mutable-state question across `ParallelAgent`'s concurrently-running
+specialists.
+
+The backoff schedule (`initial_delay=2.0`, `max_delay=30.0`, `exp_base=
+2.0`, `attempts=6`) is tuned toward the per-minute reset window actually
+observed in the incident's 429 responses (`retryDelay` values of roughly
+16-30s) rather than the SDK's own defaults (`attempts=5`, `initial_delay=
+1.0`, `max_delay=60.0`), which front-load retries too fast for a cap that
+resets on a roughly 60-second cadence rather than immediately.
+
+**Deliberately out of scope:** this does not add any caching, model
+fallback, or RPD pacing to the ADK graph — only retry-with-backoff on
+429/5xx, matching what was actually asked for and actually broke. The
+broader "ADK graph has none of gemini_reviewer.py's resilience" gap
+remains in README's Known limitations, now narrowed by one item rather
+than closed entirely.
+
+### 15.3 Tests (`tests/test_agent.py::TestGeminiRetryOptions`)
+
+| Test ID | Scenario | Expected |
+|---------|----------|----------|
+| `test_gemini_model_factory_configures_retry_on_the_right_model_name` | Call `_gemini_model()` directly | Returns a `Gemini` instance with `model == DEFAULT_MODEL` and `retry_options.attempts > 1` |
+| `test_gemini_model_factory_returns_a_fresh_instance_every_call` | Call `_gemini_model()` twice | Two distinct objects, not one shared instance |
+| `test_agents_across_the_graph_use_the_retry_configured_model` (parametrized over root, L1, L2, L3, an aggregator, and `remediation_agent`) | Build the real graph, inspect each named agent's `.model` | Every layer's agent uses a `Gemini` instance with the same `DEFAULT_MODEL` and retry configured — not just the first agent touched |
+
+### 15.4 Acceptance Criteria
+
+- [x] Every `Agent(model=...)` in the graph uses `Gemini(retry_options=...)`, not a bare model string
+- [x] Retry happens at the HTTP layer (ADK's own documented mechanism), not a hand-rolled wrapper duplicating `gemini_reviewer.py`'s existing logic
+- [x] Each agent gets its own `Gemini` instance (verified, not just assumed)
+- [x] Full `pytest` suite passes (418 passed, up from 409)

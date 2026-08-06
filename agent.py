@@ -44,8 +44,10 @@ if _THIS_DIR not in sys.path:
 
 from google.adk.agents import Agent, LoopAgent, ParallelAgent, SequentialAgent
 from google.adk.agents.readonly_context import ReadonlyContext
+from google.adk.models import Gemini
 from google.adk.tools import FunctionTool
 from google.adk.tools.tool_context import ToolContext
+from google.genai import types as genai_types
 
 import report_generator
 import tracing
@@ -512,6 +514,36 @@ DEFAULT_MAX_FILES = 100
 DEFAULT_MODEL = "gemini-3.1-flash-lite"
 DEFAULT_SEMGREP_CONFIG = "auto"
 
+# ── 429 retry-with-backoff for the ADK agent graph ──────────────────────────
+# Found via a real incident: security_full_scan's 6-way parallel fan-out
+# (plus L4 sub-delegates) can burst past the free tier's per-minute caps
+# (observed: 15 RPM, 250k input-tokens/min for gemini-3.1-flash-lite) within
+# a single full scan. Every Agent(...) here previously passed a bare model
+# name string, which ADK resolves to its own internal `Gemini` model
+# wrapper -- a completely different code path from gemini_reviewer.py's
+# _call_model() (used only by the CLI/server/Streamlit path), which already
+# has its own retry/backoff and isn't touched by this. A 429 hitting that
+# internal wrapper previously propagated straight up through ParallelAgent's
+# asyncio.TaskGroup as an unhandled ExceptionGroup, killing the entire scan
+# (see specs/agent_spec.md §14 for the incident this quota pressure caused).
+#
+# `Gemini`'s own `retry_options` field (google.genai.types.HttpRetryOptions)
+# is ADK's documented, first-class mechanism for this -- it retries at the
+# HTTP layer, inside the SDK's own client, before an exception ever reaches
+# ADK or this project's code. Tuned toward the per-minute reset window
+# actually observed in the incident's 429 responses (retryDelay values of
+# ~16-30s) rather than the SDK's own defaults (attempts=5, initial_delay=1s,
+# max_delay=60s), which front-load retries too fast for a per-minute cap.
+def _gemini_model() -> Gemini:
+    """Fresh Gemini model instance (per Agent, per ADK's own documented
+    pattern) with 429/5xx retry-with-backoff enabled at the HTTP layer."""
+    return Gemini(
+        model=DEFAULT_MODEL,
+        retry_options=genai_types.HttpRetryOptions(
+            attempts=6, initial_delay=2.0, max_delay=30.0, exp_base=2.0,
+        ),
+    )
+
 
 # ---------------------------------------------------------------------------
 # Orchestrator
@@ -720,7 +752,7 @@ class CodeReviewAgent:
                 review_report = ReviewReport(
                     issues=[],
                     summary=f"Review unavailable: {message}",
-                    model=DEFAULT_MODEL,
+                    model=_gemini_model(),
                     files_reviewed=0,
                     duration_s=0.0,
                 )
@@ -1709,7 +1741,7 @@ def build_adk_agent(
 
     return Agent(
         name="code_review_agent",
-        model=DEFAULT_MODEL,
+        model=_gemini_model(),
         description=(
             "Reviews a GitHub repository's Python code for security and "
             "quality issues using static analysis and an LLM."
@@ -2461,7 +2493,7 @@ def build_multi_agent_system(
 
     validator_agent = Agent(
         name="validator_agent",
-        model=DEFAULT_MODEL,
+        model=_gemini_model(),
         description="Findings Validator: cross-checks security findings against source code to flag false positives.",
         instruction=(
             "You are the Findings Validator. Your sole job is catching false positives "
@@ -2478,7 +2510,7 @@ def build_multi_agent_system(
 
     taint_validator_agent = Agent(
         name="taint_validator_agent",
-        model=DEFAULT_MODEL,
+        model=_gemini_model(),
         description="Taint Validator: confirms that data-flow taint paths are actually reachable and exploitable.",
         instruction=(
             "You are the Taint Path Validator. The data_flow_agent has identified "
@@ -2500,7 +2532,7 @@ def build_multi_agent_system(
 
     owasp_agent = Agent(
         name="owasp_agent",
-        model=DEFAULT_MODEL,
+        model=_gemini_model(),
         description="OWASP Mapper: maps security findings to OWASP Top 10 2021 categories (A01–A10).",
         instruction=(
             "You are the OWASP Mapper. You receive a list of security findings and "
@@ -2521,7 +2553,7 @@ def build_multi_agent_system(
 
     cwe_agent = Agent(
         name="cwe_agent",
-        model=DEFAULT_MODEL,
+        model=_gemini_model(),
         description="CWE Mapper: maps security findings to CWE Top 25 Most Dangerous Software Weaknesses.",
         instruction=(
             "You are the CWE Mapper. You receive a list of security findings and "
@@ -2545,7 +2577,7 @@ def build_multi_agent_system(
 
     sast_agent = Agent(
         name="sast_agent",
-        model=DEFAULT_MODEL,
+        model=_gemini_model(),
         description="SAST Analyst: Semgrep static analysis + LLM security review. Can delegate to validator_agent.",
         instruction=(
             "You are the SAST Analyst. You run deterministic static analysis (Semgrep) "
@@ -2572,7 +2604,7 @@ def build_multi_agent_system(
 
     injection_agent = Agent(
         name="injection_agent",
-        model=DEFAULT_MODEL,
+        model=_gemini_model(),
         description=(
             "Injection Specialist: finds SQL injection, command injection, SSTI, XSS, "
             "SSRF, path traversal, LDAP, XXE, and header injection vulnerabilities."
@@ -2601,7 +2633,7 @@ def build_multi_agent_system(
 
     auth_agent = Agent(
         name="auth_agent",
-        model=DEFAULT_MODEL,
+        model=_gemini_model(),
         description=(
             "Auth Specialist: finds broken authentication, IDOR, privilege escalation, "
             "missing access controls, JWT issues, and OAuth flaws."
@@ -2632,7 +2664,7 @@ def build_multi_agent_system(
 
     crypto_agent = Agent(
         name="crypto_agent",
-        model=DEFAULT_MODEL,
+        model=_gemini_model(),
         description=(
             "Cryptography Auditor: detects weak, broken, or misused cryptography — "
             "MD5/SHA1 password hashing, predictable randomness, ECB mode, disabled TLS."
@@ -2658,7 +2690,7 @@ def build_multi_agent_system(
 
     secrets_agent = Agent(
         name="secrets_agent",
-        model=DEFAULT_MODEL,
+        model=_gemini_model(),
         description=(
             "Secrets Scanner: finds hardcoded API keys, passwords, private keys, "
             "JWT secrets, and database credentials in source code."
@@ -2694,7 +2726,7 @@ def build_multi_agent_system(
 
     data_flow_agent = Agent(
         name="data_flow_agent",
-        model=DEFAULT_MODEL,
+        model=_gemini_model(),
         description=(
             "Taint Analyst: traces untrusted user input from entry points (HTTP params, "
             "CLI args) through the application to dangerous sinks (DB, shell, templates)."
@@ -2736,7 +2768,7 @@ def build_multi_agent_system(
 
     security_aggregator_agent = Agent(
         name="security_aggregator_agent",
-        model=DEFAULT_MODEL,
+        model=_gemini_model(),
         description=(
             "Security Findings Aggregator: consolidates the six security "
             "specialists' results (already collected in session state by "
@@ -2828,7 +2860,7 @@ def build_multi_agent_system(
 
     quality_agent = Agent(
         name="quality_agent",
-        model=DEFAULT_MODEL,
+        model=_gemini_model(),
         description="Quality Reviewer: LLM code quality, readability, and best-practice review. No security angle.",
         instruction=(
             "You are the Quality Reviewer. You assess code quality, readability, and "
@@ -2857,7 +2889,7 @@ def build_multi_agent_system(
 
     complexity_agent = Agent(
         name="complexity_agent",
-        model=DEFAULT_MODEL,
+        model=_gemini_model(),
         description=(
             "Complexity Analyst: measures cyclomatic complexity, deep nesting, "
             "god classes, magic numbers, and code duplication."
@@ -2884,7 +2916,7 @@ def build_multi_agent_system(
 
     test_agent = Agent(
         name="test_agent",
-        model=DEFAULT_MODEL,
+        model=_gemini_model(),
         description=(
             "Test Coverage Analyst: identifies untested functions, missing edge cases, "
             "untested error paths, and test quality issues."
@@ -2911,7 +2943,7 @@ def build_multi_agent_system(
 
     doc_agent = Agent(
         name="doc_agent",
-        model=DEFAULT_MODEL,
+        model=_gemini_model(),
         description=(
             "Documentation Auditor: finds missing docstrings, missing type hints, "
             "stale comments, misleading names, and TODO debt."
@@ -2940,7 +2972,7 @@ def build_multi_agent_system(
 
     dependency_agent = Agent(
         name="dependency_agent",
-        model=DEFAULT_MODEL,
+        model=_gemini_model(),
         description="Dependency CVE Scanner: checks requirements.txt against the OSV database for known CVEs.",
         instruction=(
             "You are the Dependency Security Scanner. You check the project's "
@@ -2961,7 +2993,7 @@ def build_multi_agent_system(
 
     threat_model_agent = Agent(
         name="threat_model_agent",
-        model=DEFAULT_MODEL,
+        model=_gemini_model(),
         description="Threat Modeler: STRIDE threat model — assets, entry points, attack scenarios, missing defenses.",
         instruction=(
             "You are the Threat Modeler. You help developers think like attackers.\n\n"
@@ -2982,7 +3014,7 @@ def build_multi_agent_system(
 
     compliance_agent = Agent(
         name="compliance_agent",
-        model=DEFAULT_MODEL,
+        model=_gemini_model(),
         description=(
             "Compliance Checker: maps findings to OWASP Top 10 and CWE Top 25, "
             "producing a standards-based compliance view of the risk landscape."
@@ -3014,7 +3046,7 @@ def build_multi_agent_system(
 
     security_coordinator = Agent(
         name="security_coordinator",
-        model=DEFAULT_MODEL,
+        model=_gemini_model(),
         description=(
             "Security Coordinator: orchestrates all 6 security specialist agents "
             "(SAST, injection, auth, crypto, secrets, data flow) and aggregates results. "
@@ -3053,7 +3085,7 @@ def build_multi_agent_system(
 
     quality_coordinator = Agent(
         name="quality_coordinator",
-        model=DEFAULT_MODEL,
+        model=_gemini_model(),
         description=(
             "Quality Coordinator: orchestrates quality_agent, complexity_agent, "
             "test_agent, and doc_agent for a comprehensive quality assessment."
@@ -3079,7 +3111,7 @@ def build_multi_agent_system(
 
     intel_coordinator = Agent(
         name="intel_coordinator",
-        model=DEFAULT_MODEL,
+        model=_gemini_model(),
         description=(
             "Intel Coordinator: orchestrates threat intelligence agents — dependency CVE "
             "scanning, STRIDE threat modeling, and standards compliance (OWASP/CWE)."
@@ -3108,7 +3140,7 @@ def build_multi_agent_system(
 
     context_agent = Agent(
         name="context_agent",
-        model=DEFAULT_MODEL,
+        model=_gemini_model(),
         description=(
             "Context Analyzer: identifies the codebase's framework, architecture, "
             "entry points, authentication mechanism, and security attack surface "
@@ -3138,7 +3170,7 @@ def build_multi_agent_system(
 
     planner_agent = Agent(
         name="planner_agent",
-        model=DEFAULT_MODEL,
+        model=_gemini_model(),
         description=(
             "Execution Planner: decides which coordinators to invoke for a given "
             "request and sequences them — security, quality, and/or intel. "
@@ -3172,7 +3204,7 @@ def build_multi_agent_system(
 
     scout_agent = Agent(
         name="scout_agent",
-        model=DEFAULT_MODEL,
+        model=_gemini_model(),
         description="Repo Scout: lightweight metadata, file listing, and pattern search — no LLM review.",
         instruction=(
             "You are the Repo Scout. You inspect a GitHub repository at surface level.\n\n"
@@ -3193,7 +3225,7 @@ def build_multi_agent_system(
 
     pr_agent = Agent(
         name="pr_agent",
-        model=DEFAULT_MODEL,
+        model=_gemini_model(),
         description="PR Reviewer: reviews only the Python files changed in a GitHub Pull Request.",
         instruction=(
             "You are the PR Reviewer. You focus on PR diffs only.\n\n"
@@ -3228,7 +3260,7 @@ def build_multi_agent_system(
 
     report_agent = Agent(
         name="report_agent",
-        model=DEFAULT_MODEL,
+        model=_gemini_model(),
         description=(
             "Report Writer: deep-dive explanations of findings, saves Markdown reports "
             "to disk, and (on explicit request only) opens a GitHub issue summarizing findings."
@@ -3270,7 +3302,7 @@ def build_multi_agent_system(
 
     dedup_agent = Agent(
         name="dedup_agent",
-        model=DEFAULT_MODEL,
+        model=_gemini_model(),
         description=(
             "Deduplication Agent: merges duplicate and overlapping findings from "
             "multiple analysis agents into one clean, consolidated list."
@@ -3294,7 +3326,7 @@ def build_multi_agent_system(
 
     risk_scorer_agent = Agent(
         name="risk_scorer_agent",
-        model=DEFAULT_MODEL,
+        model=_gemini_model(),
         description=(
             "Risk Scorer: assigns CVSS-like composite risk scores to findings "
             "and produces an overall project risk rating."
@@ -3327,7 +3359,7 @@ def build_multi_agent_system(
 
     patch_generator_agent = Agent(
         name="patch_generator_agent",
-        model=DEFAULT_MODEL,
+        model=_gemini_model(),
         description=(
             "Patch Generator: generates concrete, copy-pasteable code fix patches "
             "for security findings — not vague advice, but real before/after code. "
@@ -3344,7 +3376,7 @@ def build_multi_agent_system(
 
     patch_verifier_step = Agent(
         name="patch_verifier_step",
-        model=DEFAULT_MODEL,
+        model=_gemini_model(),
         description=(
             "Patch Verifier: checks whether patch_generator_agent's most recent "
             "patches actually resolve the findings they target, by re-scanning the "
@@ -3391,7 +3423,7 @@ def build_multi_agent_system(
 
     root = Agent(
         name="code_review_agent",
-        model=DEFAULT_MODEL,
+        model=_gemini_model(),
         description=(
             "Master orchestrator of a 5-layer, 37-LLM-agent code security and quality "
             "analysis system (plus 3 deterministic workflow orchestrators for full "

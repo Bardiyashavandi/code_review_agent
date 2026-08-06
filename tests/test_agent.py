@@ -26,6 +26,7 @@ import pytest
 from google.adk.agents import LoopAgent, ParallelAgent, SequentialAgent
 from google.adk.agents.invocation_context import InvocationContext
 from google.adk.agents.readonly_context import ReadonlyContext
+from google.adk.models import Gemini
 from google.adk.sessions import InMemorySessionService
 from google.adk.tools import FunctionTool
 from google.adk.tools.tool_confirmation import ToolConfirmation
@@ -1352,6 +1353,52 @@ class TestSecurityFullScan:
             scan_clone = _find_agent(root, f"{name}_scan")
             assert scan_clone.output_key == scan_key
             assert scan_clone.output_key != specialist.output_key
+
+
+# ---------------------------------------------------------------------------
+# 6b. 429 retry-with-backoff for the ADK agent graph
+# ---------------------------------------------------------------------------
+# Every Agent(...) used to take a bare model name string, which ADK resolves
+# to its own internal model wrapper with no retry configured -- a 429 there
+# (observed: security_full_scan's parallel fan-out bursting past the free
+# tier's 15 RPM / 250k input-tokens-per-minute caps) propagated straight up
+# through ParallelAgent's asyncio.TaskGroup as an unhandled ExceptionGroup,
+# killing the whole scan. See specs/agent_spec.md §14 for the incident this
+# quota pressure caused, and §15 for this fix's own writeup.
+
+class TestGeminiRetryOptions:
+
+    def test_gemini_model_factory_configures_retry_on_the_right_model_name(self):
+        model = agent_module._gemini_model()
+        assert isinstance(model, Gemini)
+        assert model.model == agent_module.DEFAULT_MODEL
+        assert model.retry_options is not None
+        assert model.retry_options.attempts and model.retry_options.attempts > 1
+
+    def test_gemini_model_factory_returns_a_fresh_instance_every_call(self):
+        # Each Agent() should get its own model object -- not one shared
+        # mutable instance across every agent in the graph.
+        first = agent_module._gemini_model()
+        second = agent_module._gemini_model()
+        assert first is not second
+
+    @pytest.mark.parametrize("name", [
+        "code_review_agent", "planner_agent", "security_coordinator",
+        "sast_agent", "injection_agent_scan", "security_aggregator_agent",
+        "remediation_agent",
+    ])
+    def test_agents_across_the_graph_use_the_retry_configured_model(self, name):
+        # Spot-check across every layer (root, L1, L2, L3, an aggregator,
+        # and the LoopAgent's own sub_agents aren't Agent instances so
+        # remediation_agent itself is checked instead) -- not just the one
+        # agent that happened to be touched first.
+        root = _build_root()
+        found = _find_agent(root, name)
+        assert found is not None
+        target = found.sub_agents[0] if isinstance(found, LoopAgent) else found
+        assert isinstance(target.model, Gemini)
+        assert target.model.model == agent_module.DEFAULT_MODEL
+        assert target.model.retry_options is not None
 
 
 # ---------------------------------------------------------------------------
