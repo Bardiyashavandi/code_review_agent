@@ -84,6 +84,49 @@ def _escape(text) -> str:
     return str(text).replace("<", "&lt;").replace(">", "&gt;")
 
 
+# ---------------------------------------------------------------------------
+# Severity validation + size caps for rendered issue fields
+# ---------------------------------------------------------------------------
+#
+# The CLI/review_repo() path is already constrained upstream: Gemini's
+# response_schema + _IssueSchema's Literal[...]+extra="forbid" (see
+# gemini_reviewer.py) mean issue.severity can only ever be one of the four
+# real values by construction. This is NOT true of the ADK chat path --
+# generate_report_file_tool builds ReviewIssue objects straight from
+# model-reconstructed dict arguments with only isinstance/non-empty checks
+# (see agent.py), so severity there is an arbitrary string until this
+# function runs. Applying the same normalization unconditionally, on both
+# paths, means generate_markdown_report has one severity-handling behavior
+# to reason about, not two.
+_MAX_TITLE_LENGTH = 300
+_MAX_DESCRIPTION_LENGTH = 5_000
+
+
+def _normalize_severity(severity) -> str:
+    """Coerce a rendered severity value to one of the four known values, or
+    the single literal "UNKNOWN" catch-all. Without this, by_severity.
+    setdefault(issue.severity, []) would let ANY string become its own,
+    out-of-order Markdown heading (## <arbitrary attacker text>) -- this
+    collapses every unrecognized value into one clearly-labeled bucket
+    instead."""
+    s = str(severity).strip().upper() if severity else ""
+    return s if s in SEVERITY_ORDER else "UNKNOWN"
+
+
+def _cap_text(text, limit: int) -> str:
+    """Truncate an already-escaped-or-about-to-be-rendered field to `limit`
+    characters, with a visible marker, rather than letting an unbounded
+    string (a batch of `title`/`description` values coming from a
+    specialist or model call with no schema-level length constraint on the
+    ADK chat path) blow up the rendered report's size unboundedly."""
+    if text is None:
+        return ""
+    s = str(text)
+    if len(s) <= limit:
+        return s
+    return s[:limit] + f"... [truncated, {len(s)} chars total]"
+
+
 def generate_markdown_report(result) -> str:
     """Build the full Markdown report text from a PipelineResult."""
     lines: list[str] = []
@@ -143,26 +186,29 @@ def generate_markdown_report(result) -> str:
         lines.append("")
     else:
         by_severity: dict[str, list] = {level: [] for level in SEVERITY_ORDER}
+        by_severity["UNKNOWN"] = []
         for issue in review.issues:
-            by_severity.setdefault(issue.severity, []).append(issue)
+            by_severity[_normalize_severity(issue.severity)].append(issue)
 
-        ordered_keys = list(SEVERITY_ORDER) + [
-            k for k in by_severity if k not in SEVERITY_ORDER
-        ]
+        # UNKNOWN only appended if non-empty -- a clean run with every
+        # issue in a real severity bucket renders exactly as before, no
+        # empty "### UNKNOWN" heading clutter.
+        ordered_keys = list(SEVERITY_ORDER) + (["UNKNOWN"] if by_severity["UNKNOWN"] else [])
 
         for severity in ordered_keys:
             issues = by_severity.get(severity, [])
             if not issues:
                 continue
-            lines.append(f"### {severity}")
+            heading = "UNKNOWN SEVERITY (unrecognized value, not rendered as-is)" if severity == "UNKNOWN" else severity
+            lines.append(f"### {heading}")
             lines.append("")
             for issue in issues:
                 location = f"{_escape(issue.path)}:{issue.line}"
-                lines.append(f"**{_escape(issue.title)}** ({location})")
+                lines.append(f"**{_escape(_cap_text(issue.title, _MAX_TITLE_LENGTH))}** ({location})")
                 lines.append("")
-                lines.append(_escape(issue.description))
+                lines.append(_escape(_cap_text(issue.description, _MAX_DESCRIPTION_LENGTH)))
                 lines.append("")
-                lines.append(f"*Suggested fix:* {_escape(issue.suggested_fix)}")
+                lines.append(f"*Suggested fix:* {_escape(_cap_text(issue.suggested_fix, _MAX_DESCRIPTION_LENGTH))}")
                 if getattr(issue, "rule_id", None):
                     lines.append(f"*Rule:* `{_escape(issue.rule_id)}`")
                 lines.append("")

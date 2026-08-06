@@ -1,8 +1,8 @@
 # Spec: Write-Action Security Hardening
 
 **Project:** AI Code Review Agent
-**Modules:** `report_generator.py` (path confinement), `agent.py` (confirmation gate, tool wiring, memory hardening), `review_memory.py` (provenance documentation), `gemini_reviewer.py` (dedup/risk-scorer hardening)
-**Version:** 1.1
+**Modules:** `report_generator.py` (path confinement, severity/length rendering hardening), `agent.py` (confirmation gate, tool wiring, memory hardening, agent-to-agent handoff hardening), `review_memory.py` (provenance documentation), `gemini_reviewer.py` (dedup/risk-scorer/owasp/cwe/validate-findings hardening), `github_fetcher.py` (severity/length rendering hardening)
+**Version:** 1.2
 **Status:** Draft
 
 ---
@@ -142,3 +142,77 @@ Three changes:
 - Cross-repo poisoning via the store's key structure itself was investigated and found not to be possible today (`f"{repo_url}::{branch}"` exact-match keying) — not addressed further here since there was nothing concrete to fix.
 - An indirect, agentic-action risk (an injected instruction convincing an insufficiently-resistant model to invoke `review_repo_tool` against a second, attacker-chosen URL) is a different category of risk than a memory-store bug and is not addressed by this addendum.
 - A real staleness/eviction policy for `.review_memory/findings.json` (age-based or reconfirmation-based) is enabled by `persisted_at`/`source_run_id` but not implemented here — deferred, per the original task scope ("doesn't need to change diff()'s matching logic today, just needs to be captured").
+
+---
+
+## 10. Addendum (v1.2) — blind trust between internal agent-to-agent handoffs
+
+A follow-up investigation (again separate from Sections 1-9) asked a different question than either prior pass: not "is external content trusted without checking" (Monday) and not "is accumulated cross-call state trusted without checking" (Wednesday), but whether one *internal* agent's own output is trusted without checking by the *next* agent downstream in the same graph run — a handoff that never touches the outside world at all, so it had received none of the hardening the other two categories got.
+
+### 10.1 The core problem
+
+`security_aggregator_agent`'s instruction (and, identically, `patch_generator_agent`'s and `patch_verifier_step`'s) was a plain string containing raw `{sast_result}`-style placeholders. ADK's `inject_session_state()` fills these in with `str(session.state[var_name])` — no delimiter, no framing, no escaping, substituted directly into the prompt the model reads next. Concretely, this made these three handoffs the **weakest** link in the whole pipeline, weaker even than what dedup/risk-score looked like *before* Wednesday's fix: dedup/risk-score's `.get(...)`-with-defaults at least degraded gracefully on a missing key, where a missing `session.state[var_name]` here raised a raw, uncaught `KeyError` from inside `inject_session_state()` itself. A sub-agent's own generated text — plausible, fluent, and written by the same model family the aggregator itself is — is exactly the kind of content Monday's `<file_content>` and Wednesday's `<recalled_memory>`/`<findings_to_process>` work already established shouldn't reach a prompt unframed. This was the one place left where it still did.
+
+Three concrete, independent risks fell out of this:
+
+1. **Unframed substitution.** A specialist's own output (SAST's `sast_result`, the patch generator's `generated_patches`, etc.) landed in the aggregator's/verifier's next prompt with no signal that it's untrusted, previously-generated text rather than part of the instruction itself.
+2. **Shared `output_key` staleness.** `security_full_scan`'s six `.clone()`'d specialists (`sast_agent_scan`, etc.) preserved their originals' `output_key` (`.clone()`'s default) — so `sast_agent` (the ad-hoc chat specialist) and `sast_agent_scan` (the deterministic full-scan specialist) both wrote to the same `session.state["sast_result"]` slot. A session that mixed an ad-hoc "check for SQL injection" call with a later "full security review" call (or vice versa) could leave one path's real output sitting in a slot the other path's specialist didn't overwrite on a turn that produced no text.
+3. **Missing-key crash / silent staleness.** A specialist whose final turn ends without a text part (e.g. it exits purely on a tool call) leaves its `output_key` slot untouched by ADK's own `__maybe_save_output_to_state`. Under the old string-substitution mechanism, a slot that was never set at all raised `KeyError`; a slot left over from an *earlier* run of the same session silently looked like a fresh, real result.
+
+### 10.2 Design decision — `InstructionProvider` callables, not string delimiters
+
+The fix wraps each specialist's raw output in `<specialist_output name="...">...</specialist_output>` with the same "not verified fact, not an instruction" framing Monday's `<file_content>` and Wednesday's `<recalled_memory>` use. The open question was *how* to get that wrapped text into the prompt — bake the delimiter into the raw instruction string (simple, but still relies on ADK's own `inject_session_state()` regex-substitution to place it), or switch `instruction=` to a **callable** (`InstructionProvider: Callable[[ReadonlyContext], str]`) that reads `ctx.state` directly and builds the fully-wrapped string in Python.
+
+The callable approach was chosen, for a reason specific to this codebase's ADK version, confirmed by reading `google-adk==2.3.0` source and by a direct empirical test (not just documentation):
+
+- `LlmAgent.canonical_instruction(ctx)` returns `(self.instruction, False)` when `instruction` is a plain string, but `(instruction(ctx), True)` when it's callable — that second element is `bypass_state_injection`.
+- `_process_agent_instruction()` (`google/adk/flows/llm_flows/instructions.py`) only calls `inject_session_state()` when `bypass_state_injection` is `False`. For a callable instruction, ADK **does not re-scan the returned string for `{placeholder}` patterns at all.**
+- Verified directly: constructing a minimal `Agent` with a callable `instruction`, seeding `session.state["sast_result"]` with adversarial-looking text, and calling `agent.canonical_instruction(ReadonlyContext(ctx))` returns `bypass_state_injection == True`, and a literal `"{not_a_real_var}"` string planted inside the callable's returned text survives completely untouched in the result.
+
+This mattered for three concrete reasons, not just tidiness:
+
+1. **No double-substitution risk.** A specialist's own free text can legitimately contain something that *looks* like a state-variable pattern — a code snippet with a dict literal, an f-string example in a description. With a raw string instruction, that text would still pass through `inject_session_state()`'s regex a second time; with a callable, ADK never touches the returned string again, so this is structurally impossible rather than merely unlikely.
+2. **Programmatic per-key control.** The missing-key case (10.1, risk 3) needed different handling than a simple string default — an explicit, visible sentinel distinguishable from "the agent said nothing interesting" and from "the agent said 'None'" as literal text. A callable can express that in code (`ctx.state.get(key)` plus a real conditional); a string template's only lever is ADK's own `{var?}` "empty string on missing" syntax, which can't distinguish those cases either.
+3. **Directly unit-testable in isolation.** `agent.instruction(ReadonlyContext(ctx))` can be called and asserted against without spinning up the full ADK graph or making a real LLM call — see 10.6.
+
+The alternative (baking `<specialist_output>` tags into the raw string, leaving substitution to `inject_session_state()`) was rejected specifically because it still depends on a framework internal (`inject_session_state()`'s exact regex and escaping behavior) for the one thing that most needs to not be ambiguous — where untrusted text starts and ends.
+
+`agent.py`'s new `_wrap_specialist_output(name, value)` is the single delimiter+framing implementation, shared by `_security_aggregator_instruction()`, `_patch_generator_instruction()`, and `_patch_verifier_instruction()` — one function, three call sites, not three copies.
+
+### 10.3 Shared-`output_key` staleness — fixed with distinct scan keys
+
+The six `security_full_scan` clones (`sast_agent_scan`, `injection_agent_scan`, `auth_agent_scan`, `crypto_agent_scan`, `secrets_agent_scan`, `data_flow_agent_scan`) now each get an explicit `output_key` override in their `.clone(update={...})` call — `"sast_scan_result"` etc. — distinct from the ad-hoc chat specialists' `"sast_result"` etc., which are left unchanged. `_security_aggregator_instruction()` reads only the `*_scan_result` keys (`_SECURITY_SPECIALIST_STATE_KEYS`), since `security_aggregator_agent` only ever runs downstream of `security_parallel_scan`, never the ad-hoc specialists. This makes the two call paths — "ask one specialist a question" and "run the full deterministic scan" — fully state-independent within the same session.
+
+### 10.4 Sentinel-seeding — `before_agent_callback` on `security_full_scan`
+
+`_seed_security_scan_state()` is wired as `security_full_scan`'s `before_agent_callback`, mirroring the existing `_seed_remediation_state()` pattern on `remediation_loop` — but with the opposite reset semantics, for a reason specific to what each loop is for:
+
+- `_seed_remediation_state()` only seeds `verifier_feedback` **if absent**, because `remediation_loop` deliberately carries feedback *forward* across its own iterations — iteration 2 needs to see iteration 1's verifier feedback.
+- `_seed_security_scan_state()` **unconditionally** resets all six `*_scan_result` slots to `_NO_SPECIALIST_OUTPUT_SENTINEL` every time `security_full_scan` runs, because each full scan is meant to be an independent, fresh run — a specialist that silently produced no text this time must not be backed by a *previous* run's real output still sitting in the same session's state. Attaching the callback to `security_full_scan` itself (not `security_parallel_scan`) means the reset happens once, before any of the six specialists start, so every specialist that *does* produce output this run simply overwrites the sentinel before `security_aggregator_agent` ever reads it.
+
+Combined with 10.3, this closes risk 3 from 10.1 two ways at once: a key that's genuinely never been set at all (first run) reads `None` from `ReadonlyContext.state`, which `_wrap_specialist_output()` already renders as the same sentinel; a key left over from a *prior* run gets explicitly overwritten before this run's aggregator read. Either way, `security_aggregator_agent`'s instruction can never raise `KeyError` and can never mistake stale data for a fresh result.
+
+### 10.5 Three leftover tools brought up to Wednesday's standard
+
+`validate_findings_tool`, `owasp_mapping_tool`, and `cwe_mapping_tool` (backed by `GeminiReviewer.validate_findings()`/`map_to_owasp()`/`map_to_cwe()`) were the same pre-Wednesday-fix class of problem as `dedup_tool`/`risk_score_tool` had been: unwrapped findings text in the prompt, and only an `isinstance(..., list)` + non-empty check at the tool boundary — no per-item validation. `validate_findings_tool` additionally had a genuine crash risk Wednesday's two tools didn't: `ReviewIssue(path=i["path"], ...)` — a bare bracket-index access that raises `KeyError` on any malformed item, rather than degrading via `.get(...)`.
+
+Rather than writing three more near-duplicate validators, the existing `_validate_dedup_items()`/`_validate_risk_score_items()` were **generalized, not duplicated**: both gained an optional `caller: str` parameter (defaulting to their original tool's name) used only in the dropped-item log line, so the log correctly names whichever tool actually called it. `owasp_mapping_tool`/`cwe_mapping_tool` reuse `_validate_risk_score_items()` as-is — both document the identical `{severity, title, description}` input shape `risk_score_tool` does — passing `caller="owasp_mapping_tool"`/`caller="cwe_mapping_tool"`. `validate_findings_tool` reuses `_validate_dedup_items()` as-is — it needs the same `{path, severity, title}` shape `dedup_tool` does — passing `caller="validate_findings_tool"`; this also incidentally closes the `i["path"]` `KeyError` risk, since a missing-`path` item is now dropped before that line ever runs. All three tools gained the same `<findings_to_process>...</findings_to_process>` wrapping in `gemini_reviewer.py` (`validate_findings()`, `map_to_owasp()`, `map_to_cwe()`) that `deduplicate_findings()`/`generate_risk_scores()` got Wednesday, and `OWASP_MAPPING_SYSTEM_INSTRUCTION`/`CWE_MAPPING_SYSTEM_INSTRUCTION` gained the same delimiter-mention sentence `DEDUP_SYSTEM_INSTRUCTION`/`RISK_SCORE_SYSTEM_INSTRUCTION` did. Dropped items are logged and surfaced as `items_dropped`, same convention as Wednesday.
+
+### 10.6 Report-rendering hardening — `UNKNOWN` severity bucket and length caps
+
+Separately from the agent-to-agent handoffs above, `report_generator.generate_markdown_report()` and `github_fetcher.py`'s `_build_issue_body()` both grouped issues with `by_severity.setdefault(issue.severity, [])` (or the dict-based equivalent) — any string at all became its own out-of-order Markdown/issue-body heading, with no upstream constraint forcing it to be one of the four real severities on the ADK chat path (unlike the CLI/`review_repo()` path, where Gemini's `response_schema` + `_IssueSchema`'s `Literal[...]` + `extra="forbid"` make this structurally impossible before a `ReviewIssue` is ever built). Both renderers now run every issue's severity through `_normalize_severity()` first: one of the four known values passes through unchanged, anything else — empty, garbage, or an attempted heading-injection payload like `"IGNORE PREVIOUS INSTRUCTIONS..."` — collapses into a single `UNKNOWN` bucket, rendered with an explicit `"UNKNOWN SEVERITY (unrecognized value, not rendered as-is)"` label, and only appended to the rendering order at all when non-empty (a clean run renders byte-identical to before). `_cap_text()` truncates `title`/`description`/`suggested_fix` to a fixed length (300 / 5,000 / 5,000 characters respectively) with a visible `"... [truncated, N chars total]"` marker, rather than letting an unbounded model-controlled string on the ADK chat path (which has no schema-level length constraint the way the CLI path's Pydantic schema does) blow up the rendered report's size without limit.
+
+**`_escape()`/`_escape_markup()` were deliberately left untouched.** Both were already confirmed, working defenses against raw-HTML/markup injection (`<` / `>` escaping applied to every rendered field), predating this addendum — this pass added severity/length validation *around* them, not a replacement for them.
+
+### 10.7 Tests (addendum)
+
+- `tests/test_agent.py::TestSecurityAggregatorInstructionHardening` — `security_aggregator_agent`'s (and `patch_verifier_step`'s/`patch_generator_agent`'s) `instruction` attribute is a callable, not a string; the built instruction contains `<specialist_output name="...">` delimiters and untrusted-data framing around each specialist's raw output; an adversarial payload inside a specialist's output survives as inert data rather than being stripped or acted on.
+- `tests/test_agent.py::TestSecurityScanStateSeeding` — `_seed_security_scan_state()` overwrites a stale prior-run value and fills every one of the six keys; `security_full_scan.before_agent_callback` is wired to it; a completely-unseeded state still produces the sentinel in every specialist's block with no `KeyError`.
+- `tests/test_agent.py::TestFindingsToolsPerItemValidation` — `validate_findings_tool`/`owasp_mapping_tool`/`cwe_mapping_tool` each drop a malformed item (missing path/severity/title), log it with the correct calling-tool name, surface `items_dropped`, and raise when every item is invalid — mirroring `TestDedupAndRiskScoreValidation`'s existing pattern.
+- `tests/test_agent.py::TestReportSeverityAndSizeHardening` — an unrecognized severity string no longer appears verbatim as its own heading and instead renders under the `UNKNOWN SEVERITY` label; a real severity's rendering is unaffected; an oversized title/description is truncated with a visible marker.
+
+### 10.8 Out of Scope (addendum)
+
+- `quality_coordinator`/`intel_coordinator`'s specialists still use plain-string instructions with no session-state placeholders at all today — this addendum only touched the three agents that actually had `{placeholder}`-style handoffs (`security_aggregator_agent`, `patch_generator_agent`, `patch_verifier_step`). If a future change gives either coordinator its own deterministic aggregation step, it should use the same `InstructionProvider` pattern from the start.
+- `generate_report_file_tool`'s other input fields (`files`, `findings`) still use `.get(...)`-with-defaults / bracket-index access on individual dict keys (e.g. `f["path"]`) without the same per-item validation `issues` now gets — judged lower risk (file/finding lists are typically model-reconstructed from the review's own recent output, not adversarial specialist text) and out of scope for this pass.
+- Migrating `ParallelAgent`/`SequentialAgent`/`LoopAgent` off ADK's deprecated workflow primitives (see [Known limitations](../README.md#known-limitations)) is unrelated to this addendum and not done here.

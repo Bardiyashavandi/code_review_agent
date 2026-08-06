@@ -552,32 +552,66 @@ class GitHubFetcher:
             return ""
         return str(text).replace("<", "&lt;").replace(">", "&gt;")
 
+    # Kept as a local copy (not imported from report_generator.py) to match
+    # this module's existing convention of duplicating _escape_markup
+    # rather than cross-importing -- same untrusted-output concern as
+    # report_generator.py's _normalize_severity()/_cap_text(), same fix.
+    _MAX_TITLE_LENGTH = 300
+    _MAX_DESCRIPTION_LENGTH = 5_000
+
+    @staticmethod
+    def _normalize_severity(severity) -> str:
+        """Coerce a rendered severity value to one of the four known
+        values, or the single literal "UNKNOWN" catch-all. Without this,
+        by_severity.setdefault(str(issue.get("severity", "MEDIUM")).upper(),
+        []) let ANY string become its own, out-of-order '## <arbitrary
+        text> (1)' heading in the created GitHub issue body."""
+        s = str(severity).strip().upper() if severity else ""
+        return s if s in SEVERITY_ORDER else "UNKNOWN"
+
+    @staticmethod
+    def _cap_text(text, limit: int) -> str:
+        """Truncate a rendered field to `limit` characters with a visible
+        marker -- same rationale as report_generator.py's _cap_text()."""
+        if text is None:
+            return ""
+        s = str(text)
+        if len(s) <= limit:
+            return s
+        return s[:limit] + f"... [truncated, {len(s)} chars total]"
+
     def _build_issue_body(self, issues: list, summary: str) -> str:
         """Build the issue body: summary at the top, then findings grouped
         by severity (CRITICAL first), mirroring post_pr_review's per-finding
         formatting (severity + path:line + title, then description and
         suggested fix)."""
         esc = self._escape_markup
+        cap = self._cap_text
         lines = [esc(summary) or "AI Code Review Agent — automated findings below.", ""]
 
         by_severity: dict[str, list] = {level: [] for level in SEVERITY_ORDER}
+        by_severity["UNKNOWN"] = []
         for issue in issues:
-            by_severity.setdefault(str(issue.get("severity", "MEDIUM")).upper(), []).append(issue)
+            by_severity[self._normalize_severity(issue.get("severity", "MEDIUM"))].append(issue)
 
-        ordered_keys = list(SEVERITY_ORDER) + [k for k in by_severity if k not in SEVERITY_ORDER]
+        # UNKNOWN only appended if non-empty -- see report_generator.py's
+        # matching comment.
+        ordered_keys = list(SEVERITY_ORDER) + (["UNKNOWN"] if by_severity["UNKNOWN"] else [])
 
         for severity in ordered_keys:
             group = by_severity.get(severity, [])
             if not group:
                 continue
-            lines.append(f"## {severity} ({len(group)})")
+            heading = "UNKNOWN SEVERITY (unrecognized value, not rendered as-is)" if severity == "UNKNOWN" else severity
+            lines.append(f"## {heading} ({len(group)})")
             lines.append("")
             for iss in group:
-                lines.append(f"**`{esc(iss.get('path',''))}:{iss.get('line',0)}`** — {esc(iss.get('title',''))}")
+                title = cap(iss.get("title", ""), self._MAX_TITLE_LENGTH)
+                lines.append(f"**`{esc(iss.get('path',''))}:{iss.get('line',0)}`** — {esc(title)}")
                 lines.append("")
-                lines.append(esc(iss.get("description", "")))
+                lines.append(esc(cap(iss.get("description", ""), self._MAX_DESCRIPTION_LENGTH)))
                 if iss.get("suggested_fix"):
-                    lines.append(f"*Suggested fix:* {esc(iss['suggested_fix'])}")
+                    lines.append(f"*Suggested fix:* {esc(cap(iss['suggested_fix'], self._MAX_DESCRIPTION_LENGTH))}")
                 if iss.get("rule_id"):
                     lines.append(f"*Rule:* `{esc(iss['rule_id'])}`")
                 lines.append("")
