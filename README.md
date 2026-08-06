@@ -836,6 +836,7 @@ Two tabs:
 - Expandable issue cards: file, line, description, suggested fix
 - Semgrep findings with actual code snippets (`st.code`)
 - Metrics row: files fetched, issues found, duration, model used
+- **Download report:** a "⬇️ Download report (Markdown)" button next to the metrics row renders the completed review through the same `report_generator.generate_markdown_report()` the CLI's `--out` flag uses — byte-for-byte the same report format — as a `.md` file, ready to attach to a PR description, Slack message, or email. Purely client-side (reads the review already sitting in `st.session_state`); no extra server call, and not gated the way the write-action tools are, since nothing is written anywhere — it only downloads to the browser
 - Specific readable error messages for every failure mode — never a raw traceback
 - **Fix generation:** a checkbox on each issue card plus a "Generate fixes for N selected issue(s)" button — opt-in, never triggered automatically after a review. Calls `POST /remediate` with just the checked issues and renders each returned patch as a side-by-side before/after `st.code` block, with the explanation, any new dependencies, a breaking-change warning if Gemini flagged one, and a ✅/⚠️ verification badge (with the verifier's reason) showing whether that specific patch was confirmed to actually resolve its finding — plus a summary line reporting how many verify-and-refine iterations it took. Results persist across reruns (checking another issue's box, etc.) via `st.session_state`
 

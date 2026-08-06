@@ -20,9 +20,12 @@ from __future__ import annotations
 
 import os
 from datetime import datetime, timezone
+from types import SimpleNamespace
 
 import requests
 import streamlit as st
+
+import report_generator
 
 # ---------------------------------------------------------------------------
 # Config
@@ -335,6 +338,74 @@ def _render_scan(scan: dict) -> None:
                 st.code(snippet, language="python")
 
 
+def _build_report_markdown(data: dict, repo_url: str) -> str:
+    """Render /analyze's JSON response as the same Markdown report the CLI
+    (`--out`) and the ADK chat path (`generate_report_file_tool`) produce —
+    by reusing report_generator.generate_markdown_report() rather than
+    writing a third, UI-specific renderer.
+
+    generate_markdown_report() expects a PipelineResult-shaped object
+    (dataclasses with attribute access), not the plain dicts /analyze
+    returns as JSON, so this adapts one into the other with
+    SimpleNamespace -- the same lightweight-fake-object pattern
+    tests/test_agent.py already uses throughout for the same reason.
+    Only the fields generate_markdown_report() actually reads are
+    populated; fetch_result.files only needs to support len(), so a plain
+    list of that length stands in for the real FileResult objects (whose
+    content isn't part of /analyze's response and isn't needed for
+    rendering anyway).
+    """
+    review = data.get("review", {})
+    scan = data.get("scan", {})
+
+    fake_result = SimpleNamespace(
+        repo_url=repo_url,
+        duration_s=data.get("duration_s", 0.0),
+        fetch_result=SimpleNamespace(
+            files=[None] * data.get("files_fetched", 0),
+            truncated=data.get("truncated", False),
+        ),
+        scan_report=SimpleNamespace(
+            scanned=scan.get("scanned", 0),
+            findings=scan.get("findings", []),
+            skipped=scan.get("skipped", []),
+            duration_s=scan.get("duration_s", 0.0),
+        ),
+        review_report=SimpleNamespace(
+            issues=[SimpleNamespace(**issue) for issue in review.get("issues", [])],
+            summary=review.get("summary", ""),
+            model=review.get("model", ""),
+            files_reviewed=review.get("files_reviewed", 0),
+            duration_s=review.get("duration_s", 0.0),
+            schema_errors=review.get("schema_errors", []),
+        ),
+        stage_errors=[SimpleNamespace(**e) for e in data.get("stage_errors", [])],
+        # injection_findings isn't in /analyze's response today -- omitted
+        # rather than faked; generate_markdown_report() reads it via
+        # getattr(result, "injection_findings", None) and simply omits the
+        # section when absent, same as a PipelineResult that never set it.
+    )
+    return report_generator.generate_markdown_report(fake_result)
+
+
+def _render_download_button(data: dict, repo_url: str, branch: str) -> None:
+    """A single "download and share" action for a completed review: the
+    exact same Markdown a CLI run with --out would have written, ready to
+    attach to a PR description, Slack message, or email -- no separate
+    server call, no write-action gate involved (this only reads data
+    already in the browser's session state)."""
+    repo_slug = repo_url.rstrip("/").split("/")[-1] or "repo"
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    st.download_button(
+        "⬇️ Download report (Markdown)",
+        data=_build_report_markdown(data, repo_url),
+        file_name=f"{repo_slug}_{branch}_review_{timestamp}.md",
+        mime="text/markdown",
+        help="Same report format the CLI's --out flag writes — share the "
+             "downloaded file directly (PR description, Slack, email, etc.).",
+    )
+
+
 def _render_results(data: dict, repo_url: str, branch: str) -> None:
     review       = data.get("review", {})
     scan         = data.get("scan", {})
@@ -347,6 +418,8 @@ def _render_results(data: dict, repo_url: str, branch: str) -> None:
     c2.metric("Issues found",  len(issues))
     c3.metric("Duration",      f"{data.get('duration_s', 0):.1f} s")
     c4.metric("Model",         review.get("model", "—"))
+
+    _render_download_button(data, repo_url, branch)
 
     if data.get("truncated"):
         st.warning(
