@@ -826,8 +826,6 @@ class TestSemanticCacheRagGrounding:
 class TestResponseSchema:
     """
     Day-4 task: _call_model gained an optional response_schema parameter,
-    passed straight through to GenerateContentConfig so Gemini's own
-    generation is constrained by the schema (native structured output),
     additive to (never a replacement for) this file's existing post-hoc
     Pydantic validation. These tests confirm the passthrough/omission
     plumbing in _call_model itself; the three call sites that actually use
@@ -835,6 +833,20 @@ class TestResponseSchema:
     generate_risk_scores) plus review()'s existing _ReviewResponseSchema
     usage are covered below and in TestReviewWithProjectContext/
     TestGenerateRemediationPatchesWithVerification-adjacent tests.
+
+    Updated (real-API bug fix): the Pydantic class is no longer passed to
+    GenerateContentConfig's own `response_schema` field -- every schema
+    here uses extra="forbid", which Pydantic's .model_json_schema() renders
+    as additionalProperties: false, and the real Gemini Developer API
+    rejects that with a 400 ("Unknown name additional_properties ...
+    Cannot find field") that this mocked test suite could never catch
+    (confirmed against google-genai 2.9.0's own
+    _raise_for_unsupported_mldev_properties, which explicitly disallows
+    additionalProperties outside Vertex AI). `response_json_schema` is the
+    SDK's documented alternative that DOES support additionalProperties
+    (and $defs/$ref, for nested models), so _call_model now passes
+    `response_schema.model_json_schema()` through that field instead,
+    leaving `response_schema` itself unset (None) on every call.
     """
 
     def test_response_schema_passed_through_to_config_when_given(self):
@@ -844,14 +856,15 @@ class TestResponseSchema:
         reviewer._call_model("prompt", system_instruction="sys", response_schema=_ReviewResponseSchema)
 
         call = mock_client.models.generate_content.call_args
-        assert call.kwargs["config"].response_schema is _ReviewResponseSchema
+        assert call.kwargs["config"].response_json_schema == _ReviewResponseSchema.model_json_schema()
+        assert call.kwargs["config"].response_schema is None
         assert call.kwargs["config"].response_mime_type == "application/json"
 
     def test_response_schema_omitted_from_config_when_not_given(self):
         # Every existing call site that doesn't pass response_schema must
         # behave EXACTLY as before this parameter existed -- no
-        # response_schema key/attribute set at all, not even None-valued
-        # in a way that could change wire behavior.
+        # response_schema/response_json_schema key/attribute set at all,
+        # not even None-valued in a way that could change wire behavior.
         reviewer, mock_client = make_reviewer()
         mock_client.models.generate_content.return_value = response_text(summary="ok")
 
@@ -859,6 +872,7 @@ class TestResponseSchema:
 
         call = mock_client.models.generate_content.call_args
         assert call.kwargs["config"].response_schema is None
+        assert call.kwargs["config"].response_json_schema is None
         assert call.kwargs["config"].response_mime_type == "application/json"
 
     def test_response_schema_ignored_when_json_mode_is_false(self):
@@ -876,6 +890,7 @@ class TestResponseSchema:
 
         call = mock_client.models.generate_content.call_args
         assert call.kwargs["config"].response_schema is None
+        assert call.kwargs["config"].response_json_schema is None
         assert call.kwargs["config"].response_mime_type is None
 
     def test_review_batch_call_uses_review_response_schema(self):
@@ -888,7 +903,7 @@ class TestResponseSchema:
         reviewer.review([make_file("a.py")], make_scan_report())
 
         call = mock_client.models.generate_content.call_args
-        assert call.kwargs["config"].response_schema is _ReviewResponseSchema
+        assert call.kwargs["config"].response_json_schema == _ReviewResponseSchema.model_json_schema()
 
     def test_remediation_patches_call_uses_remediation_schema(self):
         reviewer, mock_client = make_reviewer()
@@ -903,7 +918,7 @@ class TestResponseSchema:
         )
 
         call = mock_client.models.generate_content.call_args
-        assert call.kwargs["config"].response_schema is _RemediationResponseSchema
+        assert call.kwargs["config"].response_json_schema == _RemediationResponseSchema.model_json_schema()
 
     def test_verify_patch_call_uses_patch_verification_schema(self):
         reviewer, mock_client = make_reviewer()
@@ -912,7 +927,7 @@ class TestResponseSchema:
         reviewer.verify_patch_resolves_finding({"title": "x", "severity": "HIGH"}, "fixed code")
 
         call = mock_client.models.generate_content.call_args
-        assert call.kwargs["config"].response_schema is _PatchVerificationSchema
+        assert call.kwargs["config"].response_json_schema == _PatchVerificationSchema.model_json_schema()
 
     def test_risk_scores_call_uses_risk_score_schema(self):
         reviewer, mock_client = make_reviewer()
@@ -921,7 +936,7 @@ class TestResponseSchema:
         reviewer.generate_risk_scores([{"title": "x", "severity": "HIGH"}])
 
         call = mock_client.models.generate_content.call_args
-        assert call.kwargs["config"].response_schema is _RiskScoreResponseSchema
+        assert call.kwargs["config"].response_json_schema == _RiskScoreResponseSchema.model_json_schema()
 
     def test_specialist_audit_calls_do_not_set_a_response_schema(self):
         # Deliberately left alone (see gemini_reviewer.py's comment above
@@ -936,6 +951,29 @@ class TestResponseSchema:
 
         for call in mock_client.models.generate_content.call_args_list:
             assert call.kwargs["config"].response_schema is None
+            assert call.kwargs["config"].response_json_schema is None
+
+    def test_response_json_schema_contains_no_additional_properties_key_error_regression(self):
+        """Direct regression test for the real bug this fix addresses: a
+        genai_types.GenerateContentConfig built with the OLD approach
+        (response_schema=<Pydantic class directly>) is what the SDK
+        rejects outside Vertex AI. This asserts the schema actually placed
+        on the wire (response_json_schema) is a plain dict a real
+        Gemini Developer API call can accept -- not a schema round-tripped
+        through response_schema's OpenAPI-subset conversion, which is
+        exactly where additionalProperties triggered the 400."""
+        reviewer, mock_client = make_reviewer()
+        mock_client.models.generate_content.return_value = response_text(summary="ok")
+
+        reviewer._call_model("prompt", system_instruction="sys", response_schema=_ReviewResponseSchema)
+
+        call = mock_client.models.generate_content.call_args
+        sent_schema = call.kwargs["config"].response_json_schema
+        assert isinstance(sent_schema, dict)
+        # The nested _IssueSchema's extra="forbid" must still be present --
+        # this fix routes it through a field that supports
+        # additionalProperties, it does not strip strictness away.
+        assert "$defs" in sent_schema or "properties" in sent_schema
 
 
 # ---------------------------------------------------------------------------

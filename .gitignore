@@ -210,6 +210,11 @@ test_report.md
 # Observability: runtime trace logs (generated data, not source)
 traces/
 
+# Persistent findings memory store (generated data, not source -- see
+# specs/memory_spec.md); one .review_memory/ per machine/checkout, not
+# meant to be shared via git
+.review_memory/
+
 # Eval suite: JSON result snapshots from `runner.py --json-out` (generated
 # data, not source; committing an eval run's own fixtures/harness is
 # useful, committing every run's numbers is not)

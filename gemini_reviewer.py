@@ -2243,7 +2243,34 @@ class GeminiReviewer:
         if json_mode:
             config_kwargs["response_mime_type"] = "application/json"
             if response_schema is not None:
-                config_kwargs["response_schema"] = response_schema
+                # NOT genai_types.GenerateContentConfig's `response_schema`
+                # field -- passing the Pydantic class straight through there
+                # fails against the real (Gemini Developer / "mldev") API
+                # with a 400: "Unknown name additional_properties ...
+                # Cannot find field", because every schema here uses
+                # extra="forbid" (see _IssueSchema, _ReviewResponseSchema,
+                # etc.), which Pydantic's .model_json_schema() renders as
+                # additionalProperties: false -- and `response_schema`'s
+                # OpenAPI-subset conversion explicitly disallows that field
+                # outside Vertex AI ("Enterprise Agent Platform mode"); see
+                # google.genai._transformers._raise_for_unsupported_mldev_
+                # properties in the installed SDK. This was never caught by
+                # the test suite because it mocks GeminiReviewer/_call_model
+                # entirely -- only a real API call surfaces it.
+                #
+                # `response_json_schema` is the SDK's own documented
+                # alternative for exactly this case: unlike `response_schema`,
+                # its supported-property list explicitly includes
+                # additionalProperties (plus $defs/$ref, which Pydantic
+                # emits for nested models like _ReviewResponseSchema's
+                # `issues: list[_IssueSchema]`). Using it here means the
+                # existing extra="forbid" config doesn't need to be
+                # loosened -- these same classes are also used for strict
+                # post-hoc validation in _parse_response() etc., and
+                # weakening extra="forbid" there would be a real regression
+                # to a documented Security-by-design guarantee, not just a
+                # generation-time tweak.
+                config_kwargs["response_json_schema"] = response_schema.model_json_schema()
 
         with tracing.span(
             "llm_call", span_name,

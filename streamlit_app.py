@@ -464,10 +464,17 @@ def _render_results(data: dict, repo_url: str, branch: str) -> None:
     st.subheader(f"Issues ({len(issues)})")
     _render_remediation_section(issues, repo_url, branch)
 
-    # --- Scan details (collapsed by default) ---
+    # --- Scan details ---
+    # No outer st.expander here (Streamlit disallows nesting expanders,
+    # and _render_scan already gives each individual finding its own
+    # collapsed-by-default expander) -- an earlier version wrapped this
+    # whole section in one too, which only ever crashed
+    # (StreamlitAPIException: "Expanders may not be nested inside other
+    # expanders") on a real run that actually had findings > 0, since a
+    # 0-finding run never reaches the per-finding expander at all.
     finding_count = len(scan.get("findings", []))
-    with st.expander(f"Semgrep scan details ({finding_count} finding(s))", expanded=False):
-        _render_scan(scan)
+    st.subheader(f"Semgrep scan details ({finding_count} finding(s))")
+    _render_scan(scan)
 
 
 # ---------------------------------------------------------------------------
