@@ -55,7 +55,13 @@ class TestSecretDetection:
         assert any(v.category == "secret" for v in result.violations)
 
     def test_google_api_key(self):
-        result = check_content("api_key = 'AIzaSyDaGmWKa4JsXZ-HjGw7ISLan_Maftpx1oQ'")
+        # Unambiguously-fake example (mirrors AWS's own AKIAIOSFODNN7EXAMPLE
+        # convention just above) -- an earlier version of this test used a
+        # real-format-looking value that GitHub's secret scanning flagged
+        # as a public leak even though it was never a live credential; this
+        # value matches guardrail.py's AIza[0-9A-Za-z_-]{35} pattern the
+        # same way but can never be mistaken for a real key.
+        result = check_content("api_key = 'AIza" + "FAKE" * 8 + "FAK'")
         assert result.blocked is True
 
     def test_github_token(self):
