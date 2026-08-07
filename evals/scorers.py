@@ -16,6 +16,14 @@ from typing import Any
 class ScoreResult:
     passed: bool
     detail: str
+    # Additive, defaulted -- every existing call site across cases.py and
+    # trajectory_scorers.py constructs ScoreResult(passed, detail) with two
+    # positional args and is untouched by this field. `detail` remains the
+    # scorer's own pass/fail narration; `evidence` is a verbatim excerpt of
+    # the actual output being scored (a quoted finding title, a quoted
+    # prompt fragment, a quoted log line) for evals/adversarial_cases.py's
+    # report to show, not just assert. See specs/adversarial_eval_spec.md.
+    evidence: str = ""
 
 
 def _finding_text(finding: dict) -> str:

@@ -128,7 +128,7 @@ flowchart TD
 
     subgraph External["External entry points — reuse this graph's tools, not a parallel implementation"]
         RemediateAPI["🔧 POST /remediate\nopt-in before/after patches"]
-        EvalSuite["✅ Eval suite (27 cases)\nscores real judgment + real ADK trajectories"]
+        EvalSuite["✅ Eval suite (41 cases)\nscores real judgment + real ADK trajectories + adversarial defense"]
     end
 
     Root --> Planner & Context & Scout & PR & Report & Dedup & Risk & Remed
@@ -219,10 +219,11 @@ EXTERNAL ENTRY POINTS ─ reuse this graph's tools, not a parallel implementatio
   POST /remediate   (opt-in before/after patches, via CodeReviewAgent's
                      generate_remediation_patches_with_verification — same
                      verify-and-refine shape as remediation_agent's LoopAgent)
-  eval suite         (27 cases: 24 scenario cases scoring real judgment against
+  eval suite         (41 cases: 24 scenario cases scoring real judgment against
                      real Gemini/embedding calls + 3 trajectory cases that run
                      the actual ADK graph via InMemoryRunner and inspect the
-                     event trace)
+                     event trace + 14 adversarial cases reframing this week's
+                     hardening work as named attack/defense/evidence cards)
 ```
 
 ### Agent roles
@@ -921,9 +922,10 @@ RAG project-context coverage spans all three layers: `tests/test_github_fetcher.
 cd evals
 python3 runner.py --mode live                        # needs GEMINI_API_KEY; ~19 real Gemini calls
 python3 runner.py --mode live --category trajectory   # needs GEMINI_API_KEY + GITHUB_TOKEN
+python3 adversarial_report.py --mode live -o adversarial_report.md   # Markdown attack-scenario report
 ```
 
-27 cases total, split across two structurally different eval flavors. 24 are
+41 cases total, split across three structurally different eval flavors. 24 are
 **response evals**, exercising the full pipeline end to end by calling real
 `CodeReviewAgent`/`GeminiReviewer` methods, not individual functions — do the
 specialist agents actually catch known-bad patterns, does the validator
@@ -941,13 +943,27 @@ deterministic fallback, so these cases call real methods against realistic
 fixture files rather than mocking Gemini — a mocked response would only
 re-test JSON parsing, which the 267 unit tests above already cover.
 
-The other 3 are **trajectory evals** — they build the actual ADK agent graph
+3 are **trajectory evals** — they build the actual ADK agent graph
 (`agent.build_multi_agent_system`) and run it via `google.adk.runners.
 InMemoryRunner`, inspecting the real event trace (which agents fired, which
 tools they called) rather than calling a pipeline method directly. This is
-the one place in the eval suite that actually exercises the ADK graph itself,
-checking that `security_full_scan` and `remediation_agent` *behave* the way
+one of two places in the eval suite that actually exercise the ADK graph
+itself (the other is one of the adversarial cases below), checking that
+`security_full_scan` and `remediation_agent` *behave* the way
 `tests/test_agent.py` already proves they're *constructed*.
+
+The remaining 14 are **adversarial evals** — a reframing, not a rebuild, of
+the same four days of hardening work the "Agent Security"/"Security, by
+design" sections above document (indirect prompt injection, excessive
+agency, memory poisoning, blind trust between components), presented as
+named attack/defended-behavior/verdict/evidence cards for a non-technical
+reviewer to skim, plus 2 new gap-filler cases (a delimiter-escape attempt,
+and a confirmation-gate check run through the real ADK graph rather than
+called directly). 10 of the 14 call deterministic production code with no
+LLM involved at all — genuinely meaningful in any `--mode`, not just a
+harness self-test. `evals/adversarial_report.py` renders the same 14 cases
+as a standalone Markdown report. Full rationale:
+[`specs/adversarial_eval_spec.md`](./specs/adversarial_eval_spec.md).
 
 | Category | Cases | Checks |
 |---|---|---|
@@ -961,6 +977,7 @@ checking that `security_full_scan` and `remediation_agent` *behave* the way
 | Retrieval quality | 1 | Given one clearly-relevant and one clearly-irrelevant past review comment, `retrieve_relevant_comments` must rank the relevant one into the top_k and leave the irrelevant one out. Calls `GeminiReviewer` directly — no `CodeReviewAgent` wrapper exists for these RAG methods |
 | Cost estimate | 2 | `server.py`'s token/RPD math matches `view_trace.py`'s on an identical trace file (no LLM needed — these 2 run in any environment) |
 | **Trajectory** | **3** | **Runs the real ADK graph via `InMemoryRunner` and inspects the event trace: all 6 parallel specialists really fire during a full security scan; `remediation_agent`'s loop really exits early on a genuinely correct patch; the loop really runs to its cap and reports honestly (no false "resolved" claim) when patches keep failing** |
+| **Adversarial** | **14** | **Named attack/defended-behavior/verdict/evidence cards reframing the week's hardening (indirect prompt injection, excessive agency, memory poisoning, blind inter-agent trust) for a non-technical reviewer, plus 2 new gap-fillers: a delimiter-escape attempt against the `<file_content>` boundary, and an unconfirmed-write check run through a real `InMemoryRunner` graph instead of called directly. 10/14 call deterministic production code (real verdict in any mode); 4 need `--mode live`. Rendered as a standalone report via `evals/adversarial_report.py`** |
 
 Full rationale, fixture design, and scoring philosophy: [`evals/README.md`](./evals/README.md).
 
@@ -1042,7 +1059,7 @@ code_review_agent/
 │                                  #   /remediate via FastAPI's TestClient
 │
 └── Evals
-    └── evals/                    # 27 cases: 24 scenario cases (detection,
+    └── evals/                    # 41 cases: 24 scenario cases (detection,
                                    #   false-positive, dedup, risk scoring,
                                    #   prompt injection, security full scan,
                                    #   remediation loop, retrieval quality, cost
@@ -1050,7 +1067,10 @@ code_review_agent/
                                    #   not mocked plumbing) + 3 trajectory cases
                                    #   (runs the real ADK graph via
                                    #   InMemoryRunner and inspects the event
-                                   #   trace)
+                                   #   trace) + 14 adversarial cases (named
+                                   #   attack/defense/evidence cards, reframing
+                                   #   this week's hardening work for a
+                                   #   non-technical reviewer)
 ```
 
 ---

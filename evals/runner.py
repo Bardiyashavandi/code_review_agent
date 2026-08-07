@@ -42,6 +42,15 @@ Two modes:
   README.md's "Trajectory cases" section and trajectory_cases.py's module
   docstring for the full rationale and what each --mode does for them.
 
+  The 14 `adversarial` cases (evals/adversarial_cases.py) reframe already-
+  proven Mon-Thu hardening work as named attack scenarios for a non-
+  technical audience -- see specs/adversarial_eval_spec.md. 10 of the 14
+  are deterministic Python with no LLM call at all (real in any --mode);
+  4 need --mode live for a real verdict. evals/adversarial_report.py
+  renders the same 14 cases as a standalone Markdown report -- prefer that
+  for the actual demo artifact; this runner's console table is for
+  developer re-runs.
+
 Usage:
     python3 runner.py                       # mock mode (default)
     python3 runner.py --mode live           # real eval, needs GEMINI_API_KEY
@@ -49,6 +58,8 @@ Usage:
     python3 runner.py --mode live --only det-01-sqli,fp-02-enum-table-name
     python3 runner.py --category trajectory              # mock, harness-only
     python3 runner.py --mode live --category trajectory  # needs GEMINI_API_KEY + GITHUB_TOKEN
+    python3 runner.py --category adversarial              # mock, harness-only for 4 of 14 cases
+    python3 runner.py --mode live --category adversarial  # needs GEMINI_API_KEY + GITHUB_TOKEN
 """
 
 from __future__ import annotations
@@ -68,6 +79,7 @@ _REPO_ROOT = _THIS_DIR.parent
 sys.path.insert(0, str(_REPO_ROOT))
 sys.path.insert(0, str(_THIS_DIR))
 
+from adversarial_cases import ADVERSARIAL_CASES  # noqa: E402
 from cases import ALL_CASES, FIXTURES_DIR, EvalCase  # noqa: E402
 from cost_estimate_cases import run_cost_estimate_case_1, run_cost_estimate_case_2  # noqa: E402
 from scorers import ScoreResult  # noqa: E402
@@ -163,6 +175,40 @@ def _run_trajectory_cases(mode: str, only_ids: set[str] | None) -> list[dict]:
     return rows
 
 
+def _run_adversarial_cases(mode: str, only_ids: set[str] | None) -> list[dict]:
+    """Runs the 14 adversarial cases (evals/adversarial_cases.py). Same
+    run(mode)/score(raw) shape as trajectory cases, structurally separate
+    from _run_llm_backed_case for the same reason: these don't fit the
+    "construct a CodeReviewAgent, call case.run(agent, fixtures_dir)" shape
+    every cases.py case uses. See evals/adversarial_cases.py's module
+    docstring and specs/adversarial_eval_spec.md. Extra keys (day, attack,
+    defended_behavior) are attached to each row for adversarial_report.py's
+    benefit; _print_table/--json-out below simply ignore keys they don't
+    reference, same as every other row shape."""
+    rows: list[dict] = []
+    for case in ADVERSARIAL_CASES:
+        if only_ids is not None and case.id not in only_ids:
+            continue
+        start = time.monotonic()
+        try:
+            raw = case.run(mode)
+            result = case.score(raw)
+            status = "PASS" if result.passed else "FAIL"
+            detail = result.detail
+        except Exception as exc:  # noqa: BLE001 — surface any failure as a row, don't crash the suite
+            status, detail = "ERROR", f"{type(exc).__name__}: {exc}"
+        duration = time.monotonic() - start
+        rows.append({
+            "id": case.id, "category": "adversarial",
+            "description": f"[{case.day}] {case.attack}",
+            "status": status, "detail": detail, "duration_s": round(duration, 2),
+            "day": case.day, "attack": case.attack,
+            "defended_behavior": case.defended_behavior,
+            "mode_independent": case.mode_independent,
+        })
+    return rows
+
+
 def _run_cost_estimate_cases(tmp_dir: Path) -> list[tuple[str, str, ScoreResult, float]]:
     out = []
     for case_id, description, fn in [
@@ -191,7 +237,7 @@ def main() -> None:
                          help="Only run cases in this category "
                               "(detection|false_positive|dedup|risk_scoring|prompt_injection|"
                               "security_full_scan|remediation_loop|retrieval_quality|"
-                              "cost_estimate|trajectory)")
+                              "cost_estimate|trajectory|adversarial)")
     parser.add_argument("--only", default=None, help="Comma-separated case IDs to run")
     parser.add_argument("--json-out", default=None, help="Write full results as JSON to this path")
     args = parser.parse_args()
@@ -247,6 +293,9 @@ def main() -> None:
 
     if args.category is None or args.category == "trajectory":
         rows.extend(_run_trajectory_cases(args.mode, only_ids))
+
+    if args.category is None or args.category == "adversarial":
+        rows.extend(_run_adversarial_cases(args.mode, only_ids))
 
     _print_table(rows)
 
