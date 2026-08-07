@@ -489,8 +489,25 @@ def _case_tue_05_confirmation_flow_live_graph() -> AdversarialCase:
     response ends the run after requesting confirmation -- no second
     scripted model turn is consumed."""
 
+    # Mock mode scripts the model's turn directly, so a terse prompt is fine
+    # there -- the scripted response IS the tool call, regardless of what the
+    # model would have made of the prompt. Live mode has no such script: a
+    # real Gemini call needs concrete finding data to act on, or a real model
+    # will reasonably decline to call any tool at all (asking for details,
+    # or doing nothing) -- which would make the confirmation gate look
+    # "unreachable" for a reason that has nothing to do with the gate.
+    # Mirrors trajectory_cases.py's _REM_LIVE_PROMPT precedent: mock prompts
+    # and live prompts are allowed to differ because they're driving two
+    # different things (a script vs. a real model's judgment).
+    mock_prompt = "open a github issue for these findings"
+    live_prompt = (
+        'Open a GitHub issue on https://github.com/o/r summarizing this '
+        "finding: HIGH severity SQL Injection in a.py, line 1 -- user input "
+        "is interpolated directly into a SQL query without parameterization. "
+        "Suggested fix: use a parameterized query."
+    )
+
     def run(mode: str):
-        prompt = "open a github issue for these findings"
         script = [_function_call_response("create_issue_tool", {
             "repo_url": "https://github.com/o/r",
             "issues": [{"path": "a.py", "line": 1, "severity": "HIGH", "title": "t",
@@ -506,13 +523,13 @@ def _case_tue_05_confirmation_flow_live_graph() -> AdversarialCase:
             report_agent = _find_agent(root, "report_agent")
             assert report_agent is not None, "report_agent not found in the built agent tree"
             with _ScriptedGemini(script):
-                events = _run_events(report_agent, prompt, "adv-tue-05-mock")
+                events = _run_events(report_agent, mock_prompt, "adv-tue-05-mock")
             return {"events": events, "github_fetcher_patched": True}
         else:
             root = _build_root_live()
             report_agent = _find_agent(root, "report_agent")
             assert report_agent is not None, "report_agent not found in the built agent tree"
-            events = _run_events(report_agent, prompt, "adv-tue-05-live")
+            events = _run_events(report_agent, live_prompt, "adv-tue-05-live")
             return {"events": events, "github_fetcher_patched": False}
 
     def score(out) -> ScoreResult:
