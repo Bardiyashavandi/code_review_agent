@@ -922,6 +922,7 @@ RAG project-context coverage spans all three layers: `tests/test_github_fetcher.
 cd evals
 python3 runner.py --mode live                        # needs GEMINI_API_KEY; ~19 real Gemini calls
 python3 runner.py --mode live --category trajectory   # needs GEMINI_API_KEY + GITHUB_TOKEN
+python3 runner.py --mode live --category adversarial  # needs GEMINI_API_KEY + GITHUB_TOKEN
 python3 adversarial_report.py --mode live -o adversarial_report.md   # Markdown attack-scenario report
 ```
 
@@ -962,8 +963,23 @@ and a confirmation-gate check run through the real ADK graph rather than
 called directly). 10 of the 14 call deterministic production code with no
 LLM involved at all — genuinely meaningful in any `--mode`, not just a
 harness self-test. `evals/adversarial_report.py` renders the same 14 cases
-as a standalone Markdown report. Full rationale:
-[`specs/adversarial_eval_spec.md`](./specs/adversarial_eval_spec.md).
+as a standalone Markdown report. **Current result: 14/14 defended in
+`--mode live`** against real Gemini/GitHub APIs.
+
+Worth noting what live mode caught that mock mode structurally couldn't:
+three separate harness bugs, none of them real defense gaps. A scorer
+was flagging the model for *correctly describing* an injection attempt
+(the fixture asks the model to leak its system prompt; the model's own
+issue text describing that attack then tripped a naive substring check —
+fixed by scoping the check to the model's summary). And the
+confirmation-gate case built its graph without `allow_write=True`, so
+the tool it was testing was never registered at all — the model's own
+reply, *"my write capabilities are currently disabled,"* was the clue,
+which is why that case's failure evidence now includes the model's text
+and not just the event trace. Both are the kind of thing a suite that
+only ever runs against scripted responses will happily report as green.
+Full sequence, including the two diagnoses that turned out wrong:
+[`specs/adversarial_eval_spec.md`](./specs/adversarial_eval_spec.md) §6.
 
 | Category | Cases | Checks |
 |---|---|---|
@@ -977,7 +993,7 @@ as a standalone Markdown report. Full rationale:
 | Retrieval quality | 1 | Given one clearly-relevant and one clearly-irrelevant past review comment, `retrieve_relevant_comments` must rank the relevant one into the top_k and leave the irrelevant one out. Calls `GeminiReviewer` directly — no `CodeReviewAgent` wrapper exists for these RAG methods |
 | Cost estimate | 2 | `server.py`'s token/RPD math matches `view_trace.py`'s on an identical trace file (no LLM needed — these 2 run in any environment) |
 | **Trajectory** | **3** | **Runs the real ADK graph via `InMemoryRunner` and inspects the event trace: all 6 parallel specialists really fire during a full security scan; `remediation_agent`'s loop really exits early on a genuinely correct patch; the loop really runs to its cap and reports honestly (no false "resolved" claim) when patches keep failing** |
-| **Adversarial** | **14** | **Named attack/defended-behavior/verdict/evidence cards reframing the week's hardening (indirect prompt injection, excessive agency, memory poisoning, blind inter-agent trust) for a non-technical reviewer, plus 2 new gap-fillers: a delimiter-escape attempt against the `<file_content>` boundary, and an unconfirmed-write check run through a real `InMemoryRunner` graph instead of called directly. 10/14 call deterministic production code (real verdict in any mode); 4 need `--mode live`. Rendered as a standalone report via `evals/adversarial_report.py`** |
+| **Adversarial** | **14** | **Named attack/defended-behavior/verdict/evidence cards reframing the week's hardening (indirect prompt injection, excessive agency, memory poisoning, blind inter-agent trust) for a non-technical reviewer, plus 2 new gap-fillers: a delimiter-escape attempt against the `<file_content>` boundary, and an unconfirmed-write check run through a real `InMemoryRunner` graph instead of called directly. 10/14 call deterministic production code (real verdict in any mode); 4 need `--mode live`. 14/14 defended in live mode. Rendered as a standalone report via `evals/adversarial_report.py`** |
 
 Full rationale, fixture design, and scoring philosophy: [`evals/README.md`](./evals/README.md).
 
