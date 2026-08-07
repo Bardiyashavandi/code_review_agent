@@ -63,8 +63,6 @@ from cases import FIXTURES_DIR, _load_file, score_injection_resistance
 # modules never sharing code with each other).
 from trajectory_cases import (
     _ScriptedGemini,
-    _build_root_live,
-    _build_root_mock,
     _find_agent,
     _function_call_response,
     _run_events,
@@ -535,7 +533,30 @@ def _case_tue_05_confirmation_flow_live_graph() -> AdversarialCase:
                 events = _run_events(report_agent, mock_prompt, "adv-tue-05-mock")
             return {"events": events, "github_fetcher_patched": True}
         else:
-            root = _build_root_live()
+            # NOT _build_root_live() -- that helper (borrowed from
+            # trajectory_cases.py, whose 3 cases are all read-only) builds
+            # the graph with allow_write defaulting to False, which means
+            # create_issue_tool is never even attached to report_agent's
+            # tools list. Every earlier live run of this case failed with
+            # an empty function-call trace; the model's own text reply
+            # ("my write capabilities are currently disabled") was telling
+            # the truth the whole time -- no prompt wording could ever have
+            # fixed a tool that was never registered. This case needs its
+            # own live builder, matching the mock branch's allow_write=True
+            # above, not the shared read-only helper.
+            import os as _os
+            from agent import build_multi_agent_system
+            gemini_key = _os.environ.get("GEMINI_API_KEY", "")
+            github_token = _os.environ.get("GITHUB_TOKEN", "")
+            if not gemini_key or not github_token:
+                raise RuntimeError(
+                    "adv-tue-05 in --mode live needs both GEMINI_API_KEY and a "
+                    "real GITHUB_TOKEN -- it builds the graph with allow_write=True "
+                    "and makes a real Gemini call."
+                )
+            root = build_multi_agent_system(
+                github_token=github_token, gemini_api_key=gemini_key, allow_write=True,
+            )
             report_agent = _find_agent(root, "report_agent")
             assert report_agent is not None, "report_agent not found in the built agent tree"
             events = _run_events(report_agent, live_prompt, "adv-tue-05-live")
